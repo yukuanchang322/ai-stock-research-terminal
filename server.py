@@ -38,7 +38,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.2.3")
+app = FastAPI(title="AI Stock Research Terminal", version="5.2.4")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -111,7 +111,7 @@ def _row_value(row: dict[str, Any], includes: list[str], excludes: list[str] | N
     return None
 
 async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.3"}) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.4"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
 
@@ -125,7 +125,7 @@ IR_FINANCIAL_PAGES = {
 async def mops_csv_rows(filename: str) -> list[dict[str, Any]]:
     """Official MOPS CSV fallback. Some foreign/KY issuers can appear here even when JSON feeds lag."""
     url=f"{MOPS_CSV_BASE}/{filename}"
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.3"}) as client:
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.4"}) as client:
         r=await client.get(url); r.raise_for_status()
     raw=r.content
     text=None
@@ -223,7 +223,7 @@ async def fetch_company_ir_financial(ticker: str, expected_year: int, expected_q
     page=IR_FINANCIAL_PAGES.get(ticker)
     if not page: return None
     try:
-        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.3"}) as client:
+        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.4"}) as client:
             r=await client.get(page); r.raise_for_status(); page_html=r.text
             hrefs=re.findall(r'href=["\']([^"\']+)["\']',page_html,re.I)
             embedded=re.findall(r'["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']',page_html,re.I)
@@ -350,6 +350,167 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
         return merged
     return {"official":False,"errors":errors,"candidate_hits":0}
 
+
+
+async def diagnose_official_financial_sources(ticker: str) -> dict[str, Any]:
+    """Live diagnostic of every official-financial source used by V5.2.4.
+
+    This endpoint intentionally exposes metadata/status only (no secrets). It is designed to answer:
+    * did the upstream endpoint respond?
+    * did it contain the requested ticker?
+    * what fiscal period did it report?
+    * for company IR, did the page advertise the expected quarter and did it expose a PDF link?
+    * if a PDF was found, did its text explicitly validate the expected period and parse the core fields?
+    """
+    now=datetime.now().astimezone()
+    ey,eq,expected=expected_latest_financial_period(now.date())
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.4 diagnostics"}
+    out={
+        "ticker":ticker, "generated_at":now.isoformat(timespec="seconds"),
+        "expected_period":expected, "expected_year":ey, "expected_quarter":eq,
+        "openapi":[], "mops_csv":[], "company_ir":None, "selection":None,
+        "diagnostic_version":"5.2.4",
+    }
+
+    def company_code(row: dict[str, Any]) -> str:
+        direct=row.get("公司代號") or row.get("SecuritiesCompanyCode") or row.get("公司代碼") or row.get("代號")
+        if direct is not None:
+            return re.sub(r"\D","",str(direct)) or str(direct).strip()
+        v=_row_value(row,["公司","代號"]) or _row_value(row,["代號"])
+        return str(v or "").strip()
+
+    industry_suffixes=["ci","mim","basi","bd","fh","ins"]
+    candidates=[
+        (TWSE_OPENAPI, "/opendata/t187ap14_L", "TWSE/MOPS EPS Daily Summary", "summary"),
+        (TPEX_OPENAPI, "/mopsfin_t187ap14_O", "TPEx/MOPS EPS Daily Summary", "summary"),
+    ]
+    for suffix in industry_suffixes:
+        candidates += [
+            (TWSE_OPENAPI, f"/opendata/t187ap06_L_{suffix}", "TWSE/MOPS Income Statement", "detail"),
+            (TWSE_OPENAPI, f"/opendata/t187ap06_X_{suffix}", "TWSE/MOPS X/Foreign Income Statement", "detail"),
+            (TPEX_OPENAPI, f"/mopsfin_t187ap06_O_{suffix}", "TPEx/MOPS Income Statement", "detail"),
+        ]
+
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=ua) as client:
+        for base,path,source,kind in candidates:
+            item={"source":source,"url":base+path,"kind":kind}
+            try:
+                r=await client.get(base+path)
+                item.update({"http_status":r.status_code,"content_type":r.headers.get("content-type"),"bytes":len(r.content)})
+                r.raise_for_status()
+                data=r.json()
+                rows=data if isinstance(data,list) else []
+                item["rows_count"]=len(rows)
+                row=next((x for x in rows if company_code(x)==ticker),None)
+                item["matched"]=bool(row)
+                if row:
+                    snap=_official_row_to_snapshot(row,source,path,"official",kind)
+                    item["snapshot"]={k:snap.get(k) for k in ("period","fiscal_year","fiscal_quarter","statement_date","ytd_eps","revenue_ytd","gross_profit_ytd","operating_income_ytd","net_income_ytd","completeness")} if snap else None
+                    item["raw_keys"]=list(row.keys())[:40]
+            except Exception as e:
+                item["error"]=f"{type(e).__name__}: {str(e)[:240]}"
+            out["openapi"].append(item)
+
+        csv_files=[
+            ("t187ap14_L.csv","TWSE/MOPS EPS CSV","summary"),
+            ("t187ap06_L_ci.csv","TWSE/MOPS Income CSV","detail"),
+            ("t187ap06_L_mim.csv","TWSE/MOPS Income CSV","detail"),
+            ("t187ap06_X_ci.csv","TWSE/MOPS Public/Foreign Income CSV","detail"),
+            ("t187ap06_X_mim.csv","TWSE/MOPS Public/Foreign Income CSV","detail"),
+        ]
+        for filename,source,kind in csv_files:
+            url=f"{MOPS_CSV_BASE}/{filename}"
+            item={"source":source,"url":url,"kind":kind}
+            try:
+                r=await client.get(url)
+                item.update({"http_status":r.status_code,"content_type":r.headers.get("content-type"),"bytes":len(r.content)})
+                r.raise_for_status()
+                text=None; encoding=None
+                for enc in ("utf-8-sig","utf-8","cp950","big5"):
+                    try: text=r.content.decode(enc); encoding=enc; break
+                    except Exception: pass
+                if text is None: raise ValueError("CSV decode failed")
+                rows=[dict(x) for x in csv.DictReader(io.StringIO(text))]
+                item.update({"encoding":encoding,"rows_count":len(rows),"header":list(rows[0].keys())[:40] if rows else []})
+                matched=None; snap=None
+                for row in rows:
+                    candidate=_official_row_to_snapshot(row,source,filename,"official",kind)
+                    if candidate and candidate.get("company_code")==ticker:
+                        matched=row; snap=candidate; break
+                item["matched"]=bool(matched)
+                if snap:
+                    item["snapshot"]={k:snap.get(k) for k in ("period","fiscal_year","fiscal_quarter","statement_date","ytd_eps","revenue_ytd","gross_profit_ytd","operating_income_ytd","net_income_ytd","completeness")}
+            except Exception as e:
+                item["error"]=f"{type(e).__name__}: {str(e)[:240]}"
+            out["mops_csv"].append(item)
+
+        page=IR_FINANCIAL_PAGES.get(ticker)
+        if page:
+            ir={"page_url":page,"expected_period":expected,"pdf_candidates":[]}
+            try:
+                r=await client.get(page)
+                html_text=r.text
+                ir.update({"http_status":r.status_code,"final_url":str(r.url),"content_type":r.headers.get("content-type"),"bytes":len(r.content)})
+                r.raise_for_status()
+                compact_html=re.sub(r"\s+"," ",html_text)
+                q_tokens={1:["Q1","First Quarter","第一季度","第一季"],2:["Q2","Second Quarter","第二季度","第二季"],3:["Q3","Third Quarter","第三季度","第三季"],4:["Q4","Fourth Quarter","第四季度","第四季"]}[eq]
+                ir["expected_year_visible"]=str(ey) in html_text
+                ir["expected_quarter_label_visible"]=any(t.lower() in html_text.lower() for t in q_tokens)
+                year_pos=compact_html.find(str(ey))
+                ir["html_context"]=compact_html[max(0,year_pos-160):year_pos+700] if year_pos>=0 else compact_html[:700]
+                hrefs=re.findall(r'href=["\']([^"\']+)["\']',html_text,re.I)
+                embedded=re.findall(r'["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']',html_text,re.I)
+                pdfs=[]
+                for href in list(dict.fromkeys(hrefs+embedded)):
+                    if ".pdf" not in href.lower(): continue
+                    url=urljoin(str(r.url),href); lo=url.lower(); score=0
+                    if str(ey) in lo: score+=4
+                    if f"q{eq}" in lo or f"_{eq}_" in lo: score+=5
+                    pdfs.append((score,url))
+                pdfs=sorted(set(pdfs),reverse=True)[:16]
+                ir["pdf_link_count"]=len(pdfs)
+                ir["expected_q_pdf_link_detected"]=any(score>=5 for score,_ in pdfs)
+                for score,url in pdfs[:8]:
+                    pi={"url":url,"score":score}
+                    try:
+                        pr=await client.get(url)
+                        pi.update({"http_status":pr.status_code,"content_type":pr.headers.get("content-type"),"bytes":len(pr.content)})
+                        pr.raise_for_status()
+                        reader=PdfReader(io.BytesIO(pr.content))
+                        text="\n".join((pg.extract_text() or "") for pg in reader.pages[:12])
+                        low=text.lower()
+                        if eq==2: period_ok=(str(ey) in text and ("six months ended june 30" in low or "六月三十日" in text or "6月30日" in text))
+                        elif eq==1: period_ok=(str(ey) in text and ("three months ended march 31" in low or "三月三十一日" in text or "3月31日" in text))
+                        elif eq==3: period_ok=(str(ey) in text and ("nine months ended september 30" in low or "九月三十日" in text or "9月30日" in text))
+                        else: period_ok=(str(ey) in text and ("year ended december 31" in low or "十二月三十一日" in text or "12月31日" in text))
+                        pi.update({"pages":len(reader.pages),"text_chars_first12":len(text),"period_ok":period_ok})
+                        if period_ok: pi["parsed"]=_extract_pdf_financials(text,ey,eq)
+                    except Exception as e:
+                        pi["error"]=f"{type(e).__name__}: {str(e)[:240]}"
+                    ir["pdf_candidates"].append(pi)
+            except Exception as e:
+                ir["error"]=f"{type(e).__name__}: {str(e)[:240]}"
+            out["company_ir"]=ir
+
+    try:
+        selected=await fetch_official_income_statement(ticker)
+        out["selection"]={k:selected.get(k) for k in ("official","source","endpoint","period","fiscal_year","fiscal_quarter","statement_date","ytd_eps","revenue_ytd","gross_profit_ytd","operating_income_ytd","net_income_ytd","candidate_hits","errors")}
+    except Exception as e:
+        out["selection"]={"error":f"{type(e).__name__}: {str(e)[:240]}"}
+
+    # concise machine-readable conclusion for screenshots/support
+    matched_open=[x for x in out["openapi"] if x.get("matched")]
+    matched_csv=[x for x in out["mops_csv"] if x.get("matched")]
+    ir=out.get("company_ir") or {}
+    valid_pdf=[x for x in ir.get("pdf_candidates",[]) if x.get("period_ok")]
+    out["summary"]={
+        "openapi_hits":len(matched_open), "csv_hits":len(matched_csv), "valid_ir_pdfs":len(valid_pdf),
+        "ir_expected_label_visible":ir.get("expected_quarter_label_visible"),
+        "ir_expected_pdf_link_detected":ir.get("expected_q_pdf_link_detected"),
+        "selected_period":(out.get("selection") or {}).get("period"),
+        "selected_source":(out.get("selection") or {}).get("source"),
+    }
+    return out
 
 def expected_latest_financial_period(as_of: date | None=None) -> tuple[int,int,str]:
     """Conservative Taiwan quarterly filing calendar used only as a freshness gate.
@@ -1044,7 +1205,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
           "source_status":source_status,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,
-          "data_policy":"V5.2.3 財報資料層：OpenAPI JSON → MOPS 官方 CSV → 公司 IR 審閱/查核 PDF fallback；僅在文件明確驗證季度後才放行 EPS 與核心估值。"}
+          "data_policy":"V5.2.4 財報資料層：OpenAPI JSON → MOPS 官方 CSV → 公司 IR 審閱/查核 PDF fallback；僅在文件明確驗證季度後才放行 EPS 與核心估值。"}
     _CACHE[ticker]=(time.time(),data)
     return data
 
@@ -1060,7 +1221,7 @@ def report_html(d: dict[str, Any]) -> str:
     return f"""<!doctype html><html lang='zh-Hant'><head><meta charset='utf-8'><style>
     @page{{size:A4;margin:11mm}} body{{font-family:'Noto Sans TC','PingFang TC',sans-serif;color:#13202a;font-size:9.5pt;line-height:1.55}} h1{{font-size:23pt;margin:0}} h2{{font-size:14pt;border-bottom:2px solid #173847;padding-bottom:4px;margin:18px 0 8px}} .muted{{color:#60727c}} .head{{display:flex;justify-content:space-between;border-bottom:3px solid #173847;padding-bottom:9px}} .price{{font-size:23pt;font-weight:800;text-align:right}} .pill{{display:inline-block;border:1px solid #719188;border-radius:20px;padding:2px 8px;margin-right:5px}} .grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin:10px 0}} .card{{border:1px solid #d7e0e4;border-radius:7px;padding:8px}} .card b{{font-size:14pt;display:block}} table{{width:100%;border-collapse:collapse;font-size:8.4pt}} th,td{{padding:5px;border-bottom:1px solid #dce4e8;text-align:left}} th{{background:#f2f6f7}} .call{{border-left:4px solid #17866b;background:#f4faf8;padding:9px}} .warn{{border:1px solid #d7b94b;background:#fff9e7;padding:8px;margin-top:10px}} .small{{font-size:8pt}} .page-break{{break-before:page}} .cols{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} ul{{margin:4px 0 0;padding-left:18px}} .badge{{font-weight:700}}
     </style></head><body>
-    <div class='head'><div><div class='muted'>AI STOCK RESEARCH TERMINAL V5.2.1 FINANCIAL FRESHNESS GATE • TAIWAN EQUITY RESEARCH</div><h1>{esc(d['name'])} <span class='muted'>{esc(d['ticker'])}</span></h1><div><span class='pill'>{esc(d['industry'])}</span><span class='pill'>{esc(d['stance'])}</span><span class='pill'>可信度 {conf['overall']}/100</span></div></div><div><div class='muted'>最新收盤</div><div class='price'>{nfmt(d['price'],1)}</div><div>{pct(d['change_pct'])}</div></div></div>
+    <div class='head'><div><div class='muted'>AI STOCK RESEARCH TERMINAL V5.2.4 OFFICIAL FINANCIAL DIAGNOSTICS • TAIWAN EQUITY RESEARCH</div><h1>{esc(d['name'])} <span class='muted'>{esc(d['ticker'])}</span></h1><div><span class='pill'>{esc(d['industry'])}</span><span class='pill'>{esc(d['stance'])}</span><span class='pill'>可信度 {conf['overall']}/100</span></div></div><div><div class='muted'>最新收盤</div><div class='price'>{nfmt(d['price'],1)}</div><div>{pct(d['change_pct'])}</div></div></div>
     <div class='small muted'>報告產生：{esc(d['generated_at'])} ｜ 資料完整度：{conf['data_completeness']}% ｜ 估值信心：{conf['valuation_confidence']}%</div>
     <h2>1. Executive Summary</h2><div class='call'>{esc(d['thesis'])}</div>
     <div class='grid'><div class='card'>綜合評分<b>{sc['綜合']}/100</b></div><div class='card'>基本面<b>{sc['基本面']}</b></div><div class='card'>籌碼面<b>{sc['籌碼面']}</b></div><div class='card'>技術面<b>{sc['技術面']}</b></div></div>
@@ -1086,6 +1247,14 @@ async def css(): return FileResponse(ROOT / "styles.css", media_type="text/css",
 @app.get("/sw.js")
 async def sw(): return FileResponse(ROOT / "sw.js", media_type="application/javascript", headers={"Cache-Control":"no-cache", "Service-Worker-Allowed":"/"})
 
+
+@app.get("/api/diagnostics/financial/{ticker}")
+async def financial_diagnostics(ticker: str):
+    ticker=ticker.strip()
+    if not ticker.isdigit() or len(ticker) not in (4,5,6): raise HTTPException(400,"請輸入有效台股代號")
+    result=await diagnose_official_financial_sources(ticker)
+    return JSONResponse(result, headers={"Cache-Control":"no-store"})
+
 @app.get("/api/stock/{ticker}")
 async def stock_api(ticker: str, refresh: bool = Query(False)):
     ticker=ticker.strip()
@@ -1099,13 +1268,13 @@ async def stock_pdf(ticker: str, refresh: bool = Query(True)):
     d=await build_stock(ticker.strip(), force_refresh=refresh)
     if d["price"] is None: raise HTTPException(503,"目前無法取得股價資料，為避免輸出錯誤報告，PDF 未產生。")
     stamp=datetime.now().strftime("%Y%m%d_%H%M")
-    out=REPORT_DIR/f"{ticker}_{stamp}_research_v5_1.pdf"
+    out=REPORT_DIR/f"{ticker}_{stamp}_research_v5_2_4.pdf"
     HTML(string=report_html(d),base_url=str(ROOT)).write_pdf(out)
-    return FileResponse(out,media_type="application/pdf",filename=f"{ticker}_AI_research_V5_1_{stamp}.pdf")
+    return FileResponse(out,media_type="application/pdf",filename=f"{ticker}_AI_research_V5_2_4_{stamp}.pdf")
 
 @app.post("/api/cache/clear")
 async def cache_clear():
     _CACHE.clear(); return {"status":"ok","message":"cache cleared"}
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.2.3","mode":"cloud-mobile-ky-official-fallback","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.2.4","mode":"cloud-mobile-official-diagnostics","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}

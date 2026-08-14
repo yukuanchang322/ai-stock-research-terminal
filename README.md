@@ -1,12 +1,12 @@
-# AI Stock Research Terminal V5.2.3
+# AI Stock Research Terminal V5.2.4
 
-V5.2.3 focuses on KY/foreign issuer financial freshness. It adds direct official MOPS CSV fallback and a reviewed/audited company-IR PDF fallback (including Alchip 3661), while preserving the financial freshness gate.
+V5.2.4 focuses on KY/foreign issuer financial freshness. It adds direct official MOPS CSV fallback and a reviewed/audited company-IR PDF fallback (including Alchip 3661), while preserving the financial freshness gate.
 
-Deploy by replacing the files in the existing GitHub repository and letting Render auto-deploy. Verify `/health` returns `5.2.3`.
+Deploy by replacing the files in the existing GitHub repository and letting Render auto-deploy. Verify `/health` returns `5.2.4`.
 
-# AI Stock Research Terminal V5.2.3 — Financial Freshness Gate
+# AI Stock Research Terminal V5.2.4 — Financial Freshness Gate
 
-V5.2.3 fixes the case where a recent price/revenue date coexisted with stale Q1 financials. The server now scans all official MOPS income-statement schemas, compares the newest official fiscal period with the conservative filing calendar, and blocks stale accounting EPS from core valuation.
+V5.2.4 fixes the case where a recent price/revenue date coexisted with stale Q1 financials. The server now scans all official MOPS income-statement schemas, compares the newest official fiscal period with the conservative filing calendar, and blocks stale accounting EPS from core valuation.
 
 V5.2 focuses on financial-data correctness and freshness. Official TWSE/MOPS/TPEx data has priority over third-party structured APIs. EPS is split into quarterly, YTD, TTM, and Forward EPS; the valuation engine no longer uses quarterly EPS × 4 as a formal forecast.
 
@@ -79,3 +79,10 @@ Health Check:
 - 預期修正分數 0–100 與四種市場預期狀態
 - iPhone/瀏覽器本機保存「上次分析 vs 這次分析」快照，不上傳個人查詢歷史
 - PDF 新增 Expectation Gap & Revision Radar
+
+## V5.2.4 官方財報診斷
+
+新增 `GET /api/diagnostics/financial/{ticker}`，逐層回報 TWSE/TPEx OpenAPI、MOPS CSV、公司 IR 頁面與 PDF 的 HTTP 狀態、是否命中股票、季度、解析欄位與最終選擇。
+當財報 freshness gate 未通過時，基本面「財報來源」卡會出現「查看官方資料診斷」連結。
+
+3661 可直接開：`/api/diagnostics/financial/3661`。
