@@ -40,7 +40,13 @@ function render(d){
   $('thesis').textContent=d.thesis; $('dataPolicy').textContent=d.data_policy; $('overallScore').textContent=d.scores['綜合'];
   $('kpis').innerHTML=[['預期狀態',d.expectation_gap?.regime||'—','V5.1'],['Research Score',`${d.scores['綜合']}/100`,'量化綜合'],['可信度',`${d.confidence?.overall??'—'}/100`,'資料+估值'],['PER',`${fmt(d.per?.per,1)}x`,'最新可得'],['營收 YoY',pct(d.revenue?.revenue_yoy),'最新月'],['外資20日',fmt0(d.flow?.foreign_20),'淨買賣'],['RSI14',fmt(d.technical?.rsi14,1),'技術動能']].map(x=>`<div class="kpi"><span>${x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`).join('');
   $('dockPdf').disabled=false; $('dockShare').disabled=false; $('lastFetch').textContent=`資料頁產生 ${new Date(d.generated_at).toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit'})}`;
-  const u=new URL(location.href); u.searchParams.set('ticker',d.ticker); history.replaceState({},'',u);
+  // Safari-safe URL update: avoid passing a URL object to history.replaceState.
+  try {
+    const qs = new URLSearchParams(location.search);
+    qs.set('ticker', d.ticker);
+    const nextUrl = `${location.pathname}?${qs.toString()}`;
+    history.replaceState({}, '', nextUrl);
+  } catch (_) { /* URL decoration is non-critical */ }
   $('scoreBars').innerHTML=['基本面','籌碼面','技術面','估值'].map(k=>`<div class="scorebar"><span>${k}</span><div class="scorebar-track"><div class="scorebar-fill" style="width:${d.scores[k]}%"></div></div><b>${d.scores[k]}</b></div>`).join('');
 
   const scenarios=d.valuation.scenarios||[];
@@ -95,14 +101,43 @@ function render(d){
   wrapWideTables();
 }
 
+async function readApiResponse(response){
+  const contentType=(response.headers.get('content-type')||'').toLowerCase();
+  const raw=await response.text();
+  if(!raw) return {};
+  if(contentType.includes('application/json')){
+    try{return JSON.parse(raw);}catch(_){throw new Error('伺服器回傳的 JSON 格式不正確，請重新整理後再試。');}
+  }
+  // Render/proxy errors can return HTML. Show a useful message instead of Safari's vague SyntaxError.
+  const plain=raw.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();
+  throw new Error(plain.slice(0,180)||`伺服器回傳非 JSON 資料（HTTP ${response.status}）`);
+}
+
 async function loadTicker(ticker, force=false){
-  $('errorBox').classList.add('hidden'); $('loading').classList.remove('hidden'); $('searchBtn').disabled=true; $('pdfBtn').disabled=true; $('dockPdf').disabled=true; $('dockShare').disabled=true;
+  ticker=String(ticker||'').trim().toUpperCase();
+  $('errorBox').classList.add('hidden');
+  if(!/^[0-9A-Z.-]{2,12}$/.test(ticker)){
+    $('report').classList.add('hidden');
+    $('errorBox').textContent='股票代號格式不正確，請輸入例如 2330、3661。';
+    $('errorBox').classList.remove('hidden');
+    return;
+  }
+  $('loading').classList.remove('hidden'); $('searchBtn').disabled=true; $('pdfBtn').disabled=true; $('dockPdf').disabled=true; $('dockShare').disabled=true;
   try{
-    const r=await fetch(`/api/stock/${encodeURIComponent(ticker)}${force?'?refresh=true':''}`); const j=await r.json();
-    if(!r.ok) throw new Error(j.detail||'資料取得失敗');
-    render(j);
-  }catch(e){ $('report').classList.add('hidden'); $('errorBox').textContent=e.message; $('errorBox').classList.remove('hidden'); }
-  finally{$('loading').classList.add('hidden'); $('searchBtn').disabled=false;}
+    const path=`/api/stock/${encodeURIComponent(ticker)}${force?'?refresh=true':''}`;
+    const r=await fetch(path,{method:'GET',headers:{'Accept':'application/json'},cache:force?'no-store':'default'});
+    const j=await readApiResponse(r);
+    if(!r.ok) throw new Error(j.detail||j.message||`資料取得失敗（HTTP ${r.status}）`);
+    try{render(j);}catch(renderError){
+      console.error('render failed',renderError);
+      throw new Error(`畫面產生失敗：${renderError?.message||'未知錯誤'}`);
+    }
+  }catch(e){
+    console.error('loadTicker failed',e);
+    $('report').classList.add('hidden');
+    $('errorBox').textContent=e?.message||'資料取得失敗，請稍後再試。';
+    $('errorBox').classList.remove('hidden');
+  } finally {$('loading').classList.add('hidden'); $('searchBtn').disabled=false;}
 }
 $('searchBtn').onclick=()=>loadTicker($('tickerInput').value.trim()); $('refreshBtn').onclick=()=>loadTicker($('tickerInput').value.trim(), true);
 $('tickerInput').addEventListener('keydown',e=>{if(e.key==='Enter')loadTicker(e.target.value.trim())});
@@ -145,9 +180,9 @@ $('dockRefresh').onclick=()=>currentTicker&&loadTicker(currentTicker,true);
 $('dockPdf').onclick=()=>currentTicker&&(window.location.href=`/api/stock/${currentTicker}/pdf?refresh=true`);
 $('dockShare').onclick=async()=>{
   if(!currentTicker)return;
-  const url=new URL(location.href); url.searchParams.set('ticker',currentTicker);
-  const shareData={title:`${$('companyName').textContent} ${currentTicker} AI 研究報告`,text:'AI Stock Research Terminal 個股研究',url:url.toString()};
-  try{if(navigator.share) await navigator.share(shareData); else {await navigator.clipboard.writeText(url.toString()); alert('研究連結已複製');}}catch(e){}
+  let shareUrl=`${location.origin}${location.pathname}?ticker=${encodeURIComponent(currentTicker)}`;
+  const shareData={title:`${$('companyName').textContent} ${currentTicker} AI 研究報告`,text:'AI Stock Research Terminal 個股研究',url:shareUrl};
+  try{if(navigator.share) await navigator.share(shareData); else {await navigator.clipboard.writeText(shareUrl); alert('研究連結已複製');}}catch(e){}
 };
 if('serviceWorker' in navigator){window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js').catch(()=>{}));}
 window.addEventListener('online',checkCloud); window.addEventListener('offline',checkCloud);
