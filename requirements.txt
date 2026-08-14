@@ -4,3 +4,5 @@ httpx>=0.27
 pandas>=2.0
 weasyprint>=62
 pypdf>=5.0
+
+lxml>=5.0
