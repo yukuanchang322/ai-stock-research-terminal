@@ -48,8 +48,11 @@ function render(d){
   $('levels').innerHTML=[['MA20',t.ma?.['20']],['MA60',t.ma?.['60']],['第一支撐',t.support1],['60日壓力',t.resistance]].map(x=>`<div class="level"><span>${x[0]}</span><b>${fmt(x[1],1)}</b></div>`).join('');
   $('techAnalysis').textContent=`趨勢：${t.trend||'—'}；RSI14 ${fmt(t.rsi14,1)}。支撐與壓力為量化參考，不是保證反轉點。`;
 
-  const rr=d.research||{}; $('reportCount').textContent=rr.count||0; $('consensusText').textContent=rr.median_target?`目標價中位數 ${fmt0(rr.median_target)}`:'尚無授權法人共識'; $('revisionText').textContent=rr.eps_revision_pct!=null?`Forward EPS 修正 ${pct(rr.eps_revision_pct)}`:'Forward EPS 修正：資料不足';
-  $('analystTable').innerHTML=(rr.reports||[]).length?`<table class="clean-table"><thead><tr><th>法人/券商</th><th>日期</th><th>評等</th><th>目標價</th><th>Forward EPS</th></tr></thead><tbody>${rr.reports.map(x=>`<tr><td>${x.institution||'—'}</td><td>${x.report_date||'—'}</td><td>${x.rating||'—'}</td><td>${fmt0(x.target_price)}</td><td>${fmt(x.forward_eps,2)}</td></tr>`).join('')}</tbody></table>`:'<div class="empty bordered">目前未匯入合法授權的法人研究資料。網站不使用未驗證網路目標價代替。</div>';
+  const rr=d.research||{}; $('reportCount').textContent=rr.count||0; $('consensusText').textContent=rr.median_target?`目標價中位數 ${fmt0(rr.median_target)} · 平均 ${fmt0(rr.average_target)}`:'目前尚無可解析的法人目標價共識'; $('revisionText').textContent=rr.target_revision_pct!=null?`同機構目標價修正中位數 ${pct(rr.target_revision_pct)}`:(rr.eps_revision_pct!=null?`Forward EPS 修正 ${pct(rr.eps_revision_pct)}`:'修正趨勢：資料不足');
+  if($('consensusStats')) $('consensusStats').innerHTML=[['法人機構',rr.institution_count||0],['最高目標',fmt0(rr.high_target)],['最低目標',fmt0(rr.low_target)],['買進/正向',rr.ratings?.['買進']||0],['中立',rr.ratings?.['中立']||0],['公開網路',rr.public_web_count||0]].map(x=>`<div><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
+  $('analystTable').innerHTML=(rr.reports||[]).length?`<table class="clean-table analyst-web-table"><thead><tr><th>法人/券商</th><th>日期</th><th>評等</th><th>目標價</th><th>來源/標題</th><th>可信度</th></tr></thead><tbody>${rr.reports.map(x=>`<tr><td>${x.institution||'—'}</td><td>${x.report_date||'—'}</td><td>${x.rating||'—'}</td><td>${fmt0(x.target_price)}</td><td>${x.source_url?`<a href="${x.source_url}" target="_blank" rel="noopener noreferrer">${x.title||x.publisher||'查看來源'}</a>`:(x.title||x.publisher||'自行匯入')}</td><td>${x.confidence!=null?`${x.confidence}/100`:'—'}</td></tr>`).join('')}</tbody></table>`:'<div class="empty bordered">目前尚未搜尋到可解析的公開法人研究引用。可按「強制刷新」重新搜尋最新網路資料。</div>';
+
+  const ev=d.company_events?.rows||[]; if($('eventRadar')) $('eventRadar').innerHTML=ev.length?`<div class="event-list">${ev.map(x=>`<article class="event-item"><div><time>${x.date||'—'}</time><div class="event-tags">${(x.tags||[]).map(t=>`<span>${t}</span>`).join('')}</div></div><div><a href="${x.source_url||'#'}" target="_blank" rel="noopener noreferrer">${x.title||'—'}</a><small>${x.publisher||'公開來源'}</small></div></article>`).join('')}</div>`:'<div class="empty bordered">目前尚未搜尋到近期法說或重大訊息引用。</div>';
 
   $('valuationBody').innerHTML=scenarios.length?scenarios.map(x=>`<tr><td>${x.name}</td><td>${fmt(x.eps,2)}</td><td>${fmt(x.pe,1)}x</td><td><b>${fmt0(x.target)}</b></td><td>${pct(x.upside_pct)}</td></tr>`).join(''):'<tr><td colspan="5">估值資料不足</td></tr>';
   $('assumptions').innerHTML=`<div class="assumption-row"><b>EPS Basis</b><span>${d.valuation.eps_basis||'—'}</span></div><div class="assumption-row"><b>PE Basis</b><span>${d.valuation.pe_basis||'—'}</span></div><div class="assumption-row"><b>估值信心</b><span>${d.valuation.confidence||0}/100</span></div><div class="assumption-row"><b>模型原則</b><span>Bear/Base/Bull 對 EPS 與 PE 同時做情境化，而非單點預測。</span></div>`; $('peBand').innerHTML=`歷史 PER：P25 <b>${fmt(d.per?.pe_p25,1)}x</b> · Median <b>${fmt(d.per?.pe_median,1)}x</b> · P75 <b>${fmt(d.per?.pe_p75,1)}x</b>`;
@@ -96,7 +99,7 @@ async function checkCloud(){
     const r=await fetch('/health',{cache:'no-store'}); const j=await r.json();
     if(!r.ok) throw new Error();
     dot?.classList.remove('offline'); dot?.classList.add('online');
-    $('cloudStatus').textContent=`雲端服務正常 · V${j.version||'4'}`;
+    $('cloudStatus').textContent=`雲端服務正常 · V${j.version||'5'}`;
   }catch(e){
     dot?.classList.remove('online'); dot?.classList.add('offline');
     $('cloudStatus').textContent='雲端服務目前無法連線';

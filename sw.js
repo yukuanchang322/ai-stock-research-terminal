@@ -1,4 +1,4 @@
-const CACHE = 'ai-stock-v4-shell-1';
+const CACHE = 'ai-stock-v5-shell-1';
 const SHELL = ['/', '/styles.css', '/app.js', '/static/manifest.webmanifest', '/static/icons/icon-192.png', '/static/icons/icon-512.png'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
