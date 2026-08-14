@@ -1,6 +1,12 @@
-# AI Stock Research Terminal V5.2.2 — Financial Freshness Gate
+# AI Stock Research Terminal V5.2.3
 
-V5.2.2 fixes the case where a recent price/revenue date coexisted with stale Q1 financials. The server now scans all official MOPS income-statement schemas, compares the newest official fiscal period with the conservative filing calendar, and blocks stale accounting EPS from core valuation.
+V5.2.3 focuses on KY/foreign issuer financial freshness. It adds direct official MOPS CSV fallback and a reviewed/audited company-IR PDF fallback (including Alchip 3661), while preserving the financial freshness gate.
+
+Deploy by replacing the files in the existing GitHub repository and letting Render auto-deploy. Verify `/health` returns `5.2.3`.
+
+# AI Stock Research Terminal V5.2.3 — Financial Freshness Gate
+
+V5.2.3 fixes the case where a recent price/revenue date coexisted with stale Q1 financials. The server now scans all official MOPS income-statement schemas, compares the newest official fiscal period with the conservative filing calendar, and blocks stale accounting EPS from core valuation.
 
 V5.2 focuses on financial-data correctness and freshness. Official TWSE/MOPS/TPEx data has priority over third-party structured APIs. EPS is split into quarterly, YTD, TTM, and Forward EPS; the valuation engine no longer uses quarterly EPS × 4 as a formal forecast.
 

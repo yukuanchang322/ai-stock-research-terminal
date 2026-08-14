@@ -13,6 +13,9 @@ from typing import Any
 from urllib.parse import quote_plus
 import re
 import xml.etree.ElementTree as ET
+import csv
+import io
+from urllib.parse import urljoin
 from email.utils import parsedate_to_datetime
 
 import httpx
@@ -22,6 +25,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
 from weasyprint import HTML
+from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
@@ -34,7 +38,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.2.2")
+app = FastAPI(title="AI Stock Research Terminal", version="5.2.3")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -107,9 +111,157 @@ def _row_value(row: dict[str, Any], includes: list[str], excludes: list[str] | N
     return None
 
 async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.2"}) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.3"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
+
+
+
+MOPS_CSV_BASE = "https://mopsfin.twse.com.tw/opendata"
+IR_FINANCIAL_PAGES = {
+    "3661": "https://www.alchip.com/en/Investors/financials/report",
+}
+
+async def mops_csv_rows(filename: str) -> list[dict[str, Any]]:
+    """Official MOPS CSV fallback. Some foreign/KY issuers can appear here even when JSON feeds lag."""
+    url=f"{MOPS_CSV_BASE}/{filename}"
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.3"}) as client:
+        r=await client.get(url); r.raise_for_status()
+    raw=r.content
+    text=None
+    for enc in ("utf-8-sig","utf-8","cp950","big5"):
+        try:
+            text=raw.decode(enc); break
+        except Exception:
+            continue
+    if text is None: return []
+    return [dict(x) for x in csv.DictReader(io.StringIO(text))]
+
+def _official_row_to_snapshot(row: dict[str, Any], source: str, endpoint: str, market: str="上市", kind: str="summary") -> dict[str, Any] | None:
+    def val(*names):
+        for name in names:
+            if name in row and row.get(name) not in (None,""): return row.get(name)
+        return None
+    code=val("公司代號","SecuritiesCompanyCode","公司代碼","代號")
+    if code is None:
+        code=_row_value(row,["公司","代號"]) or _row_value(row,["代號"])
+    eps=parse_num_text(val("基本每股盈餘(元)","基本每股盈餘","每股盈餘") or _row_value(row,["基本每股盈餘"]) or _row_value(row,["每股盈餘"]))
+    revenue=parse_num_text(val("營業收入") or _row_value(row,["營業收入"],["百分比"]))
+    gross=parse_num_text(val("營業毛利（毛損）","營業毛利(毛損)") or _row_value(row,["營業毛利"],["百分比"]))
+    op=parse_num_text(val("營業利益（損失）","營業利益(損失)","營業利益") or _row_value(row,["營業利益"],["百分比"]))
+    net=parse_num_text(val("本期淨利（淨損）","本期淨利(淨損)","本期淨利","稅後淨利") or _row_value(row,["本期淨利"],["百分比"]) or _row_value(row,["稅後淨利"]))
+    year=val("年度") or _row_value(row,["年度"]) or _row_value(row,["年"])
+    quarter=val("季別") or _row_value(row,["季別"]) or _row_value(row,["季"])
+    out_date=val("出表日期","資料日期") or _row_value(row,["出表日期"]) or _row_value(row,["資料日期"])
+    try:
+        y=int(str(year).strip()); y=y+1911 if y<1911 else y
+    except Exception: y=None
+    q=None; qm=re.search(r"([1-4])",str(quarter or "")); q=int(qm.group(1)) if qm else None
+    period=f"{y} Q{q}" if y and q else (roc_date_to_iso(out_date) or "latest")
+    return {"source":source,"market":market,"endpoint":endpoint,"official":True,"period":period,
+            "fiscal_year":y,"fiscal_quarter":q,"statement_date":roc_date_to_iso(out_date),
+            "ytd_eps":eps,"revenue_ytd":revenue,"gross_profit_ytd":gross,
+            "operating_income_ytd":op,"net_income_ytd":net,"raw_keys":list(row.keys())[:30],
+            "feed_kind":kind,"company_code":re.sub(r"\D","",str(code or "")) or str(code or "").strip(),
+            "completeness":sum(v is not None for v in (eps,revenue,gross,op,net))}
+
+async def fetch_mops_csv_official(ticker: str) -> list[dict[str, Any]]:
+    files=[
+        ("t187ap14_L.csv","TWSE/MOPS EPS CSV","summary"),
+        ("t187ap06_L_ci.csv","TWSE/MOPS Income CSV","detail"),
+        ("t187ap06_L_mim.csv","TWSE/MOPS Income CSV","detail"),
+        ("t187ap06_X_ci.csv","TWSE/MOPS Public/Foreign Income CSV","detail"),
+        ("t187ap06_X_mim.csv","TWSE/MOPS Public/Foreign Income CSV","detail"),
+    ]
+    out=[]
+    for filename,source,kind in files:
+        try:
+            rows=await mops_csv_rows(filename)
+            for row in rows:
+                snap=_official_row_to_snapshot(row,source,filename,"上市/公發",kind)
+                if snap and snap.get("company_code")==ticker:
+                    out.append(snap); break
+        except Exception:
+            continue
+    return out
+
+def _extract_pdf_financials(text: str, year: int, quarter: int) -> dict[str, Any]:
+    """Parse reviewed/audited IR PDFs conservatively.
+
+    For Q2/Q3 Alchip-style statements the columns are:
+    current quarter, prior-year quarter, current YTD, prior-year YTD.
+    Therefore the third amount/EPS is the current YTD value. We only accept
+    explicit table patterns; ambiguity returns None instead of guessing.
+    """
+    compact=" ".join(text.split())
+    def num(x): return parse_num_text(str(x).replace("$", "").replace("(", "-").replace(")", ""))
+    def eps_current_ytd():
+        if quarter in (2,3):
+            m=re.search(r"(?:EARNINGS PER SHARE.*?)(?:Basic)\s+\$?\s*([0-9.]+)\s+\$?\s*([0-9.]+)\s+\$?\s*([0-9.]+)\s+\$?\s*([0-9.]+)", compact, re.I)
+            return num(m.group(3)) if m else None
+        if quarter==1:
+            m=re.search(r"(?:EARNINGS PER SHARE.*?)(?:Basic)\s+\$?\s*[0-9.]+\s+\$?\s*([0-9.]+)",compact,re.I)
+            return num(m.group(1)) if m else None
+        m=re.search(r"(?:EARNINGS PER SHARE.*?)(?:Basic)\s+\$?\s*[0-9.]+\s+\$?\s*([0-9.]+)",compact,re.I)
+        return num(m.group(1)) if m else None
+    def table_ytd(label: str, pct_pattern: str="(?:100|[0-9]{1,2})"):
+        # Amount/% repeated four times; choose current YTD (third amount) for Q2/Q3.
+        pat=rf"{label}.*?\$?\s*([0-9,]+)\s+{pct_pattern}\s+\$?\s*([0-9,]+)\s+{pct_pattern}\s+\$?\s*([0-9,]+)\s+{pct_pattern}\s+\$?\s*([0-9,]+)\s+{pct_pattern}"
+        m=re.search(pat,compact,re.I)
+        if m: return num(m.group(3))
+        # Q1 / annual two-column form: USD and NTD (or current/prior year); prefer NTD second amount.
+        m=re.search(rf"{label}.*?\$?\s*([0-9,]+)\s+\$?\s*([0-9,]+)",compact,re.I)
+        return num(m.group(2)) if m else None
+    eps=eps_current_ytd()
+    revenue=table_ytd(r"OPERATING REVENUE(?:\s*\(Note\s*20\))?", "100")
+    gross=table_ytd(r"GROSS PROFIT")
+    op=table_ytd(r"PROFIT FROM OPERATIONS")
+    net=table_ytd(r"NET PROFIT FOR THE PERIOD")
+    return {"ytd_eps":eps,"revenue_ytd":revenue,"gross_profit_ytd":gross,"operating_income_ytd":op,"net_income_ytd":net}
+
+async def fetch_company_ir_financial(ticker: str, expected_year: int, expected_quarter: int) -> dict[str, Any] | None:
+    page=IR_FINANCIAL_PAGES.get(ticker)
+    if not page: return None
+    try:
+        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.3"}) as client:
+            r=await client.get(page); r.raise_for_status(); page_html=r.text
+            hrefs=re.findall(r'href=["\']([^"\']+)["\']',page_html,re.I)
+            embedded=re.findall(r'["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']',page_html,re.I)
+            # Prefer PDFs whose URL/text suggests the expected year/quarter. Hidden/data-attribute PDF URLs are included too.
+            pdfs=[]
+            for href in list(dict.fromkeys(hrefs+embedded)):
+                if ".pdf" not in href.lower(): continue
+                url=urljoin(str(r.url),href)
+                score=0
+                lo=url.lower()
+                if str(expected_year) in lo: score+=4
+                if f"q{expected_quarter}" in lo or f"_{expected_quarter}_" in lo: score+=5
+                pdfs.append((score,url))
+            pdfs=sorted(set(pdfs),reverse=True)[:12]
+            for _,url in pdfs:
+                pr=await client.get(url); pr.raise_for_status()
+                reader=PdfReader(io.BytesIO(pr.content))
+                text="\n".join((page.extract_text() or "") for page in reader.pages[:12])
+                # Period must be explicit; never infer a current quarter from download date.
+                low=text.lower()
+                if expected_quarter==2:
+                    period_ok=(str(expected_year) in text and ("six months ended june 30" in low or "六月三十日" in text or "6月30日" in text))
+                elif expected_quarter==1:
+                    period_ok=(str(expected_year) in text and ("three months ended march 31" in low or "三月三十一日" in text or "3月31日" in text))
+                elif expected_quarter==3:
+                    period_ok=(str(expected_year) in text and ("nine months ended september 30" in low or "九月三十日" in text or "9月30日" in text))
+                else:
+                    period_ok=(str(expected_year) in text and ("year ended december 31" in low or "十二月三十一日" in text or "12月31日" in text))
+                if not period_ok: continue
+                vals=_extract_pdf_financials(text,expected_year,expected_quarter)
+                return {"source":"Company IR audited/reviewed PDF","market":"IR","endpoint":url,"official":True,
+                        "period":f"{expected_year} Q{expected_quarter}","fiscal_year":expected_year,"fiscal_quarter":expected_quarter,
+                        "statement_date":None,"feed_kind":"ir_pdf","completeness":sum(v is not None for v in vals.values()),
+                        **vals,"ir_page":page}
+    except Exception:
+        return None
+    return None
+
 
 async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
     """Fetch the newest official MOPS income-statement row across listed/OTC industry schemas.
@@ -166,6 +318,18 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
 
     results=await asyncio.gather(*(probe(*c) for c in candidates))
     found=[x for x in results if x]
+    # Layer 2: direct official MOPS CSV. This bypasses JSON endpoint/schema lag and is critical for KY/foreign issuers.
+    try:
+        found.extend(await fetch_mops_csv_official(ticker))
+    except Exception as e:
+        errors.append(f"mops_csv:{type(e).__name__}")
+    # Layer 3: company IR reviewed/audited PDF for mapped issuers. Used only when the PDF explicitly states the expected period.
+    try:
+        ey,eq,_=expected_latest_financial_period(date.today())
+        ir=await fetch_company_ir_financial(ticker,ey,eq)
+        if ir: found.append(ir)
+    except Exception as e:
+        errors.append(f"company_ir:{type(e).__name__}")
     if found:
         # Latest fiscal period always wins. Within the same period prefer the detailed row with more parsed fields.
         found.sort(key=lambda x: (x.get("fiscal_year") or 0, x.get("fiscal_quarter") or 0,
@@ -880,7 +1044,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
           "source_status":source_status,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,
-          "data_policy":"V5.2.1 財報閘門：官方 TWSE/MOPS/TPEx 最新季度必須達到應有申報期，否則財報標示 STALE，YTD/TTM/反推 EPS 禁止進核心估值；僅明確年度法人 Forward EPS 可獨立使用。"}
+          "data_policy":"V5.2.3 財報資料層：OpenAPI JSON → MOPS 官方 CSV → 公司 IR 審閱/查核 PDF fallback；僅在文件明確驗證季度後才放行 EPS 與核心估值。"}
     _CACHE[ticker]=(time.time(),data)
     return data
 
@@ -944,4 +1108,4 @@ async def cache_clear():
     _CACHE.clear(); return {"status":"ok","message":"cache cleared"}
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.2.2","mode":"cloud-mobile-official-financial-layer","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.2.3","mode":"cloud-mobile-ky-official-fallback","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
