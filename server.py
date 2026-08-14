@@ -34,7 +34,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.2.1")
+app = FastAPI(title="AI Stock Research Terminal", version="5.2.2")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -107,7 +107,7 @@ def _row_value(row: dict[str, Any], includes: list[str], excludes: list[str] | N
     return None
 
 async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.1"}) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.2"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
 
@@ -119,18 +119,24 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
     """
     industry_suffixes=["ci","mim","basi","bd","fh","ins"]
     candidates=[]
+    # Daily EPS summary is the fastest official period anchor and is not tied to an industry schema.
+    # It is especially useful for KY/foreign issuers whose detailed statement may live outside the usual L_* feed.
+    candidates.append((TWSE_OPENAPI, "/opendata/t187ap14_L", "TWSE/MOPS EPS Daily Summary", "上市", "summary"))
+    candidates.append((TPEX_OPENAPI, "/mopsfin_t187ap14_O", "TPEx/MOPS EPS Daily Summary", "上櫃", "summary"))
     for suffix in industry_suffixes:
-        candidates.append((TWSE_OPENAPI, f"/opendata/t187ap06_L_{suffix}", "TWSE/MOPS OpenAPI", "上市"))
-        candidates.append((TPEX_OPENAPI, f"/mopsfin_t187ap06_O_{suffix}", "TPEx/MOPS OpenAPI", "上櫃"))
+        candidates.append((TWSE_OPENAPI, f"/opendata/t187ap06_L_{suffix}", "TWSE/MOPS Income Statement", "上市", "detail"))
+        # X_* is the public-company/foreign-issuer feed and covers cases that do not appear in L_* as expected.
+        candidates.append((TWSE_OPENAPI, f"/opendata/t187ap06_X_{suffix}", "TWSE/MOPS Income Statement (X/foreign)", "公發/外國", "detail"))
+        candidates.append((TPEX_OPENAPI, f"/mopsfin_t187ap06_O_{suffix}", "TPEx/MOPS Income Statement", "上櫃", "detail"))
     errors=[]; found=[]
 
     def company_code(row: dict[str, Any]) -> str:
         direct=row.get("公司代號") or row.get("SecuritiesCompanyCode") or row.get("公司代碼") or row.get("代號")
-        if direct is not None: return str(direct).strip()
+        if direct is not None: return re.sub(r"\D", "", str(direct)) or str(direct).strip()
         v=_row_value(row,["公司","代號"]) or _row_value(row,["代號"])
         return str(v or "").strip()
 
-    async def probe(base: str, path: str, source: str, market: str):
+    async def probe(base: str, path: str, source: str, market: str, kind: str):
         try:
             rows=await openapi_json(base,path)
             row=next((x for x in rows if company_code(x)==ticker),None)
@@ -151,7 +157,9 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
             return {"source":source,"market":market,"endpoint":path,"official":True,"period":period,
                     "fiscal_year":y,"fiscal_quarter":q,"statement_date":roc_date_to_iso(out_date),
                     "ytd_eps":eps,"revenue_ytd":revenue,"gross_profit_ytd":gross,
-                    "operating_income_ytd":op,"net_income_ytd":net,"raw_keys":list(row.keys())[:12]}
+                    "operating_income_ytd":op,"net_income_ytd":net,"raw_keys":list(row.keys())[:20],
+                    "feed_kind":kind,
+                    "completeness":sum(v is not None for v in (eps,revenue,gross,op,net))}
         except Exception as e:
             errors.append(f"{path}:{type(e).__name__}")
             return None
@@ -159,9 +167,23 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
     results=await asyncio.gather(*(probe(*c) for c in candidates))
     found=[x for x in results if x]
     if found:
-        found.sort(key=lambda x: (x.get("fiscal_year") or 0, x.get("fiscal_quarter") or 0, x.get("statement_date") or ""), reverse=True)
-        best=found[0]; best["errors"]=errors; best["candidate_hits"]=len(found)
-        return best
+        # Latest fiscal period always wins. Within the same period prefer the detailed row with more parsed fields.
+        found.sort(key=lambda x: (x.get("fiscal_year") or 0, x.get("fiscal_quarter") or 0,
+                                  x.get("completeness") or 0, 1 if x.get("feed_kind")=="detail" else 0,
+                                  x.get("statement_date") or ""), reverse=True)
+        best=found[0]
+        latest_key=(best.get("fiscal_year"),best.get("fiscal_quarter"))
+        same=[x for x in found if (x.get("fiscal_year"),x.get("fiscal_quarter"))==latest_key]
+        # Merge fields across official feeds for the same period; e.g. daily EPS summary can anchor Q2 while
+        # a detailed feed supplies gross profit/margins. Never merge across different fiscal periods.
+        merged=dict(best)
+        for row in same:
+            for k in ("ytd_eps","revenue_ytd","gross_profit_ytd","operating_income_ytd","net_income_ytd","statement_date"):
+                if merged.get(k) is None and row.get(k) is not None:
+                    merged[k]=row[k]
+        merged["source_candidates"]=[{"source":x.get("source"),"endpoint":x.get("endpoint"),"kind":x.get("feed_kind"),"completeness":x.get("completeness")} for x in same]
+        merged["errors"]=errors; merged["candidate_hits"]=len(found)
+        return merged
     return {"official":False,"errors":errors,"candidate_hits":0}
 
 
@@ -922,4 +944,4 @@ async def cache_clear():
     _CACHE.clear(); return {"status":"ok","message":"cache cleared"}
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.2.1","mode":"cloud-mobile-financial-freshness-gate","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.2.2","mode":"cloud-mobile-official-financial-layer","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
