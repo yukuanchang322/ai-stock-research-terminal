@@ -13,6 +13,24 @@ function lineSvg(values){
 function metric(k,v,note=''){return `<div class="metric"><span>${k}</span><b>${v}</b><em>${note}</em></div>`}
 function targetRow(x){return `<div class="target-row ${x.name==='悲觀'?'bear':x.name==='樂觀'?'bull':'base'}"><span>${x.name}</span><b>${fmt0(x.target)}</b></div>`}
 
+function snapshotKey(ticker){return `ai-stock-v5.1-snapshot-${ticker}`}
+function currentSnapshot(d){
+  return {generated_at:d.generated_at,score:d.scores?.['綜合'],price:d.price,median_target:d.research?.median_target,median_eps:d.research?.median_forward_eps,per:d.per?.per,foreign20:d.flow?.foreign_20,regime:d.expectation_gap?.regime};
+}
+function deltaText(now,old,digits=1,suffix=''){if(now==null||old==null)return '—';const delta=Number(now)-Number(old);return `${delta>=0?'+':''}${delta.toFixed(digits)}${suffix}`}
+function renderSnapshotCompare(d){
+  const key=snapshotKey(d.ticker), oldRaw=localStorage.getItem(key), now=currentSnapshot(d);
+  let old=null; try{old=oldRaw?JSON.parse(oldRaw):null}catch(e){}
+  const box=$('snapshotCompare');
+  if(!box)return;
+  if(!old){box.innerHTML='<div class="empty bordered">這是此裝置第一次保存這檔股票的分析；下次查詢時會自動顯示前後變化。</div>';}
+  else{
+    const rows=[['Research Score',old.score,now.score,deltaText(now.score,old.score,0,' 分')],['法人目標價中位數',old.median_target,now.median_target,deltaText(now.median_target,old.median_target,0,'')],['Forward EPS 中位數',old.median_eps,now.median_eps,deltaText(now.median_eps,old.median_eps,2,'')],['PER',old.per,now.per,deltaText(now.per,old.per,1,'x')],['外資20日',old.foreign20,now.foreign20,deltaText(now.foreign20,old.foreign20,0,'')]];
+    box.innerHTML=`<div class="snapshot-head"><span>前次 ${old.generated_at?new Date(old.generated_at).toLocaleString('zh-TW'):'—'}</span><b>${old.regime||'—'} → ${now.regime||'—'}</b></div><div class="snapshot-grid">${rows.map(r=>`<div><span>${r[0]}</span><small>${r[1]==null?'—':fmt(r[1],r[0]==='Research Score'?0:1)} → ${r[2]==null?'—':fmt(r[2],r[0]==='Research Score'?0:1)}</small><b>${r[3]}</b></div>`).join('')}</div>`;
+  }
+  localStorage.setItem(key,JSON.stringify(now));
+}
+
 function render(d){
   currentTicker=d.ticker;
   $('report').classList.remove('hidden'); $('pdfBtn').disabled=false;
@@ -20,7 +38,7 @@ function render(d){
   $('companyName').textContent=d.name; $('tickerLabel').textContent=d.ticker; $('sector').textContent=d.industry; $('marketType').textContent=d.market_type;
   $('stanceTag').textContent=d.stance; $('confidenceScore').textContent=d.confidence?.overall ?? '—'; $('price').textContent=fmt(d.price,1); $('dayChange').textContent=pct(d.change_pct);
   $('thesis').textContent=d.thesis; $('dataPolicy').textContent=d.data_policy; $('overallScore').textContent=d.scores['綜合'];
-  $('kpis').innerHTML=[['Research Score',`${d.scores['綜合']}/100`,'量化綜合'],['可信度',`${d.confidence?.overall??'—'}/100`,'資料+估值'],['PER',`${fmt(d.per?.per,1)}x`,'最新可得'],['營收 YoY',pct(d.revenue?.revenue_yoy),'最新月'],['外資20日',fmt0(d.flow?.foreign_20),'淨買賣'],['RSI14',fmt(d.technical?.rsi14,1),'技術動能']].map(x=>`<div class="kpi"><span>${x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`).join('');
+  $('kpis').innerHTML=[['預期狀態',d.expectation_gap?.regime||'—','V5.1'],['Research Score',`${d.scores['綜合']}/100`,'量化綜合'],['可信度',`${d.confidence?.overall??'—'}/100`,'資料+估值'],['PER',`${fmt(d.per?.per,1)}x`,'最新可得'],['營收 YoY',pct(d.revenue?.revenue_yoy),'最新月'],['外資20日',fmt0(d.flow?.foreign_20),'淨買賣'],['RSI14',fmt(d.technical?.rsi14,1),'技術動能']].map(x=>`<div class="kpi"><span>${x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`).join('');
   $('dockPdf').disabled=false; $('dockShare').disabled=false; $('lastFetch').textContent=`資料頁產生 ${new Date(d.generated_at).toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit'})}`;
   const u=new URL(location.href); u.searchParams.set('ticker',d.ticker); history.replaceState({},'',u);
   $('scoreBars').innerHTML=['基本面','籌碼面','技術面','估值'].map(k=>`<div class="scorebar"><span>${k}</span><div class="scorebar-track"><div class="scorebar-fill" style="width:${d.scores[k]}%"></div></div><b>${d.scores[k]}</b></div>`).join('');
@@ -53,6 +71,15 @@ function render(d){
   $('analystTable').innerHTML=(rr.reports||[]).length?`<table class="clean-table analyst-web-table"><thead><tr><th>法人/券商</th><th>日期</th><th>評等</th><th>目標價</th><th>來源/標題</th><th>可信度</th></tr></thead><tbody>${rr.reports.map(x=>`<tr><td>${x.institution||'—'}</td><td>${x.report_date||'—'}</td><td>${x.rating||'—'}</td><td>${fmt0(x.target_price)}</td><td>${x.source_url?`<a href="${x.source_url}" target="_blank" rel="noopener noreferrer">${x.title||x.publisher||'查看來源'}</a>`:(x.title||x.publisher||'自行匯入')}</td><td>${x.confidence!=null?`${x.confidence}/100`:'—'}</td></tr>`).join('')}</tbody></table>`:'<div class="empty bordered">目前尚未搜尋到可解析的公開法人研究引用。可按「強制刷新」重新搜尋最新網路資料。</div>';
 
   const ev=d.company_events?.rows||[]; if($('eventRadar')) $('eventRadar').innerHTML=ev.length?`<div class="event-list">${ev.map(x=>`<article class="event-item"><div><time>${x.date||'—'}</time><div class="event-tags">${(x.tags||[]).map(t=>`<span>${t}</span>`).join('')}</div></div><div><a href="${x.source_url||'#'}" target="_blank" rel="noopener noreferrer">${x.title||'—'}</a><small>${x.publisher||'公開來源'}</small></div></article>`).join('')}</div>`:'<div class="empty bordered">目前尚未搜尋到近期法說或重大訊息引用。</div>';
+
+  const ex=d.expectation_gap||{};
+  if($('expectationRegime')) $('expectationRegime').textContent=ex.regime||'資料不足';
+  if($('expectationSummary')) $('expectationSummary').textContent=ex.summary||'目前無法形成預期差判斷。';
+  if($('revisionScore')) $('revisionScore').textContent=ex.revision_score??'—';
+  if($('expectationMethod')) $('expectationMethod').textContent=ex.methodology||'';
+  if($('expectationSignals')) $('expectationSignals').innerHTML=(ex.signals||[]).map(x=>`<div class="expect-signal ${x.direction||'flat'}"><span>${x.name}</span><b>${x.display||'—'}</b></div>`).join('');
+  if($('revisionTable')) $('revisionTable').innerHTML=(ex.institution_revisions||[]).length?`<table class="clean-table"><thead><tr><th>法人</th><th>前次 → 最新</th><th>EPS 修正</th><th>目標價修正</th><th>最新目標</th></tr></thead><tbody>${ex.institution_revisions.map(x=>`<tr><td>${x.institution||'—'}</td><td>${x.previous_date||'—'} → ${x.latest_date||'—'}</td><td>${pct(x.eps_revision_pct)}</td><td>${pct(x.target_revision_pct)}</td><td>${fmt0(x.latest_target)}</td></tr>`).join('')}</tbody></table>`:'<div class="empty bordered">目前沒有足夠的同機構前後研究資料可比較。</div>';
+  renderSnapshotCompare(d);
 
   $('valuationBody').innerHTML=scenarios.length?scenarios.map(x=>`<tr><td>${x.name}</td><td>${fmt(x.eps,2)}</td><td>${fmt(x.pe,1)}x</td><td><b>${fmt0(x.target)}</b></td><td>${pct(x.upside_pct)}</td></tr>`).join(''):'<tr><td colspan="5">估值資料不足</td></tr>';
   $('assumptions').innerHTML=`<div class="assumption-row"><b>EPS Basis</b><span>${d.valuation.eps_basis||'—'}</span></div><div class="assumption-row"><b>PE Basis</b><span>${d.valuation.pe_basis||'—'}</span></div><div class="assumption-row"><b>估值信心</b><span>${d.valuation.confidence||0}/100</span></div><div class="assumption-row"><b>模型原則</b><span>Bear/Base/Bull 對 EPS 與 PE 同時做情境化，而非單點預測。</span></div>`; $('peBand').innerHTML=`歷史 PER：P25 <b>${fmt(d.per?.pe_p25,1)}x</b> · Median <b>${fmt(d.per?.pe_median,1)}x</b> · P75 <b>${fmt(d.per?.pe_p75,1)}x</b>`;

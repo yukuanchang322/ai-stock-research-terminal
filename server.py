@@ -34,7 +34,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.0.0")
+app = FastAPI(title="AI Stock Research Terminal", version="5.1.0")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -141,7 +141,7 @@ def _normalize_title(s: str) -> str:
 
 async def google_news_rss(query: str) -> list[dict[str, Any]]:
     url=f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-    async with httpx.AsyncClient(timeout=18, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.0"}) as client:
+    async with httpx.AsyncClient(timeout=18, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.1"}) as client:
         r=await client.get(url); r.raise_for_status()
     root=ET.fromstring(r.text)
     out=[]
@@ -235,6 +235,103 @@ def merge_research(imported: list[dict[str, Any]], web_rows: list[dict[str, Any]
         "median_forward_eps":median(epss) if epss else None, "target_revision_pct":median(revisions) if revisions else None, "eps_revision_pct":median(eps_revisions) if eps_revisions else None,
         "ratings":ratings, "reports":rows, "public_web_count":sum(1 for x in rows if x.get('source_type')=='public_web_quote'),
         "manual_count":sum(1 for x in rows if x.get('source_type')=='manual_import'),
+    }
+
+
+def expectation_gap_analysis(research: dict[str, Any], events: dict[str, Any], perdata: dict[str, Any], revenue: dict[str, Any], scores_map: dict[str, int], price: float | None) -> dict[str, Any]:
+    """V5.1: combine estimate revisions, analyst target revisions, event tone and valuation stretch.
+    This is a transparent signal framework, not a price forecast.
+    """
+    reports = research.get("reports") or []
+    by_inst: dict[str, list[dict[str, Any]]] = {}
+    for row in reports:
+        inst = row.get("institution")
+        if not inst or inst == "未辨識機構":
+            continue
+        by_inst.setdefault(inst, []).append(row)
+    revision_rows = []
+    for inst, rows in by_inst.items():
+        rows = sorted(rows, key=lambda x: x.get("report_date") or "", reverse=True)
+        if len(rows) < 2:
+            continue
+        newest, older = rows[0], rows[1]
+        nt, ot = safe_num(newest.get("target_price")), safe_num(older.get("target_price"))
+        ne, oe = safe_num(newest.get("forward_eps")), safe_num(older.get("forward_eps"))
+        tr = ((nt / ot) - 1) * 100 if nt is not None and ot else None
+        er = ((ne / oe) - 1) * 100 if ne is not None and oe else None
+        if tr is None and er is None:
+            continue
+        revision_rows.append({
+            "institution": inst, "latest_date": newest.get("report_date"), "previous_date": older.get("report_date"),
+            "latest_target": nt, "previous_target": ot, "target_revision_pct": tr,
+            "latest_eps": ne, "previous_eps": oe, "eps_revision_pct": er,
+            "latest_rating": newest.get("rating"), "source_url": newest.get("source_url")
+        })
+
+    positive_words = ["上修","調升","看旺","優於預期","成長","強勁","創高","增加","改善","樂觀","需求旺","接單","擴產"]
+    negative_words = ["下修","調降","看淡","不如預期","衰退","疲弱","減少","惡化","保守","庫存","延後","砍單"]
+    tone_points = 0
+    recent_count = 0
+    for row in (events.get("rows") or [])[:12]:
+        text = f"{row.get('title','')} {row.get('summary','')}"
+        pos = sum(1 for w in positive_words if w in text)
+        neg = sum(1 for w in negative_words if w in text)
+        tone_points += pos - neg
+        recent_count += 1
+    event_tone_score = max(-100, min(100, tone_points * 18)) if recent_count else 0
+
+    eps_rev = safe_num(research.get("eps_revision_pct"))
+    target_rev = safe_num(research.get("target_revision_pct"))
+    median_target = safe_num(research.get("median_target"))
+    target_upside = ((median_target / price) - 1) * 100 if median_target is not None and price else None
+    current_pe = safe_num(perdata.get("per")); p25=safe_num(perdata.get("pe_p25")); med=safe_num(perdata.get("pe_median")); p75=safe_num(perdata.get("pe_p75"))
+    if current_pe is None or med is None:
+        valuation_zone, valuation_risk = "資料不足", 0
+    elif p75 is not None and current_pe >= p75:
+        valuation_zone, valuation_risk = "高於歷史 P75", 85
+    elif current_pe >= med:
+        valuation_zone, valuation_risk = "高於歷史中位數", 60
+    elif p25 is not None and current_pe <= p25:
+        valuation_zone, valuation_risk = "低於歷史 P25", 20
+    else:
+        valuation_zone, valuation_risk = "歷史合理區間", 40
+
+    rev_yoy = safe_num(revenue.get("revenue_yoy")); rev_3m = safe_num(revenue.get("revenue_3m_yoy"))
+    growth_accel = (rev_yoy - rev_3m) if rev_yoy is not None and rev_3m is not None else None
+    revision_score = 50
+    if eps_rev is not None: revision_score += max(-25, min(25, eps_rev * 2.2))
+    if target_rev is not None: revision_score += max(-20, min(20, target_rev * 1.5))
+    revision_score += max(-15, min(15, event_tone_score * .15))
+    if growth_accel is not None: revision_score += max(-10, min(10, growth_accel * .5))
+    revision_score = round(max(0, min(100, revision_score)))
+
+    fundamental_positive = (eps_rev is not None and eps_rev > 2) or (rev_yoy is not None and rev_yoy > 10) or event_tone_score > 20
+    fundamental_negative = (eps_rev is not None and eps_rev < -2) or (rev_yoy is not None and rev_yoy < -10) or event_tone_score < -20
+    if fundamental_positive and valuation_risk >= 80:
+        regime = "基本面上修，但估值偏熱"
+        summary = "獲利/營運預期偏上修，但目前估值已進入歷史高檔；後續股價更依賴 EPS 持續上修。"
+    elif revision_score >= 65:
+        regime = "市場預期上修"
+        summary = "法人預估、目標價或公司事件訊號整體偏正向，市場預期正在改善。"
+    elif revision_score <= 35 or fundamental_negative:
+        regime = "市場預期下修"
+        summary = "法人預估或公司營運訊號偏弱，市場預期存在下修風險。"
+    else:
+        regime = "預期中性／等待確認"
+        summary = "目前上修與下修訊號未形成明確共識，宜等待下一輪法說、營收或法人修正。"
+
+    signals = [
+        {"name":"Forward EPS 修正", "value": eps_rev, "display": pct(eps_rev), "direction": "up" if eps_rev is not None and eps_rev>0 else "down" if eps_rev is not None and eps_rev<0 else "flat"},
+        {"name":"法人目標價修正", "value": target_rev, "display": pct(target_rev), "direction": "up" if target_rev is not None and target_rev>0 else "down" if target_rev is not None and target_rev<0 else "flat"},
+        {"name":"法人共識相對現價", "value": target_upside, "display": pct(target_upside), "direction": "up" if target_upside is not None and target_upside>0 else "down" if target_upside is not None and target_upside<0 else "flat"},
+        {"name":"公司事件語氣", "value": event_tone_score, "display": f"{event_tone_score:+.0f}", "direction": "up" if event_tone_score>0 else "down" if event_tone_score<0 else "flat"},
+        {"name":"估值位置", "value": valuation_risk, "display": valuation_zone, "direction": "risk" if valuation_risk>=60 else "flat"},
+    ]
+    return {
+        "regime": regime, "summary": summary, "revision_score": revision_score, "valuation_risk": valuation_risk,
+        "valuation_zone": valuation_zone, "event_tone_score": event_tone_score, "target_upside_pct": target_upside,
+        "revenue_acceleration_pct": growth_accel, "signals": signals, "institution_revisions": revision_rows[:12],
+        "methodology": "Forward EPS/目標價修正 + 公司事件語氣 + 營收動能 + 歷史 PER 位置；缺失欄位不補值。"
     }
 
 def rsi(series: pd.Series, period: int = 14) -> float | None:
@@ -540,6 +637,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     valuation=model_valuation(tech.get("last"),perdata,financial.get("eps"),research.get("median_forward_eps"))
     sc=scores(tech,revenue,flow,perdata,financial,research)
     nar=narrative(sc,tech,revenue,flow,valuation,research)
+    expectation=expectation_gap_analysis(research, company_events, perdata, revenue, sc, lp)
     lp=tech.get("last"); prev=tech.get("series",[])[-2]["close"] if len(tech.get("series",[]))>=2 else None
     change=((lp/prev-1)*100) if lp and prev else None
     source_status=[
@@ -555,7 +653,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     conf=calc_confidence(source_status,valuation,research)
     data={"ticker":ticker,"name":info.get("stock_name") or ticker,"industry":info.get("industry_category") or "—","market_type":info.get("type") or "—",
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
-          "research":research,"valuation":valuation,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
+          "research":research,"expectation_gap":expectation,"valuation":valuation,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
           "source_status":source_status,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,
           "data_policy":"關鍵數值由結構化資料與公式計算；缺資料即標示缺失。法人區聚合公開網路標題、摘要、數值與來源連結，不重製付費全文；模型估值與市場法人共識分流。"}
     _CACHE[ticker]=(time.time(),data)
@@ -564,26 +662,28 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
 
 def report_html(d: dict[str, Any]) -> str:
     esc=lambda x: html.escape("—" if x is None else str(x))
-    sc=d["scores"]; tech=d["technical"]; rev=d["revenue"]; flow=d["flow"]; per=d["per"]; fin=d["financial"]; research=d["research"]; val=d["valuation"]; conf=d["confidence"]
+    sc=d["scores"]; tech=d["technical"]; rev=d["revenue"]; flow=d["flow"]; per=d["per"]; fin=d["financial"]; research=d["research"]; exp=d.get("expectation_gap",{}); val=d["valuation"]; conf=d["confidence"]
     src="".join(f"<tr><td>{esc(x['name'])}</td><td>{esc(x.get('dataset'))}</td><td>{esc(x.get('as_of'))}</td><td>{esc(x['scheduled_update'])}</td><td>{'OK' if x['status']=='ok' else '缺資料'}</td></tr>" for x in d["source_status"])
     scenarios="".join(f"<tr><td>{x['name']}</td><td>{x['eps']:.2f}</td><td>{x['pe']:.1f}x</td><td><b>{x['target']:,.0f}</b></td><td>{x['upside_pct']:+.1f}%</td></tr>" for x in val.get("scenarios",[])) or "<tr><td colspan='5'>估值資料不足</td></tr>"
     rrows="".join(f"<tr><td>{esc(x.get('institution'))}</td><td>{esc(x.get('report_date'))}</td><td>{esc(x.get('rating'))}</td><td>{nfmt(safe_num(x.get('target_price')),0)}</td><td>{nfmt(safe_num(x.get('forward_eps')),2)}</td></tr>" for x in research.get("reports",[])) or "<tr><td colspan='5'>目前尚未搜尋到可解析的公開法人研究引用。</td></tr>"
+    erows="".join(f"<tr><td>{esc(x.get('institution'))}</td><td>{esc(x.get('previous_date'))} → {esc(x.get('latest_date'))}</td><td>{pct(x.get('eps_revision_pct'))}</td><td>{pct(x.get('target_revision_pct'))}</td><td>{nfmt(x.get('latest_target'),0)}</td></tr>" for x in exp.get("institution_revisions",[])) or "<tr><td colspan='5'>同機構前後修正資料不足。</td></tr>"
     cats="".join(f"<li>{esc(x)}</li>" for x in d.get("catalysts",[])); risks="".join(f"<li>{esc(x)}</li>" for x in d.get("risks",[]))
     return f"""<!doctype html><html lang='zh-Hant'><head><meta charset='utf-8'><style>
     @page{{size:A4;margin:11mm}} body{{font-family:'Noto Sans TC','PingFang TC',sans-serif;color:#13202a;font-size:9.5pt;line-height:1.55}} h1{{font-size:23pt;margin:0}} h2{{font-size:14pt;border-bottom:2px solid #173847;padding-bottom:4px;margin:18px 0 8px}} .muted{{color:#60727c}} .head{{display:flex;justify-content:space-between;border-bottom:3px solid #173847;padding-bottom:9px}} .price{{font-size:23pt;font-weight:800;text-align:right}} .pill{{display:inline-block;border:1px solid #719188;border-radius:20px;padding:2px 8px;margin-right:5px}} .grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin:10px 0}} .card{{border:1px solid #d7e0e4;border-radius:7px;padding:8px}} .card b{{font-size:14pt;display:block}} table{{width:100%;border-collapse:collapse;font-size:8.4pt}} th,td{{padding:5px;border-bottom:1px solid #dce4e8;text-align:left}} th{{background:#f2f6f7}} .call{{border-left:4px solid #17866b;background:#f4faf8;padding:9px}} .warn{{border:1px solid #d7b94b;background:#fff9e7;padding:8px;margin-top:10px}} .small{{font-size:8pt}} .page-break{{break-before:page}} .cols{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} ul{{margin:4px 0 0;padding-left:18px}} .badge{{font-weight:700}}
     </style></head><body>
-    <div class='head'><div><div class='muted'>AI STOCK RESEARCH TERMINAL V5 WEB RESEARCH • TAIWAN EQUITY RESEARCH</div><h1>{esc(d['name'])} <span class='muted'>{esc(d['ticker'])}</span></h1><div><span class='pill'>{esc(d['industry'])}</span><span class='pill'>{esc(d['stance'])}</span><span class='pill'>可信度 {conf['overall']}/100</span></div></div><div><div class='muted'>最新收盤</div><div class='price'>{nfmt(d['price'],1)}</div><div>{pct(d['change_pct'])}</div></div></div>
+    <div class='head'><div><div class='muted'>AI STOCK RESEARCH TERMINAL V5.1 EXPECTATION GAP • TAIWAN EQUITY RESEARCH</div><h1>{esc(d['name'])} <span class='muted'>{esc(d['ticker'])}</span></h1><div><span class='pill'>{esc(d['industry'])}</span><span class='pill'>{esc(d['stance'])}</span><span class='pill'>可信度 {conf['overall']}/100</span></div></div><div><div class='muted'>最新收盤</div><div class='price'>{nfmt(d['price'],1)}</div><div>{pct(d['change_pct'])}</div></div></div>
     <div class='small muted'>報告產生：{esc(d['generated_at'])} ｜ 資料完整度：{conf['data_completeness']}% ｜ 估值信心：{conf['valuation_confidence']}%</div>
     <h2>1. Executive Summary</h2><div class='call'>{esc(d['thesis'])}</div>
     <div class='grid'><div class='card'>綜合評分<b>{sc['綜合']}/100</b></div><div class='card'>基本面<b>{sc['基本面']}</b></div><div class='card'>籌碼面<b>{sc['籌碼面']}</b></div><div class='card'>技術面<b>{sc['技術面']}</b></div></div>
     <div class='cols'><div><b>主要催化劑</b><ul>{cats}</ul></div><div><b>主要風險</b><ul>{risks}</ul></div></div>
-    <h2>2. Fundamentals</h2><table><tr><th>最新月營收</th><th>YoY</th><th>3M YoY</th><th>最新 EPS</th><th>毛利率</th><th>營益率</th></tr><tr><td>{nfmt(rev.get('latest_revenue'),0)}</td><td>{pct(rev.get('revenue_yoy'))}</td><td>{pct(rev.get('revenue_3m_yoy'))}</td><td>{nfmt(fin.get('eps'),2)}</td><td>{pct(fin.get('gross_margin'))}</td><td>{pct(fin.get('operating_margin'))}</td></tr></table>
-    <h2>3. Positioning & Technicals</h2><table><tr><th>外資20日</th><th>投信20日</th><th>融資20日</th><th>趨勢</th><th>RSI14</th><th>量比</th><th>支撐 / 壓力</th></tr><tr><td>{nfmt(flow.get('foreign_20'),0)}</td><td>{nfmt(flow.get('trust_20'),0)}</td><td>{pct(flow.get('margin_20_pct'))}</td><td>{esc(tech.get('trend'))}</td><td>{nfmt(tech.get('rsi14'),1)}</td><td>{nfmt(tech.get('volume_ratio_20'),2)}x</td><td>{nfmt(tech.get('support1'),1)} / {nfmt(tech.get('resistance'),1)}</td></tr></table>
-    <div class='page-break'></div><h2>4. Analyst Research & Revisions</h2><p>匯入報告數：<b>{research.get('count',0)}</b> ｜ Forward EPS 修正：<b>{pct(research.get('eps_revision_pct'))}</b></p><table><tr><th>法人/券商</th><th>日期</th><th>評等</th><th>目標價</th><th>Forward EPS</th></tr>{rrows}</table><p class='small muted'>本區彙整公開網路可取得之研究引用與使用者匯入資料；僅保存標題、摘要、數值、發布者與來源連結，不重製付費研究全文。</p>
-    <h2>5. Company Events & Earnings-call Radar</h2><table><tr><th>日期</th><th>事件</th><th>發布者</th></tr>{''.join(f"<tr><td>{esc(x.get('date'))}</td><td>{esc(x.get('title'))}</td><td>{esc(x.get('publisher'))}</td></tr>" for x in d.get('company_events',{{}}).get('rows',[])[:8]) or "<tr><td colspan='3'>目前未搜尋到公司事件引用。</td></tr>"}</table>
-    <h2>6. Valuation Framework</h2><p>EPS：{esc(val.get('eps_basis'))}<br>PE：{esc(val.get('pe_basis'))}</p><table><tr><th>情境</th><th>EPS</th><th>合理 PE</th><th>模型合理價</th><th>相對現價</th></tr>{scenarios}</table>
+    <h2>2. Expectation Gap & Revision Radar</h2><div class='call'><b>{esc(exp.get('regime'))}</b><br>{esc(exp.get('summary'))}</div><div class='grid'><div class='card'>預期修正分數<b>{exp.get('revision_score','—')}/100</b></div><div class='card'>EPS 修正<b>{pct(research.get('eps_revision_pct'))}</b></div><div class='card'>目標價修正<b>{pct(research.get('target_revision_pct'))}</b></div><div class='card'>估值區域<b style='font-size:10pt'>{esc(exp.get('valuation_zone'))}</b></div></div><table><tr><th>法人</th><th>前次 → 最新</th><th>EPS 修正</th><th>目標價修正</th><th>最新目標</th></tr>{erows}</table><p class='small muted'>{esc(exp.get('methodology'))}</p>
+    <h2>3. Fundamentals</h2><table><tr><th>最新月營收</th><th>YoY</th><th>3M YoY</th><th>最新 EPS</th><th>毛利率</th><th>營益率</th></tr><tr><td>{nfmt(rev.get('latest_revenue'),0)}</td><td>{pct(rev.get('revenue_yoy'))}</td><td>{pct(rev.get('revenue_3m_yoy'))}</td><td>{nfmt(fin.get('eps'),2)}</td><td>{pct(fin.get('gross_margin'))}</td><td>{pct(fin.get('operating_margin'))}</td></tr></table>
+    <h2>4. Positioning & Technicals</h2><table><tr><th>外資20日</th><th>投信20日</th><th>融資20日</th><th>趨勢</th><th>RSI14</th><th>量比</th><th>支撐 / 壓力</th></tr><tr><td>{nfmt(flow.get('foreign_20'),0)}</td><td>{nfmt(flow.get('trust_20'),0)}</td><td>{pct(flow.get('margin_20_pct'))}</td><td>{esc(tech.get('trend'))}</td><td>{nfmt(tech.get('rsi14'),1)}</td><td>{nfmt(tech.get('volume_ratio_20'),2)}x</td><td>{nfmt(tech.get('support1'),1)} / {nfmt(tech.get('resistance'),1)}</td></tr></table>
+    <div class='page-break'></div><h2>5. Analyst Research & Revisions</h2><p>匯入報告數：<b>{research.get('count',0)}</b> ｜ Forward EPS 修正：<b>{pct(research.get('eps_revision_pct'))}</b></p><table><tr><th>法人/券商</th><th>日期</th><th>評等</th><th>目標價</th><th>Forward EPS</th></tr>{rrows}</table><p class='small muted'>本區彙整公開網路可取得之研究引用與使用者匯入資料；僅保存標題、摘要、數值、發布者與來源連結，不重製付費研究全文。</p>
+    <h2>6. Company Events & Earnings-call Radar</h2><table><tr><th>日期</th><th>事件</th><th>發布者</th></tr>{''.join(f"<tr><td>{esc(x.get('date'))}</td><td>{esc(x.get('title'))}</td><td>{esc(x.get('publisher'))}</td></tr>" for x in d.get('company_events',{{}}).get('rows',[])[:8]) or "<tr><td colspan='3'>目前未搜尋到公司事件引用。</td></tr>"}</table>
+    <h2>7. Valuation Framework</h2><p>EPS：{esc(val.get('eps_basis'))}<br>PE：{esc(val.get('pe_basis'))}</p><table><tr><th>情境</th><th>EPS</th><th>合理 PE</th><th>模型合理價</th><th>相對現價</th></tr>{scenarios}</table>
     <p class='small muted'>歷史 PER：P25 {nfmt(per.get('pe_p25'),1)}x / Median {nfmt(per.get('pe_median'),1)}x / P75 {nfmt(per.get('pe_p75'),1)}x；模型合理價與法人目標價分開呈現。</p>
-    <h2>7. Data Lineage & Freshness</h2><table><tr><th>資料</th><th>Dataset</th><th>截至</th><th>預定更新</th><th>狀態</th></tr>{src}</table>
+    <h2>8. Data Lineage & Freshness</h2><table><tr><th>資料</th><th>Dataset</th><th>截至</th><th>預定更新</th><th>狀態</th></tr>{src}</table>
     <div class='warn'><b>重要揭露</b><br>本報告為研究與資訊整理工具，不構成個人化投資建議、招攬或收益保證。模型估值對 EPS 與估值倍數高度敏感；請以每列資料截至日與來源為準。</div>
     </body></html>"""
 
@@ -610,13 +710,13 @@ async def stock_pdf(ticker: str, refresh: bool = Query(True)):
     d=await build_stock(ticker.strip(), force_refresh=refresh)
     if d["price"] is None: raise HTTPException(503,"目前無法取得股價資料，為避免輸出錯誤報告，PDF 未產生。")
     stamp=datetime.now().strftime("%Y%m%d_%H%M")
-    out=REPORT_DIR/f"{ticker}_{stamp}_research_v5.pdf"
+    out=REPORT_DIR/f"{ticker}_{stamp}_research_v5_1.pdf"
     HTML(string=report_html(d),base_url=str(ROOT)).write_pdf(out)
-    return FileResponse(out,media_type="application/pdf",filename=f"{ticker}_AI_research_V5_{stamp}.pdf")
+    return FileResponse(out,media_type="application/pdf",filename=f"{ticker}_AI_research_V5_1_{stamp}.pdf")
 
 @app.post("/api/cache/clear")
 async def cache_clear():
     _CACHE.clear(); return {"status":"ok","message":"cache cleared"}
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.0.0","mode":"cloud-mobile-web-research","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.1.0","mode":"cloud-mobile-expectation-gap","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}

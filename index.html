@@ -9,7 +9,7 @@
   <meta name="apple-mobile-web-app-title" content="AI Stock" />
   <link rel="manifest" href="/static/manifest.webmanifest" />
   <link rel="apple-touch-icon" href="/static/icons/icon-192.png" />
-  <title>AI Stock Research Terminal</title>
+  <title>AI Stock Research Terminal V5.1</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -75,7 +75,7 @@
         </div>
         <div>
           <div class="section-title"><div><span>05</span><h3>法人研究共識</h3></div><div class="pill positive">Public Web Research</div></div>
-          <div class="panel"><div id="analystTable"></div><div class="consensus-box"><span>公開研究引用數</span><b id="reportCount"></b><small id="consensusText"></small><small id="revisionText"></small></div><div id="consensusStats" class="consensus-stats"></div><p class="analysis">V5 會搜尋公開網路中的法人研究引用、目標價與評等，保留發布日期、媒體/來源及原始連結；未能辨識或缺乏來源的數字不納入核心共識。</p></div>
+          <div class="panel"><div id="analystTable"></div><div class="consensus-box"><span>公開研究引用數</span><b id="reportCount"></b><small id="consensusText"></small><small id="revisionText"></small></div><div id="consensusStats" class="consensus-stats"></div><p class="analysis">V5.1 會搜尋公開網路法人研究，並追蹤同機構前後 EPS/目標價修正，未能辨識或缺乏來源的數字不納入核心共識。</p></div>
         </div>
       </section>
 
@@ -84,8 +84,16 @@
         <div class="panel"><div id="eventRadar"></div><p class="analysis">聚合公司法說、財報、營收、展望、接單與重大訊息的公開網路引用；每筆保留日期、發布者與來源連結。</p></div>
       </section>
 
+      <section class="section expectation-section">
+        <div class="section-title"><div><span>07</span><h3>預期差與修正雷達</h3></div><div class="pill positive">Expectation Gap</div></div>
+        <div class="expectation-hero"><div><small>市場預期狀態</small><h4 id="expectationRegime">—</h4><p id="expectationSummary">—</p></div><div class="expectation-score"><b id="revisionScore">—</b><span>/100</span><small>預期修正分數</small></div></div>
+        <div id="expectationSignals" class="expectation-signals"></div>
+        <div class="panel"><h4>同機構前後修正</h4><div id="revisionTable"></div><p class="analysis" id="expectationMethod"></p></div>
+        <div class="panel compare-panel"><h4>本機上次分析 vs 這次分析</h4><div id="snapshotCompare"></div><p class="analysis">此比較儲存在你的 iPhone / 瀏覽器本機，不會把個人查詢紀錄上傳到伺服器；清除瀏覽器網站資料後會重置。</p></div>
+      </section>
+
       <section class="section">
-        <div class="section-title"><div><span>07</span><h3>估值與目標價模型</h3></div><div class="pill neutral">Transparent Valuation</div></div>
+        <div class="section-title"><div><span>08</span><h3>估值與目標價模型</h3></div><div class="pill neutral">Transparent Valuation</div></div>
         <div class="valuation-grid">
           <div class="panel"><h4>Bear / Base / Bull</h4><table class="clean-table"><thead><tr><th>情境</th><th>EPS</th><th>合理 PE</th><th>模型合理價</th><th>相對現價</th></tr></thead><tbody id="valuationBody"></tbody></table><p class="note">目標價由公式推導，不由 AI 自由生成。模型合理價與法人目標價分開顯示。</p></div>
           <div class="panel assumption"><h4>估值基礎</h4><div id="assumptions"></div><div id="peBand" class="pe-band"></div></div>
@@ -93,13 +101,13 @@
       </section>
 
       <section class="section strategy-section">
-        <div class="section-title"><div><span>08</span><h3>價格情境與投資紀律</h3></div><div class="pill neutral">Scenario Planning</div></div>
+        <div class="section-title"><div><span>09</span><h3>價格情境與投資紀律</h3></div><div class="pill neutral">Scenario Planning</div></div>
         <div class="strategy-grid" id="strategyGrid"></div>
         <p class="note">此區為研究情境與風險管理框架，不構成個人化投資建議。</p>
       </section>
 
       <section class="section source-section">
-        <div class="section-title"><div><span>09</span><h3>資料來源、新鮮度與揭露</h3></div></div>
+        <div class="section-title"><div><span>10</span><h3>資料來源、新鮮度與揭露</h3></div></div>
         <div id="sourceTable"></div>
         <div class="disclaimer">重要聲明：本系統為研究與資訊整理工具，不構成個人化投資建議、招攬或收益保證。價格、財務與籌碼資料可能因交易所或資料供應商更新時程而延遲；PDF 會保留報告產生時間與各資料最後日期。</div>
       </section>
@@ -110,7 +118,7 @@
 
   <div class="install-sheet" id="installSheet"><div class="install-card"><button class="close" id="closeInstall">×</button><h3>加入 iPhone 主畫面</h3><p>在 Safari 點下方「分享」按鈕，選擇「加入主畫面」。之後可像 App 一樣開啟 AI Stock Research Terminal。</p><button class="primary" id="installOk">知道了</button></div></div>
 
-  <div class="modal" id="methodModal"><div class="modal-card"><button class="close" id="closeModal">×</button><h3>研究方法</h3><p>研究流程固定為：資料新鮮度檢查 → 指標計算 → 五構面評分 → 公開網路法人研究聚合與去重 → 多情境估值 → PDF 固化。</p><ol><li>AI 不補缺失財務數字。</li><li>價格、均線、RSI、法人買賣與估值由程式計算。</li><li>法人研究聚合公開網路標題、摘要與數值，保留原始來源連結，不重製付費全文。</li><li>每份 PDF 固定保存產生時間、資料日期與估值基礎。</li></ol></div></div>
+  <div class="modal" id="methodModal"><div class="modal-card"><button class="close" id="closeModal">×</button><h3>研究方法</h3><p>研究流程固定為：資料新鮮度檢查 → 指標計算 → 五構面評分 → 公開網路法人研究聚合與去重 → EPS/目標價修正 → 預期差判斷 → 多情境估值 → PDF 固化。</p><ol><li>AI 不補缺失財務數字。</li><li>價格、均線、RSI、法人買賣與估值由程式計算。</li><li>法人研究聚合公開網路標題、摘要與數值，保留原始來源連結，不重製付費全文。</li><li>每份 PDF 固定保存產生時間、資料日期與估值基礎。</li></ol></div></div>
   <script src="app.js"></script>
 </body>
 </html>
