@@ -34,7 +34,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.1.0")
+app = FastAPI(title="AI Stock Research Terminal", version="5.1.2")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -634,11 +634,12 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     except Exception as e:
         errors.append(f"PublicWebResearch: {type(e).__name__}"); web_research={"rows":[],"errors":[type(e).__name__],"fetched_at":datetime.now().astimezone().isoformat(timespec="seconds")}; company_events={"rows":[],"errors":[type(e).__name__],"fetched_at":datetime.now().astimezone().isoformat(timespec="seconds")}
     research=merge_research(load_research(ticker), web_research.get("rows", []))
-    valuation=model_valuation(tech.get("last"),perdata,financial.get("eps"),research.get("median_forward_eps"))
+    lp=tech.get("last")
+    valuation=model_valuation(lp,perdata,financial.get("eps"),research.get("median_forward_eps"))
     sc=scores(tech,revenue,flow,perdata,financial,research)
     nar=narrative(sc,tech,revenue,flow,valuation,research)
     expectation=expectation_gap_analysis(research, company_events, perdata, revenue, sc, lp)
-    lp=tech.get("last"); prev=tech.get("series",[])[-2]["close"] if len(tech.get("series",[]))>=2 else None
+    prev=tech.get("series",[])[-2]["close"] if len(tech.get("series",[]))>=2 else None
     change=((lp/prev-1)*100) if lp and prev else None
     source_status=[
         {"name":"股價","dataset":"TaiwanStockPrice","as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日約 17:30"},
@@ -719,4 +720,4 @@ async def cache_clear():
     _CACHE.clear(); return {"status":"ok","message":"cache cleared"}
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.1.0","mode":"cloud-mobile-expectation-gap","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.1.2","mode":"cloud-mobile-expectation-gap","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
