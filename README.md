@@ -1,4 +1,16 @@
-# AI Stock Research Terminal V5.1
+# AI Stock Research Terminal V5.2 — Data Integrity
+
+V5.2 focuses on financial-data correctness and freshness. Official TWSE/MOPS/TPEx data has priority over third-party structured APIs. EPS is split into quarterly, YTD, TTM, and Forward EPS; the valuation engine no longer uses quarterly EPS × 4 as a formal forecast.
+
+## V5.2 changes
+- Official income-statement snapshot first (TWSE/MOPS; TPEx fallback endpoint included).
+- Cross-check official quarter vs FinMind financial period; stale API is labeled and downgraded.
+- EPS stack: Quarter EPS / YTD EPS / TTM EPS / annual Forward EPS.
+- Q2/Q3/Q4 single-quarter EPS is derived from cumulative EPS only when prior-quarter cumulative data exists. Missing prior data is shown as missing, never guessed.
+- Forward EPS only enters valuation when the public research quote explicitly contains a forecast year and there are at least two comparable observations.
+- Valuation fallback uses TTM EPS; quarterly EPS × 4 has been removed.
+- PDF and mobile UI show EPS period, source, and stale status.
+
 
 台股手機雲端研究平台。輸入股票代號後，整合結構化市場資料、公開網路法人研究引用、公司事件雷達、透明估值與投資人 PDF。
 
