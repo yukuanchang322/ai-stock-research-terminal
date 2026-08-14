@@ -34,7 +34,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.2.0")
+app = FastAPI(title="AI Stock Research Terminal", version="5.2.1")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -107,38 +107,104 @@ def _row_value(row: dict[str, Any], includes: list[str], excludes: list[str] | N
     return None
 
 async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2"}) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.1"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
 
 async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
-    """Latest official MOPS/TWSE/TPEx income-statement snapshot. Dynamic key matching avoids schema-label drift."""
-    candidates=[
-        (TWSE_OPENAPI, "/opendata/t187ap06_L_ci", "TWSE/MOPS OpenAPI", "上市"),
-        (TWSE_OPENAPI, "/opendata/t187ap06_L_mim", "TWSE/MOPS OpenAPI", "上市"),
-        (TPEX_OPENAPI, "/mopsfin_t187ap06_O_ci", "TPEx/MOPS OpenAPI", "上櫃"),
-    ]
-    errors=[]
-    for base,path,source,market in candidates:
+    """Fetch the newest official MOPS income-statement row across listed/OTC industry schemas.
+
+    Do not stop at the first endpoint: a company can live in a schema other than general industry,
+    and different endpoints may refresh at slightly different times. The newest fiscal period wins.
+    """
+    industry_suffixes=["ci","mim","basi","bd","fh","ins"]
+    candidates=[]
+    for suffix in industry_suffixes:
+        candidates.append((TWSE_OPENAPI, f"/opendata/t187ap06_L_{suffix}", "TWSE/MOPS OpenAPI", "上市"))
+        candidates.append((TPEX_OPENAPI, f"/mopsfin_t187ap06_O_{suffix}", "TPEx/MOPS OpenAPI", "上櫃"))
+    errors=[]; found=[]
+
+    def company_code(row: dict[str, Any]) -> str:
+        direct=row.get("公司代號") or row.get("SecuritiesCompanyCode") or row.get("公司代碼") or row.get("代號")
+        if direct is not None: return str(direct).strip()
+        v=_row_value(row,["公司","代號"]) or _row_value(row,["代號"])
+        return str(v or "").strip()
+
+    async def probe(base: str, path: str, source: str, market: str):
         try:
             rows=await openapi_json(base,path)
-            row=next((x for x in rows if str(x.get("公司代號") or x.get("SecuritiesCompanyCode") or "").strip()==ticker),None)
-            if not row: continue
+            row=next((x for x in rows if company_code(x)==ticker),None)
+            if not row: return None
             eps=parse_num_text(_row_value(row,["基本每股盈餘"]) or _row_value(row,["每股盈餘"]))
-            revenue=parse_num_text(_row_value(row,["營業收入"], ["百分比"]))
-            gross=parse_num_text(_row_value(row,["營業毛利"], ["百分比"]))
-            op=parse_num_text(_row_value(row,["營業利益"], ["百分比"]))
-            net=parse_num_text(_row_value(row,["本期淨利"], ["百分比"]) or _row_value(row,["本期稅後淨利"]))
-            year=_row_value(row,["年度"]) or _row_value(row,["年"]); quarter=_row_value(row,["季別"]) or _row_value(row,["季"]); out_date=_row_value(row,["出表日期"]) or _row_value(row,["資料日期"])
+            revenue=parse_num_text(_row_value(row,["營業收入"],["百分比"]))
+            gross=parse_num_text(_row_value(row,["營業毛利"],["百分比"]))
+            op=parse_num_text(_row_value(row,["營業利益"],["百分比"]))
+            net=parse_num_text(_row_value(row,["本期淨利"],["百分比"]) or _row_value(row,["本期稅後淨利"]))
+            year=_row_value(row,["年度"]) or _row_value(row,["年"])
+            quarter=_row_value(row,["季別"]) or _row_value(row,["季"])
+            out_date=_row_value(row,["出表日期"]) or _row_value(row,["資料日期"])
             try:
                 y=int(str(year).strip()); y=y+1911 if y<1911 else y
             except Exception: y=None
-            q=None
-            qm=re.search(r"([1-4])",str(quarter or "")); q=int(qm.group(1)) if qm else None
+            q=None; qm=re.search(r"([1-4])",str(quarter or "")); q=int(qm.group(1)) if qm else None
             period=f"{y} Q{q}" if y and q else (roc_date_to_iso(out_date) or "latest")
-            return {"source":source,"market":market,"endpoint":path,"official":True,"period":period,"fiscal_year":y,"fiscal_quarter":q,"statement_date":roc_date_to_iso(out_date),"ytd_eps":eps,"revenue_ytd":revenue,"gross_profit_ytd":gross,"operating_income_ytd":op,"net_income_ytd":net,"raw_keys":list(row.keys())[:8],"errors":errors}
-        except Exception as e: errors.append(f"{path}:{type(e).__name__}")
-    return {"official":False,"errors":errors}
+            return {"source":source,"market":market,"endpoint":path,"official":True,"period":period,
+                    "fiscal_year":y,"fiscal_quarter":q,"statement_date":roc_date_to_iso(out_date),
+                    "ytd_eps":eps,"revenue_ytd":revenue,"gross_profit_ytd":gross,
+                    "operating_income_ytd":op,"net_income_ytd":net,"raw_keys":list(row.keys())[:12]}
+        except Exception as e:
+            errors.append(f"{path}:{type(e).__name__}")
+            return None
+
+    results=await asyncio.gather(*(probe(*c) for c in candidates))
+    found=[x for x in results if x]
+    if found:
+        found.sort(key=lambda x: (x.get("fiscal_year") or 0, x.get("fiscal_quarter") or 0, x.get("statement_date") or ""), reverse=True)
+        best=found[0]; best["errors"]=errors; best["candidate_hits"]=len(found)
+        return best
+    return {"official":False,"errors":errors,"candidate_hits":0}
+
+
+def expected_latest_financial_period(as_of: date | None=None) -> tuple[int,int,str]:
+    """Conservative Taiwan quarterly filing calendar used only as a freshness gate.
+
+    It does not invent financial values. It decides whether the latest fetched period is old enough
+    that the UI/valuation must warn or block stale accounting data.
+    """
+    d=as_of or date.today(); y=d.year
+    md=(d.month,d.day)
+    if md >= (11,14): return y,3,f"{y} Q3"
+    if md >= (8,14): return y,2,f"{y} Q2"
+    if md >= (5,15): return y,1,f"{y} Q1"
+    if md >= (3,31): return y-1,4,f"{y-1} Q4"
+    return y-1,3,f"{y-1} Q3"
+
+
+def assess_financial_integrity(official: dict[str, Any], eps_stack: dict[str, Any], as_of: date | None=None) -> dict[str, Any]:
+    ey,eq,expected=expected_latest_financial_period(as_of)
+    expected_key=(ey,eq)
+    oy,oq=official.get("fiscal_year"),official.get("fiscal_quarter")
+    official_key=(oy,oq) if oy and oq else None
+    api_period=eps_stack.get("structured_api_period")
+    am=re.match(r"(\d{4}) Q([1-4])",str(api_period or ""))
+    api_key=(int(am.group(1)),int(am.group(2))) if am else None
+    verified=bool(official.get("official") and official_key and official_key>=expected_key)
+    official_stale=bool(official.get("official") and official_key and official_key<expected_key)
+    api_stale=bool(api_key and api_key<expected_key)
+    eps_ready=verified and eps_stack.get("ytd_eps") is not None
+    if verified and eps_ready:
+        status="verified"; severity="ok"; message=f"官方最新財報期已驗證：{official.get('period')}"
+    elif verified:
+        status="verified_period_missing_eps"; severity="warning"; message=f"官方期間已達 {official.get('period')}，但 EPS 欄位尚未可靠解析；核心財報估值暫停。"
+    elif official_stale:
+        status="official_stale"; severity="stale"; message=f"官方介面目前僅取得 {official.get('period')}，低於應有 {expected}；不得標示為最新。"
+    else:
+        status="unverified"; severity="stale"; message=f"尚未從官方介面驗證 {expected}；結構化 API 財報不得視為最新。"
+    return {"status":status,"severity":severity,"expected_period":expected,
+            "official_period":official.get("period"),"structured_api_period":api_period,
+            "official_verified":verified,"official_stale":official_stale,"structured_api_stale":api_stale,
+            "core_financials_allowed":eps_ready,"market_per_is_independent":True,"message":message,
+            "rule":"只有官方期間達到應有季度且 EPS 可解析，TTM/YTD 財報 EPS 才能進核心估值；法人明確年度 Forward EPS 可獨立使用。"}
 
 def _quarter_from_date(v: Any) -> tuple[int|None,int|None]:
     try:
@@ -637,18 +703,21 @@ def analyst_consensus(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"count": len(rows), "median_target": median(targets) if targets else None, "median_forward_eps": median(epss) if epss else None, "eps_revision_pct": revision, "reports": rows}
 
 
-def model_valuation(price: float | None, perdata: dict[str, Any], eps_stack: dict[str, Any], research: dict[str, Any]) -> dict[str, Any]:
+def model_valuation(price: float | None, perdata: dict[str, Any], eps_stack: dict[str, Any], research: dict[str, Any], integrity: dict[str, Any] | None=None) -> dict[str, Any]:
     if not price: return {"scenarios": [], "confidence": 0}
     consensus_eps=safe_num(research.get("median_forward_eps")); coverage=int(research.get("eps_coverage") or 0)
-    ttm=safe_num(eps_stack.get("ttm_eps")); ytd=safe_num(eps_stack.get("ytd_eps")); q=eps_stack.get("quarter_period")
+    integrity=integrity or {}; allow_financial=bool(integrity.get("core_financials_allowed", True))
+    ttm=safe_num(eps_stack.get("ttm_eps")) if allow_financial else None
+    ytd=safe_num(eps_stack.get("ytd_eps")) if allow_financial else None
+    q=eps_stack.get("quarter_period")
     if consensus_eps and coverage >= 2:
         anchor_eps=consensus_eps; eps_basis=f"{research.get('forward_eps_year') or 'Forward'}E EPS 中位數（{coverage} 筆明確年度可比預估）"; eps_conf=82
     elif ttm and ttm>0:
         anchor_eps=ttm; eps_basis=f"TTM EPS {ttm:.2f}（截至 {q or 'latest'}；不使用單季×4）"; eps_conf=78
     elif ytd and ytd>0:
         anchor_eps=ytd; eps_basis=f"YTD EPS {ytd:.2f}（資料不足以形成 TTM，暫不年化單季）"; eps_conf=48
-    elif perdata.get("per") and perdata["per"]>0:
-        anchor_eps=price/perdata["per"]; eps_basis="由現價 / 市場 PER 反推 TTM EPS（降級模型）"; eps_conf=38
+    elif perdata.get("per") and perdata["per"]>0 and allow_financial:
+        anchor_eps=price/perdata["per"]; eps_basis="由現價 / 市場 PER 反推 TTM EPS（降級模型）"; eps_conf=32
     else: return {"scenarios": [], "eps_basis":"資料不足", "confidence":0}
     if perdata.get("pe_median"):
         bear_pe=max(5.0,perdata["pe_p25"]); base_pe=perdata["pe_median"]; bull_pe=min(150.0,perdata["pe_p75"]); pe_basis=f"近年歷史 PER 分位數（樣本 {perdata.get('sample_count',0)} 日）"; pe_conf=85
@@ -740,6 +809,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     except Exception as e:
         errors.append(f"OfficialFinancial: {type(e).__name__}"); official_financial={"official":False,"errors":[type(e).__name__]}
     eps_stack=build_eps_stack(fin, official_financial, financial)
+    financial_integrity=assess_financial_integrity(official_financial, eps_stack, today)
     # Official snapshot has highest priority for latest period margins/amounts.
     if official_financial.get("official"):
         financial.update({
@@ -755,6 +825,10 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
             financial["gross_margin"]=(financial.get("gross_profit")/financial["revenue"]*100) if financial.get("gross_profit") is not None else financial.get("gross_margin")
             financial["operating_margin"]=(financial.get("operating_income")/financial["revenue"]*100) if financial.get("operating_income") is not None else financial.get("operating_margin")
             financial["net_margin"]=(financial.get("net_income")/financial["revenue"]*100) if financial.get("net_income") is not None else financial.get("net_margin")
+    if not financial_integrity.get("official_verified"):
+        financial["official"]=False
+        financial["source"]=(financial.get("source") or "FinMind") + "（未通過官方最新季度驗證）"
+        financial["integrity_warning"]=financial_integrity.get("message")
     company_name=info.get("stock_name") or ticker
     try:
         web_research, company_events = await asyncio.gather(fetch_public_research(ticker, company_name), fetch_company_events(ticker, company_name))
@@ -762,7 +836,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         errors.append(f"PublicWebResearch: {type(e).__name__}"); web_research={"rows":[],"errors":[type(e).__name__],"fetched_at":datetime.now().astimezone().isoformat(timespec="seconds")}; company_events={"rows":[],"errors":[type(e).__name__],"fetched_at":datetime.now().astimezone().isoformat(timespec="seconds")}
     research=merge_research(load_research(ticker), web_research.get("rows", []))
     lp=tech.get("last")
-    valuation=model_valuation(lp,perdata,eps_stack,research)
+    valuation=model_valuation(lp,perdata,eps_stack,research,financial_integrity)
     sc=scores(tech,revenue,flow,perdata,financial,research)
     nar=narrative(sc,tech,revenue,flow,valuation,research)
     expectation=expectation_gap_analysis(research, company_events, perdata, revenue, sc, lp)
@@ -774,17 +848,17 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         {"name":"融資融券","dataset":"TaiwanStockMarginPurchaseShortSale","as_of":flow.get("margin_last_date"),"status":"ok" if flow.get("margin_last_date") else "missing","scheduled_update":"交易日約 21:00"},
         {"name":"月營收","dataset":"TaiwanStockMonthRevenue","as_of":revenue.get("last_date") or revenue.get("revenue_period"),"status":"ok" if revenue else "missing","scheduled_update":"依公司公告"},
         {"name":"PER/PBR","dataset":"TaiwanStockPER","as_of":perdata.get("last_date"),"status":"ok" if perdata else "missing","scheduled_update":"交易日約 18:00"},
-        {"name":"財務報表","dataset":financial.get("source") or "FinMind TaiwanStockFinancialStatements","as_of":financial.get("period") or financial.get("statement_date"),"status":"ok" if financial else "missing","scheduled_update":"官方公告優先；API 落後時自動降權"},
-        {"name":"財報 API 新鮮度","dataset":"Official-vs-Structured cross-check","as_of":eps_stack.get("structured_api_period"),"status":"stale" if eps_stack.get("structured_api_stale") else "ok","scheduled_update":"若落後官方季度，禁止覆蓋官方最新值"},
+        {"name":"財務報表","dataset":financial.get("source") or "FinMind TaiwanStockFinancialStatements","as_of":financial.get("period") or financial.get("statement_date"),"status":"ok" if financial_integrity.get("official_verified") else "stale","scheduled_update":"僅官方最新季度驗證通過才標示 OK"},
+        {"name":"財報完整性閘門","dataset":"Official period gate","as_of":financial_integrity.get("official_period") or eps_stack.get("structured_api_period"),"status":"ok" if financial_integrity.get("core_financials_allowed") else "stale","scheduled_update":financial_integrity.get("message")},
         {"name":"公開法人研究","dataset":"Google News RSS + 公開網路引用","as_of":web_research.get("fetched_at"),"status":"ok" if web_research.get("rows") else "missing","scheduled_update":"每次強制刷新重新搜尋"},
         {"name":"公司事件雷達","dataset":"公開新聞/法說/重大訊息引用","as_of":company_events.get("fetched_at"),"status":"ok" if company_events.get("rows") else "missing","scheduled_update":"每次強制刷新重新搜尋"},
     ]
     conf=calc_confidence(source_status,valuation,research)
     data={"ticker":ticker,"name":info.get("stock_name") or ticker,"industry":info.get("industry_category") or "—","market_type":info.get("type") or "—",
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
-          "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
+          "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
           "source_status":source_status,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,
-          "data_policy":"V5.2 資料階層：官方 TWSE/MOPS/TPEx > 結構化 API > 公開網路摘要。EPS 明確拆分單季/YTD/TTM/Forward；禁止用單季 EPS × 4 當正式 Forward EPS。API 若落後官方期間即降權。"}
+          "data_policy":"V5.2.1 財報閘門：官方 TWSE/MOPS/TPEx 最新季度必須達到應有申報期，否則財報標示 STALE，YTD/TTM/反推 EPS 禁止進核心估值；僅明確年度法人 Forward EPS 可獨立使用。"}
     _CACHE[ticker]=(time.time(),data)
     return data
 
@@ -800,7 +874,7 @@ def report_html(d: dict[str, Any]) -> str:
     return f"""<!doctype html><html lang='zh-Hant'><head><meta charset='utf-8'><style>
     @page{{size:A4;margin:11mm}} body{{font-family:'Noto Sans TC','PingFang TC',sans-serif;color:#13202a;font-size:9.5pt;line-height:1.55}} h1{{font-size:23pt;margin:0}} h2{{font-size:14pt;border-bottom:2px solid #173847;padding-bottom:4px;margin:18px 0 8px}} .muted{{color:#60727c}} .head{{display:flex;justify-content:space-between;border-bottom:3px solid #173847;padding-bottom:9px}} .price{{font-size:23pt;font-weight:800;text-align:right}} .pill{{display:inline-block;border:1px solid #719188;border-radius:20px;padding:2px 8px;margin-right:5px}} .grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin:10px 0}} .card{{border:1px solid #d7e0e4;border-radius:7px;padding:8px}} .card b{{font-size:14pt;display:block}} table{{width:100%;border-collapse:collapse;font-size:8.4pt}} th,td{{padding:5px;border-bottom:1px solid #dce4e8;text-align:left}} th{{background:#f2f6f7}} .call{{border-left:4px solid #17866b;background:#f4faf8;padding:9px}} .warn{{border:1px solid #d7b94b;background:#fff9e7;padding:8px;margin-top:10px}} .small{{font-size:8pt}} .page-break{{break-before:page}} .cols{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} ul{{margin:4px 0 0;padding-left:18px}} .badge{{font-weight:700}}
     </style></head><body>
-    <div class='head'><div><div class='muted'>AI STOCK RESEARCH TERMINAL V5.2 DATA INTEGRITY • TAIWAN EQUITY RESEARCH</div><h1>{esc(d['name'])} <span class='muted'>{esc(d['ticker'])}</span></h1><div><span class='pill'>{esc(d['industry'])}</span><span class='pill'>{esc(d['stance'])}</span><span class='pill'>可信度 {conf['overall']}/100</span></div></div><div><div class='muted'>最新收盤</div><div class='price'>{nfmt(d['price'],1)}</div><div>{pct(d['change_pct'])}</div></div></div>
+    <div class='head'><div><div class='muted'>AI STOCK RESEARCH TERMINAL V5.2.1 FINANCIAL FRESHNESS GATE • TAIWAN EQUITY RESEARCH</div><h1>{esc(d['name'])} <span class='muted'>{esc(d['ticker'])}</span></h1><div><span class='pill'>{esc(d['industry'])}</span><span class='pill'>{esc(d['stance'])}</span><span class='pill'>可信度 {conf['overall']}/100</span></div></div><div><div class='muted'>最新收盤</div><div class='price'>{nfmt(d['price'],1)}</div><div>{pct(d['change_pct'])}</div></div></div>
     <div class='small muted'>報告產生：{esc(d['generated_at'])} ｜ 資料完整度：{conf['data_completeness']}% ｜ 估值信心：{conf['valuation_confidence']}%</div>
     <h2>1. Executive Summary</h2><div class='call'>{esc(d['thesis'])}</div>
     <div class='grid'><div class='card'>綜合評分<b>{sc['綜合']}/100</b></div><div class='card'>基本面<b>{sc['基本面']}</b></div><div class='card'>籌碼面<b>{sc['籌碼面']}</b></div><div class='card'>技術面<b>{sc['技術面']}</b></div></div>
@@ -848,4 +922,4 @@ async def cache_clear():
     _CACHE.clear(); return {"status":"ok","message":"cache cleared"}
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.2.0","mode":"cloud-mobile-data-integrity","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.2.1","mode":"cloud-mobile-financial-freshness-gate","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
