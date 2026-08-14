@@ -1,4 +1,4 @@
-# V5.2.4 — 3661 實際官方財報診斷版
+# V5.2.4aa — 3661 實際官方財報診斷版
 
 - 新增 `/api/diagnostics/financial/{ticker}`。
 - TWSE/TPEx OpenAPI：記錄 HTTP status、資料筆數、3661 是否命中、官方季度與解析欄位。

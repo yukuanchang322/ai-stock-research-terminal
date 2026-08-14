@@ -38,7 +38,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.2.4")
+app = FastAPI(title="AI Stock Research Terminal", version="5.2.4a")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -111,7 +111,7 @@ def _row_value(row: dict[str, Any], includes: list[str], excludes: list[str] | N
     return None
 
 async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.4"}) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.4a"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
 
@@ -125,7 +125,7 @@ IR_FINANCIAL_PAGES = {
 async def mops_csv_rows(filename: str) -> list[dict[str, Any]]:
     """Official MOPS CSV fallback. Some foreign/KY issuers can appear here even when JSON feeds lag."""
     url=f"{MOPS_CSV_BASE}/{filename}"
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.4"}) as client:
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.4a"}) as client:
         r=await client.get(url); r.raise_for_status()
     raw=r.content
     text=None
@@ -223,7 +223,7 @@ async def fetch_company_ir_financial(ticker: str, expected_year: int, expected_q
     page=IR_FINANCIAL_PAGES.get(ticker)
     if not page: return None
     try:
-        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.4"}) as client:
+        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.4a"}) as client:
             r=await client.get(page); r.raise_for_status(); page_html=r.text
             hrefs=re.findall(r'href=["\']([^"\']+)["\']',page_html,re.I)
             embedded=re.findall(r'["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']',page_html,re.I)
@@ -261,6 +261,121 @@ async def fetch_company_ir_financial(ticker: str, expected_year: int, expected_q
     except Exception:
         return None
     return None
+
+
+def _text_field(row: dict[str, Any], *names: str) -> str:
+    """Read a MOPS field while tolerating invisible/trailing spaces in official keys."""
+    wanted={re.sub(r"\s+","",x) for x in names}
+    for k,v in row.items():
+        if re.sub(r"\s+","",str(k)) in wanted:
+            return str(v or "")
+    return ""
+
+
+def _roc_year_to_ad(v: str | int | None) -> int | None:
+    if v is None: return None
+    m=re.search(r"(\d{2,4})",str(v))
+    if not m: return None
+    y=int(m.group(1))
+    return y+1911 if y < 1911 else y
+
+
+def _announcement_period(text: str) -> tuple[int|None,int|None]:
+    """Resolve fiscal year/quarter from MOPS board-approved financial-report disclosures."""
+    compact=re.sub(r"\s+","",text)
+    # Highest-confidence: explicit report start/end date, e.g. 115/01/01~115/06/30.
+    m=re.search(r"(?:報導期間|報告期間|起訖日期).*?(\d{2,4})[/-]0?1[/-]0?1.*?(\d{2,4})[/-](0?3|0?6|0?9|12)[/-](?:30|31)",compact,re.I)
+    if m:
+        y=_roc_year_to_ad(m.group(2) or m.group(1)); month=int(m.group(3)); q={3:1,6:2,9:3,12:4}.get(month)
+        if y and q: return y,q
+    # Fallback: 115年度第二季 / 115年第2季.
+    m=re.search(r"(\d{2,4})年(?:度)?第?([一二三四1234])季",compact)
+    if m:
+        qmap={"一":1,"二":2,"三":3,"四":4,"1":1,"2":2,"3":3,"4":4}
+        return _roc_year_to_ad(m.group(1)),qmap.get(m.group(2))
+    return None,None
+
+
+def _extract_mops_financial_announcement(row: dict[str, Any], ticker: str) -> dict[str, Any] | None:
+    """Parse the official MOPS material-information disclosure for board-approved quarterly financials.
+
+    This is intentionally conservative: it only accepts announcements whose subject/description explicitly
+    say the board approved a quarterly/annual financial report and whose report period can be resolved.
+    """
+    code=_text_field(row,"公司代號","公司代碼")
+    if re.sub(r"\D","",code) != ticker: return None
+    subject=_text_field(row,"主旨","主旨 ")
+    desc=_text_field(row,"說明")
+    blob=f"{subject}\n{desc}"
+    key=re.sub(r"\s+","",blob)
+    if not ("財務報告" in key and ("董事會通過" in key or "董事會決議" in key or "提報董事會" in key)):
+        return None
+    fy,fq=_announcement_period(blob)
+    if not fy or not fq: return None
+    def pick(patterns):
+        for pat in patterns:
+            m=re.search(pat,blob,re.I|re.S)
+            if m:
+                return parse_num_text(m.group(1))
+        return None
+    # MOPS amounts here are explicitly stated in NT$ thousand; keep the same unit as official income statements.
+    revenue=pick([r"累計至本期止營業收入[^:：]*[:：]\s*([\-0-9,\.]+)",r"營業收入\(仟元\)[^:：]*[:：]\s*([\-0-9,\.]+)"])
+    gross=pick([r"累計至本期止營業毛利[^:：]*[:：]\s*([\-0-9,\.]+)",r"營業毛利[^:：]*\(仟元\)[^:：]*[:：]\s*([\-0-9,\.]+)"])
+    op=pick([r"累計至本期止營業利益[^:：]*[:：]\s*([\-0-9,\.]+)",r"營業利益[^:：]*\(仟元\)[^:：]*[:：]\s*([\-0-9,\.]+)"])
+    net=pick([r"歸屬於母公司業主淨利[^:：]*[:：]\s*([\-0-9,\.]+)",r"累計至本期止本期淨利[^:：]*[:：]\s*([\-0-9,\.]+)"])
+    eps=pick([r"基本每股盈餘(?:\(損失\))?[^:：]*[:：]\s*([\-0-9,\.]+)",r"每股盈餘[^:：]*[:：]\s*([\-0-9,\.]+)"])
+    speech=roc_date_to_iso(_text_field(row,"發言日期") or _text_field(row,"出表日期"))
+    return {
+        "source":"TWSE/MOPS board-approved financial disclosure",
+        "market":"上市重大訊息","endpoint":"/opendata/t187ap04_L","official":True,
+        "period":f"{fy} Q{fq}","fiscal_year":fy,"fiscal_quarter":fq,"statement_date":speech,
+        "feed_kind":"material_announcement","company_code":ticker,"ytd_eps":eps,
+        "revenue_ytd":revenue,"gross_profit_ytd":gross,"operating_income_ytd":op,"net_income_ytd":net,
+        "completeness":sum(v is not None for v in (eps,revenue,gross,op,net)),
+        "subject":subject,"announcement_date":speech,
+    }
+
+
+async def fetch_mops_material_financial(ticker: str, expected_year: int | None=None, expected_quarter: int | None=None) -> list[dict[str, Any]]:
+    """Official fallback for foreign/KY issuers whose XBRL summary feed lags.
+
+    Layer A uses TWSE's daily MOPS material-information OpenAPI. Layer B tries the official MOPS
+    historical-search endpoint so a disclosure from one or two days ago is still discoverable.
+    """
+    out=[]
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.4a"}
+    async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers=ua) as client:
+        # A. Daily official material-information feed.
+        try:
+            r=await client.get(TWSE_OPENAPI+"/opendata/t187ap04_L"); r.raise_for_status(); data=r.json()
+            for row in (data if isinstance(data,list) else []):
+                snap=_extract_mops_financial_announcement(row,ticker)
+                if snap: out.append(snap)
+        except Exception:
+            pass
+        # B. Official MOPS historical material-information search. The HTML response contains the same
+        # disclosure text; this layer is best-effort because MOPS occasionally changes presentation HTML.
+        try:
+            roc_year=(expected_year-1911) if expected_year else (date.today().year-1911)
+            form={"encodeURIComponent":"1","step":"1","firstin":"1","off":"1","TYPEK":"all",
+                  "co_id":ticker,"year":str(roc_year),"month":f"{date.today().month:02d}"}
+            r=await client.post("https://mops.twse.com.tw/mops/web/ajax_t05st01",data=form)
+            if r.status_code==200 and ticker in r.text:
+                text=html.unescape(re.sub(r"<[^>]+>","\n",r.text))
+                text=re.sub(r"[\t\r ]+"," ",text)
+                # Locate report-approval blocks and convert to pseudo rows for the shared parser.
+                for m in re.finditer(r"(.{0,240}(?:董事會通過|董事會決議).{0,1200}財務報告.{0,2400})",text,re.S):
+                    block=m.group(1)
+                    snap=_extract_mops_financial_announcement({"公司代號":ticker,"主旨":"董事會通過財務報告","說明":block,"發言日期":""},ticker)
+                    if snap: out.append(snap)
+        except Exception:
+            pass
+    # Deduplicate by period, keep most complete.
+    best={}
+    for x in out:
+        k=(x.get("fiscal_year"),x.get("fiscal_quarter"))
+        if k not in best or x.get("completeness",0)>best[k].get("completeness",0): best[k]=x
+    return list(best.values())
 
 
 async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
@@ -323,7 +438,15 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
         found.extend(await fetch_mops_csv_official(ticker))
     except Exception as e:
         errors.append(f"mops_csv:{type(e).__name__}")
-    # Layer 3: company IR reviewed/audited PDF for mapped issuers. Used only when the PDF explicitly states the expected period.
+    # Layer 3: official board-approved financial-report disclosure. This is especially important for
+    # KY/foreign issuers whose structured XBRL/EPS feed can lag even after the board has approved Q2/Q3.
+    try:
+        ey,eq,_=expected_latest_financial_period(date.today())
+        found.extend(await fetch_mops_material_financial(ticker,ey,eq))
+    except Exception as e:
+        errors.append(f"mops_material:{type(e).__name__}")
+
+    # Layer 4: company IR reviewed/audited PDF for mapped issuers. Used only when the PDF explicitly states the expected period.
     try:
         ey,eq,_=expected_latest_financial_period(date.today())
         ir=await fetch_company_ir_financial(ticker,ey,eq)
@@ -364,11 +487,11 @@ async def diagnose_official_financial_sources(ticker: str) -> dict[str, Any]:
     """
     now=datetime.now().astimezone()
     ey,eq,expected=expected_latest_financial_period(now.date())
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.4 diagnostics"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.4a diagnostics"}
     out={
         "ticker":ticker, "generated_at":now.isoformat(timespec="seconds"),
         "expected_period":expected, "expected_year":ey, "expected_quarter":eq,
-        "openapi":[], "mops_csv":[], "company_ir":None, "selection":None,
+        "openapi":[], "mops_csv":[], "mops_material":[], "company_ir":None, "selection":None,
         "diagnostic_version":"5.2.4",
     }
 
@@ -444,6 +567,13 @@ async def diagnose_official_financial_sources(ticker: str) -> dict[str, Any]:
                 item["error"]=f"{type(e).__name__}: {str(e)[:240]}"
             out["mops_csv"].append(item)
 
+        # Official material-information fallback diagnostics.
+        try:
+            mats=await fetch_mops_material_financial(ticker,ey,eq)
+            out["mops_material"]=[{k:x.get(k) for k in ("period","fiscal_year","fiscal_quarter","statement_date","ytd_eps","revenue_ytd","gross_profit_ytd","operating_income_ytd","net_income_ytd","completeness","subject","source")} for x in mats]
+        except Exception as e:
+            out["mops_material_error"]=f"{type(e).__name__}: {str(e)[:240]}"
+
         page=IR_FINANCIAL_PAGES.get(ticker)
         if page:
             ir={"page_url":page,"expected_period":expected,"pdf_candidates":[]}
@@ -504,7 +634,7 @@ async def diagnose_official_financial_sources(ticker: str) -> dict[str, Any]:
     ir=out.get("company_ir") or {}
     valid_pdf=[x for x in ir.get("pdf_candidates",[]) if x.get("period_ok")]
     out["summary"]={
-        "openapi_hits":len(matched_open), "csv_hits":len(matched_csv), "valid_ir_pdfs":len(valid_pdf),
+        "openapi_hits":len(matched_open), "csv_hits":len(matched_csv), "material_financial_hits":len(out.get("mops_material") or []), "valid_ir_pdfs":len(valid_pdf),
         "ir_expected_label_visible":ir.get("expected_quarter_label_visible"),
         "ir_expected_pdf_link_detected":ir.get("expected_q_pdf_link_detected"),
         "selected_period":(out.get("selection") or {}).get("period"),
@@ -1205,7 +1335,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
           "source_status":source_status,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,
-          "data_policy":"V5.2.4 財報資料層：OpenAPI JSON → MOPS 官方 CSV → 公司 IR 審閱/查核 PDF fallback；僅在文件明確驗證季度後才放行 EPS 與核心估值。"}
+          "data_policy":"V5.2.4a 財報資料層：OpenAPI JSON → MOPS 官方 CSV → MOPS 董事會通過財報重大訊息 → 公司 IR 審閱/查核 PDF fallback；僅在文件明確驗證季度後才放行 EPS 與核心估值。"}
     _CACHE[ticker]=(time.time(),data)
     return data
 
@@ -1268,13 +1398,13 @@ async def stock_pdf(ticker: str, refresh: bool = Query(True)):
     d=await build_stock(ticker.strip(), force_refresh=refresh)
     if d["price"] is None: raise HTTPException(503,"目前無法取得股價資料，為避免輸出錯誤報告，PDF 未產生。")
     stamp=datetime.now().strftime("%Y%m%d_%H%M")
-    out=REPORT_DIR/f"{ticker}_{stamp}_research_v5_2_4.pdf"
+    out=REPORT_DIR/f"{ticker}_{stamp}_research_v5_2_4a.pdf"
     HTML(string=report_html(d),base_url=str(ROOT)).write_pdf(out)
-    return FileResponse(out,media_type="application/pdf",filename=f"{ticker}_AI_research_V5_2_4_{stamp}.pdf")
+    return FileResponse(out,media_type="application/pdf",filename=f"{ticker}_AI_research_V5_2_4a_{stamp}.pdf")
 
 @app.post("/api/cache/clear")
 async def cache_clear():
     _CACHE.clear(); return {"status":"ok","message":"cache cleared"}
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.2.4","mode":"cloud-mobile-official-diagnostics","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.2.4a","mode":"cloud-mobile-mops-material-hotfix","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
