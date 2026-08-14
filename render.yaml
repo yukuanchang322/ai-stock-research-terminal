@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: ai-stock-research-terminal
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.4
+      - key: CACHE_TTL_SECONDS
+        value: 600
+      - key: FINMIND_TOKEN
+        sync: false
