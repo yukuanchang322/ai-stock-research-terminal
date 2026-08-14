@@ -86,3 +86,9 @@ Health Check:
 當財報 freshness gate 未通過時，基本面「財報來源」卡會出現「查看官方資料診斷」連結。
 
 3661 可直接開：`/api/diagnostics/financial/3661`。
+
+
+## V5.2.7 EPS Engine
+- 官方回查前一季累計 EPS，推導 Q2/Q3/Q4 真實單季 EPS。
+- TTM 僅在四個實際單季 EPS 齊全時顯示。
+- 官方當期資料不會混用 FinMind 舊季資料推算單季 EPS。
