@@ -38,7 +38,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.2.5")
+app = FastAPI(title="AI Stock Research Terminal", version="5.2.6")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -111,7 +111,7 @@ def _row_value(row: dict[str, Any], includes: list[str], excludes: list[str] | N
     return None
 
 async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.5"}) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.6"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
 
@@ -125,7 +125,7 @@ IR_FINANCIAL_PAGES = {
 async def mops_csv_rows(filename: str) -> list[dict[str, Any]]:
     """Official MOPS CSV fallback. Some foreign/KY issuers can appear here even when JSON feeds lag."""
     url=f"{MOPS_CSV_BASE}/{filename}"
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.5"}) as client:
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.6"}) as client:
         r=await client.get(url); r.raise_for_status()
     raw=r.content
     text=None
@@ -223,7 +223,7 @@ async def fetch_company_ir_financial(ticker: str, expected_year: int, expected_q
     page=IR_FINANCIAL_PAGES.get(ticker)
     if not page: return None
     try:
-        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.5"}) as client:
+        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.6"}) as client:
             r=await client.get(page); r.raise_for_status(); page_html=r.text
             hrefs=re.findall(r'href=["\']([^"\']+)["\']',page_html,re.I)
             embedded=re.findall(r'["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']',page_html,re.I)
@@ -343,7 +343,7 @@ async def fetch_mops_material_financial(ticker: str, expected_year: int | None=N
     historical-search endpoint so a disclosure from one or two days ago is still discoverable.
     """
     out=[]
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.5"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.6"}
     async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers=ua) as client:
         # A. Daily official material-information feed.
         try:
@@ -511,7 +511,7 @@ async def fetch_tsmc_quarterly_release(year: int, quarter: int) -> dict[str, Any
     """TSMC official IR fallback. Gives a verified quarter even before MOPS aggregate refresh."""
     if quarter not in (1,2,3,4): return None
     url=f"https://investor.tsmc.com/english/quarterly-results/{year}/q{quarter}"
-    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.5"}
+    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.6"}
     try:
         async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=headers) as client:
             r=await client.get(url); r.raise_for_status(); text=html.unescape(re.sub(r"<[^>]+>"," ",r.text))
@@ -657,7 +657,7 @@ async def diagnose_official_financial_sources(ticker: str) -> dict[str, Any]:
     """
     now=datetime.now().astimezone()
     ey,eq,expected=expected_latest_financial_period(now.date())
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.5 diagnostics"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.6 diagnostics"}
     out={
         "ticker":ticker, "generated_at":now.isoformat(timespec="seconds"),
         "expected_period":expected, "expected_year":ey, "expected_quarter":eq,
@@ -818,6 +818,42 @@ async def diagnose_official_financial_sources(ticker: str) -> dict[str, Any]:
         "selected_source":(out.get("selection") or {}).get("source"),
     }
     return out
+
+
+async def reconcile_official_financial_snapshot(ticker: str, selected: dict[str, Any]) -> dict[str, Any]:
+    """Final safety reconciliation before data reaches /api/stock.
+
+    Diagnostics proved that official MOPS CSV can already contain a newer quarter even when
+    another upstream path or stale structured source wins earlier in the request. This helper
+    independently re-checks the official CSV and forces the latest official fiscal period into
+    the main stock payload. Fields are merged only within the same fiscal period.
+    """
+    candidates: list[dict[str, Any]] = []
+    if selected and selected.get("official"):
+        candidates.append(dict(selected))
+    try:
+        candidates.extend(await fetch_mops_csv_official(ticker))
+    except Exception:
+        pass
+    if not candidates:
+        return selected or {"official": False, "candidate_hits": 0, "errors": ["reconcile:no_official_candidate"]}
+
+    def key(x: dict[str, Any]):
+        return (int(x.get("fiscal_year") or 0), int(x.get("fiscal_quarter") or 0))
+    latest_key=max(key(x) for x in candidates)
+    latest=[x for x in candidates if key(x)==latest_key]
+    latest.sort(key=lambda x:(x.get("completeness") or 0, 1 if x.get("feed_kind")=="detail" else 0, x.get("statement_date") or ""), reverse=True)
+    merged=dict(latest[0])
+    for row in latest[1:]:
+        for field in ("ytd_eps","revenue_ytd","gross_profit_ytd","operating_income_ytd","net_income_ytd",
+                      "quarter_eps_direct","gross_margin_direct","operating_margin_direct","statement_date"):
+            if merged.get(field) is None and row.get(field) is not None:
+                merged[field]=row[field]
+    merged["official"]=True
+    merged["period"]=f"{latest_key[0]} Q{latest_key[1]}" if all(latest_key) else merged.get("period")
+    merged["mapping_reconciled"]=True
+    merged["mapping_sources"]=[{"source":x.get("source"),"endpoint":x.get("endpoint"),"period":x.get("period"),"completeness":x.get("completeness")} for x in latest]
+    return merged
 
 def expected_latest_financial_period(as_of: date | None=None) -> tuple[int,int,str]:
     """Conservative Taiwan quarterly filing calendar used only as a freshness gate.
@@ -1465,6 +1501,11 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         official_financial=await fetch_official_income_statement(ticker)
     except Exception as e:
         errors.append(f"OfficialFinancial: {type(e).__name__}"); official_financial={"official":False,"errors":[type(e).__name__]}
+    # V5.2.6 final mapping guard: force the newest official MOPS quarter into the main payload.
+    try:
+        official_financial=await reconcile_official_financial_snapshot(ticker, official_financial)
+    except Exception as e:
+        errors.append(f"OfficialReconcile: {type(e).__name__}")
     eps_stack=build_eps_stack(fin, official_financial, financial)
     financial_integrity=assess_financial_integrity(official_financial, eps_stack, today)
     # Official snapshot has highest priority for latest period margins/amounts.
@@ -1519,7 +1560,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
           "source_status":source_status,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,
-          "data_policy":"V5.2.5 財報資料層：公司別 MOPS IFRS 報表 → OpenAPI/CSV → MOPS 重大訊息 → 公司 IR；避免彙總端點批次更新造成 2330/3661 等已公告公司仍停舊季。"}
+          "data_policy":"V5.2.6 財報映射層：公司別 MOPS IFRS 報表 → OpenAPI/CSV → MOPS 重大訊息 → 公司 IR；避免彙總端點批次更新造成 2330/3661 等已公告公司仍停舊季。"}
     _CACHE[ticker]=(time.time(),data)
     return data
 
@@ -1591,4 +1632,4 @@ async def cache_clear():
     _CACHE.clear(); return {"status":"ok","message":"cache cleared"}
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.2.5","mode":"cloud-mobile-company-mops-financial","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.2.6","mode":"cloud-mobile-official-mapping","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
