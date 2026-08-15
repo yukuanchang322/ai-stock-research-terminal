@@ -38,7 +38,7 @@ function render(d){
   $('companyName').textContent=d.name; $('tickerLabel').textContent=d.ticker; $('sector').textContent=d.industry; $('marketType').textContent=d.market_type;
   $('stanceTag').textContent=d.stance; $('confidenceScore').textContent=d.confidence?.overall ?? '—'; $('price').textContent=fmt(d.price,1); $('dayChange').textContent=pct(d.change_pct);
   $('thesis').textContent=d.thesis; $('dataPolicy').textContent=d.data_policy; $('overallScore').textContent=d.scores['綜合'];
-  $('kpis').innerHTML=[['預期狀態',d.expectation_gap?.regime||'—','V5.2.12'],['Research Score',`${d.scores['綜合']}/100`,'量化綜合'],['可信度',`${d.confidence?.overall??'—'}/100`,'資料+估值'],['PER',`${fmt(d.per?.per,1)}x`,'最新可得'],['營收 YoY',pct(d.revenue?.revenue_yoy),'最新月'],['外資20日',fmt0(d.flow?.foreign_20),'淨買賣'],['RSI14',fmt(d.technical?.rsi14,1),'技術動能']].map(x=>`<div class="kpi"><span>${x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`).join('');
+  $('kpis').innerHTML=[['預期狀態',d.expectation_gap?.regime||'—','V5.2.13'],['Research Score',`${d.scores['綜合']}/100`,'量化綜合'],['可信度',`${d.confidence?.overall??'—'}/100`,'資料+估值'],['PER',`${fmt(d.per?.per,1)}x`,'最新可得'],['營收 YoY',pct(d.revenue?.revenue_yoy),'最新月'],['外資20日',fmt0(d.flow?.foreign_20),'淨買賣'],['RSI14',fmt(d.technical?.rsi14,1),'技術動能']].map(x=>`<div class="kpi"><span>${x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`).join('');
   $('dockPdf').disabled=false; $('dockShare').disabled=false; $('lastFetch').textContent=`資料頁產生 ${new Date(d.generated_at).toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit'})}`;
   // Safari-safe URL update: avoid passing a URL object to history.replaceState.
   try {
@@ -63,6 +63,9 @@ function render(d){
     metric('TTM EPS',fmt(es.ttm_eps,2),`${es.ttm_period||'—'} · ${es.ttm_method_label||''}`), metric('財報來源',f.source||es.source||'—',`${f.period||f.statement_date||''} · ${staleNote}`),
     metric('毛利率',pct(f.gross_margin),f.period||'最新財報期'), metric('營益率',pct(f.operating_margin),f.period||'最新財報期'), metric('PER / PBR',`${fmt(p.per,1)}x / ${fmt(p.pbr,1)}x`,perNote)
   ].join('');
+  const ledger=(es.evidence_ledger||[]);
+  const ledgerHtml=ledger.length?`<div class="eps-ledger"><h4>EPS Evidence Ledger</h4><div class="ledger-list">${ledger.map(x=>`<div class="ledger-row ${x.status==='usable'?'ok':'missing'}"><b>${x.period}</b><span>${x.quarter_eps_direct!=null?`單季 ${fmt(x.quarter_eps_direct,2)}`:(x.ytd_eps!=null?`YTD ${fmt(x.ytd_eps,2)}`:'缺資料')}</span><small>${x.source||x.missing_reason||'無官方證據'}${x.derived_quarter_eps!=null?` · 推導單季 ${fmt(x.derived_quarter_eps,2)}`:''}</small></div>`).join('')}</div></div>`:'';
+  $('fundamentalTable').insertAdjacentHTML('afterend',ledgerHtml);
   $('fundChart').innerHTML=lineSvg((r.series||[]).map(x=>x.revenue));
   $('fundAnalysis').textContent=r.revenue_yoy==null?`營收年增資料不足。${staleNote}`:`最新月營收年增 ${pct(r.revenue_yoy)}；${fi.core_financials_allowed?`${es.quarter_period||'最新財報'} 單季 EPS ${fmt(es.quarter_eps,2)}、YTD EPS ${fmt(es.ytd_eps,2)}、TTM EPS ${fmt(es.ttm_eps,2)}。`:'財報 EPS 尚未通過最新季度閘門，不進核心估值。'} ${staleNote}`;
 

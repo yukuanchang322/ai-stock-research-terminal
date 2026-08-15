@@ -27,3 +27,5 @@
 @media(max-width:800px){.expectation-hero{grid-template-columns:1fr}.expectation-score{text-align:left}.expectation-signals{grid-template-columns:repeat(2,1fr)}.snapshot-grid{grid-template-columns:repeat(2,1fr)}.snapshot-head{display:block}.snapshot-head b{display:block;margin-top:6px}}
 
 .diagnostic-link{color:#4ce0b3;text-decoration:underline;font-weight:700}.diagnostic-link:visited{color:#4ce0b3}
+/* V5.2.13 EPS Evidence Ledger */
+.eps-ledger{margin:18px 0 6px}.eps-ledger h4{margin:0 0 10px}.ledger-list{display:grid;gap:8px}.ledger-row{display:grid;grid-template-columns:84px 1fr;gap:4px 12px;padding:11px 12px;border:1px solid var(--line,#223748);border-radius:12px;background:rgba(3,18,26,.45)}.ledger-row b{grid-row:1/3}.ledger-row small{opacity:.72}.ledger-row.ok{border-color:rgba(75,229,184,.35)}.ledger-row.missing{border-color:rgba(255,126,126,.3)}
