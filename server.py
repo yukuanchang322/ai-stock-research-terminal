@@ -25,7 +25,6 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
-from weasyprint import HTML
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
@@ -39,7 +38,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.3.4")
+app = FastAPI(title="AI Stock Research Terminal", version="5.3.5")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -139,6 +138,66 @@ async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
     async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.2"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
+
+
+def _month_starts(end_date: date, count: int = 13) -> list[date]:
+    months=[]
+    year,month=end_date.year,end_date.month
+    for _ in range(count):
+        months.append(date(year,month,1))
+        month-=1
+        if month==0:
+            year-=1; month=12
+    return list(reversed(months))
+
+
+async def fetch_twse_stock_day(ticker: str, months: int = 13) -> tuple[list[dict[str, Any]], list[str]]:
+    """Fetch official TWSE monthly OHLC without failing the full series on one bad month."""
+    url="https://www.twse.com.tw/exchangeReport/STOCK_DAY"
+    errors=[]
+    async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.5"}) as client:
+        async def fetch_month(month_start: date):
+            month_key=month_start.strftime("%Y%m")
+            try:
+                response=await client.get(url,params={"response":"json","date":month_start.strftime("%Y%m%d"),"stockNo":ticker})
+                response.raise_for_status()
+                payload=response.json()
+                if payload.get("stat") != "OK":
+                    raise RuntimeError(str(payload.get("stat") or "TWSE response not OK"))
+                rows=[]
+                for raw in payload.get("data") or []:
+                    if len(raw)<7:
+                        continue
+                    open_,high,low,close,volume=(parse_num_text(raw[3]),parse_num_text(raw[4]),parse_num_text(raw[5]),parse_num_text(raw[6]),parse_num_text(raw[1]))
+                    if None in (open_,high,low,close):
+                        continue
+                    rows.append({"date":roc_date_to_iso(raw[0]),"open":open_,"max":high,"min":low,"close":close,"Trading_Volume":volume})
+                return rows
+            except Exception as exc:
+                errors.append(f"TWSE_STOCK_DAY {month_key}: {type(exc).__name__}: {exc}")
+                return []
+        monthly=await asyncio.gather(*(fetch_month(month) for month in _month_starts(date.today(),months)))
+    rows=[row for group in monthly for row in group]
+    unique={row["date"]:row for row in rows if row.get("date")}
+    return [unique[key] for key in sorted(unique)],errors
+
+
+async def fetch_twse_stock_info(ticker: str) -> tuple[dict[str, Any], list[str]]:
+    """Resolve listed-company identity from the official TWSE company OpenAPI."""
+    try:
+        rows=await openapi_json(TWSE_OPENAPI,"/opendata/t187ap03_L")
+        row=next((item for item in rows if str(item.get("公司代號") or "").strip()==ticker),None)
+        if not row:
+            return {},["TWSE_INFO: ticker not found in t187ap03_L"]
+        return {
+            "stock_id":ticker,
+            "stock_name":str(row.get("公司簡稱") or row.get("公司名稱") or ticker).strip(),
+            "industry_category":str(row.get("產業別") or "—").strip(),
+            "type":"上市",
+            "source":"TWSE OpenAPI t187ap03_L",
+        },[]
+    except Exception as exc:
+        return {},[f"TWSE_INFO: {type(exc).__name__}: {exc}"]
 
 
 
@@ -1467,7 +1526,7 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             "missing_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")!="usable"],
             "policy":"official_registry_then_company_ir_then_official_disclosure; no third-party EPS for official derivation",
         },
-        "evidence_ledger_version":"5.3.4",
+        "evidence_ledger_version":"5.3.5",
         "blocked_mops_html_removed":True,
         "note":"V5.3.1 Evidence Engine EPS takeover：歷史季度優先讀取可稽核的公司官方 Registry，再以公司 IR/官方揭露補抓。Registry 每筆保留官方來源 URL；缺資料才留白，第三方 EPS 不參與官方推導。"
     }
@@ -2266,7 +2325,7 @@ def build_evidence_graph(ticker: str, tech: dict[str,Any], revenue: dict[str,Any
 async def probe_twstock_mcp() -> dict[str,Any]:
     out={"provider":"TWStock MCP compatible adapter","enabled":TWSTOCK_MCP_ENABLED,"url":TWSTOCK_MCP_URL,"mode":"shadow_crosscheck","status":"disabled"}
     if not TWSTOCK_MCP_ENABLED: return out
-    payload={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.3.4"}}}
+    payload={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.3.5"}}}
     try:
         async with httpx.AsyncClient(timeout=8,follow_redirects=True,headers={"Accept":"application/json, text/event-stream","Content-Type":"application/json"}) as client:
             r=await client.post(TWSTOCK_MCP_URL,json=payload)
@@ -2303,6 +2362,8 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     if not force_refresh and ticker in _CACHE and time.time() - _CACHE[ticker][0] < CACHE_TTL:
         cached = dict(_CACHE[ticker][1]); cached["cache"] = {"hit": True, "ttl_seconds": CACHE_TTL}; return cached
     today = date.today(); errors: list[str] = []
+    provider_status={"price_provider":None,"info_provider":None,"fallback_used":False,"fallback_errors":[],
+                     "finmind_available":False,"twse_fallback_success":False,"price_rows":0,"latest_price_date":None}
     async def grab(dataset: str, days: int):
         try: return await finmind(dataset, ticker, today - timedelta(days=days), today)
         except Exception as e: errors.append(f"{dataset}: {type(e).__name__}"); return []
@@ -2317,7 +2378,39 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         grab("TaiwanStockMarginPurchaseShortSale", 120), grab("TaiwanStockMonthRevenue", 900),
         grab("TaiwanStockPER", 1100), grab("TaiwanStockFinancialStatements", 1100)
     )
-    tech=calc_technical(prices); flow=calc_flow(inst,margin); revenue=calc_revenue(rev); perdata=calc_per(pers); financial=calc_financials(fin)
+    if prices:
+        provider_status.update({"price_provider":"FinMind TaiwanStockPrice","finmind_available":True})
+    else:
+        provider_status["fallback_used"]=True
+        provider_status["fallback_errors"].append("FinMind TaiwanStockPrice returned no usable rows")
+        prices,twse_price_errors=await fetch_twse_stock_day(ticker,13)
+        provider_status["fallback_errors"].extend(twse_price_errors)
+        if prices:
+            provider_status.update({"price_provider":"TWSE STOCK_DAY","twse_fallback_success":True})
+    if info:
+        provider_status["info_provider"]="FinMind TaiwanStockInfo"
+    else:
+        provider_status["fallback_used"]=True
+        provider_status["fallback_errors"].append("FinMind TaiwanStockInfo returned no matching row")
+        info,twse_info_errors=await fetch_twse_stock_info(ticker)
+        provider_status["fallback_errors"].extend(twse_info_errors)
+        if info:
+            provider_status["info_provider"]="TWSE OpenAPI t187ap03_L"
+
+    def calculate(label: str, fn, *args):
+        try:
+            return fn(*args)
+        except Exception as exc:
+            errors.append(f"{label}: {type(exc).__name__}")
+            return {}
+
+    tech=calculate("Technical",calc_technical,prices)
+    flow=calculate("InstitutionalOrMargin",calc_flow,inst,margin)
+    revenue=calculate("MonthRevenue",calc_revenue,rev)
+    perdata=calculate("PER",calc_per,pers)
+    financial=calculate("FinancialStatements",calc_financials,fin)
+    provider_status["price_rows"]=len(prices)
+    provider_status["latest_price_date"]=tech.get("last_date")
     try:
         official_financial=await fetch_official_income_statement(ticker)
     except Exception as e:
@@ -2367,7 +2460,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     change=((lp/prev-1)*100) if lp and prev else None
     evidence_graph=build_evidence_graph(ticker,tech,revenue,flow,perdata,financial,eps_stack,research,company_events,financial_integrity)
     source_status=[
-        {"name":"股價","dataset":"TaiwanStockPrice","as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日約 17:30"},
+        {"name":"股價","dataset":provider_status.get("price_provider") or "TaiwanStockPrice / TWSE STOCK_DAY","as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日約 17:30"},
         {"name":"三大法人","dataset":"TaiwanStockInstitutionalInvestorsBuySellWide","as_of":flow.get("last_date"),"status":"ok" if flow.get("last_date") else "missing","scheduled_update":"交易日約 20:00"},
         {"name":"融資融券","dataset":"TaiwanStockMarginPurchaseShortSale","as_of":flow.get("margin_last_date"),"status":"ok" if flow.get("margin_last_date") else "missing","scheduled_update":"交易日約 21:00"},
         {"name":"月營收","dataset":"TaiwanStockMonthRevenue","as_of":revenue.get("last_date") or revenue.get("revenue_period"),"status":"ok" if revenue else "missing","scheduled_update":"依公司公告"},
@@ -2382,8 +2475,8 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     data={"ticker":ticker,"name":info.get("stock_name") or ticker,"industry":info.get("industry_category") or "—","market_type":info.get("type") or "—",
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
-          "source_status":source_status,"evidence_graph":evidence_graph,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,
-          "data_policy":"V5.3.1 Evidence Engine EPS Takeover：所有資料先正規化為 Evidence Record，依官方性、新鮮度、期間與衝突檢查後才進研究模型；Fact、Derived Fact、Analysis 分層呈現。"}
+          "source_status":source_status,"evidence_graph":evidence_graph,"errors":errors,"provider_status":provider_status,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,
+          "data_policy":"V5.3.5 Provider Fallback：FinMind 保留為結構化資料來源；行情或公司資料缺失時改用 TWSE 官方資料，各區塊失敗彼此隔離。"}
     _CACHE[ticker]=(time.time(),data)
     return data
 
@@ -2443,6 +2536,7 @@ async def stock_api(ticker: str, refresh: bool = Query(False)):
 
 @app.get("/api/stock/{ticker}/pdf")
 async def stock_pdf(ticker: str, refresh: bool = Query(True)):
+    from weasyprint import HTML
     d=await build_stock(ticker.strip(), force_refresh=refresh)
     if d["price"] is None: raise HTTPException(503,"目前無法取得股價資料，為避免輸出錯誤報告，PDF 未產生。")
     stamp=datetime.now().strftime("%Y%m%d_%H%M")
@@ -2481,7 +2575,7 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.3.4",
+        "ticker":ticker,"version":"5.3.5",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
@@ -2501,7 +2595,7 @@ async def eps_registry_diagnostics(ticker: str):
     reg=_load_official_eps_registry()
     rows=[r for r in reg.get("records",[]) if str(r.get("ticker"))==ticker]
     rows=sorted(rows,key=lambda r:(r.get("year") or 0,r.get("quarter") or 0),reverse=True)
-    return {"ticker":ticker,"version":"5.3.4","registry_schema_version":reg.get("schema_version"),
+    return {"ticker":ticker,"version":"5.3.5","registry_schema_version":reg.get("schema_version"),
             "updated_at":reg.get("updated_at"),"record_count":len(rows),"records":rows}
 
 @app.get("/api/evidence/{ticker}")
@@ -2514,9 +2608,13 @@ async def evidence_api(ticker: str, refresh: int = 0):
 @app.get("/api/diagnostics/providers/{ticker}")
 async def provider_diagnostics(ticker: str):
     ticker=ticker.strip().upper()
-    d=await build_stock(ticker, False)
-    mcp=await probe_twstock_mcp()
-    return {"version":"5.3.4","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
+    d=await build_stock(ticker, True)
+    status=d.get("provider_status") or {}
+    provider_errors=list(dict.fromkeys([*(status.get("fallback_errors") or []),*(d.get("errors") or [])]))
+    return {"version":"5.3.5","ticker":ticker,"finmind_available":bool(status.get("finmind_available")),
+            "twse_fallback_success":bool(status.get("twse_fallback_success")),"price_provider":status.get("price_provider"),
+            "info_provider":status.get("info_provider"),"price_rows":status.get("price_rows",0),
+            "latest_price_date":status.get("latest_price_date"),"provider_errors":provider_errors}
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.3.4","mode":"cloud-mobile-earnings-call-events","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.3.5","mode":"cloud-mobile-earnings-call-events","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
