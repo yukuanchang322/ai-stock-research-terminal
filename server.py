@@ -350,6 +350,92 @@ async def fetch_official_stock_day(ticker: str, market_type: str = "") -> tuple[
     return [],None,errors
 
 
+def parse_twse_institutional_payload(payload: dict[str, Any], ticker: str, trading_date: str) -> list[dict[str, Any]]:
+    fields=payload.get("fields") or []
+    for raw in payload.get("data") or []:
+        if not raw or str(raw[0]).strip()!=ticker: continue
+        row=dict(zip(fields,raw))
+        return [{
+            "date":trading_date,"stock_id":ticker,
+            "Foreign_Investor_buy":parse_num_text(row.get("外陸資買進股數(不含外資自營商)")),
+            "Foreign_Investor_sell":parse_num_text(row.get("外陸資賣出股數(不含外資自營商)")),
+            "Foreign_Dealer_Self_buy":parse_num_text(row.get("外資自營商買進股數")),
+            "Foreign_Dealer_Self_sell":parse_num_text(row.get("外資自營商賣出股數")),
+            "Investment_Trust_buy":parse_num_text(row.get("投信買進股數")),
+            "Investment_Trust_sell":parse_num_text(row.get("投信賣出股數")),
+            "Dealer_self_buy":parse_num_text(row.get("自營商買進股數(自行買賣)")),
+            "Dealer_self_sell":parse_num_text(row.get("自營商賣出股數(自行買賣)")),
+            "Dealer_Hedging_buy":parse_num_text(row.get("自營商買進股數(避險)")),
+            "Dealer_Hedging_sell":parse_num_text(row.get("自營商賣出股數(避險)")),
+        }]
+    return []
+
+
+def parse_twse_margin_payload(payload: dict[str, Any], ticker: str, trading_date: str) -> list[dict[str, Any]]:
+    for table in payload.get("tables") or []:
+        fields=table.get("fields") or []
+        if not fields or fields[0] != "代號": continue
+        for raw in table.get("data") or []:
+            if not raw or str(raw[0]).strip()!=ticker or len(raw)<16: continue
+            return [{
+                "date":trading_date,"stock_id":ticker,
+                "MarginPurchaseBuy":parse_num_text(raw[2]),"MarginPurchaseSell":parse_num_text(raw[3]),
+                "MarginPurchaseCashRepayment":parse_num_text(raw[4]),
+                "MarginPurchaseYesterdayBalance":parse_num_text(raw[5]),"MarginPurchaseTodayBalance":parse_num_text(raw[6]),
+                "MarginPurchaseLimit":parse_num_text(raw[7]),"ShortSaleBuy":parse_num_text(raw[8]),
+                "ShortSaleSell":parse_num_text(raw[9]),"ShortSaleCashRepayment":parse_num_text(raw[10]),
+                "ShortSaleYesterdayBalance":parse_num_text(raw[11]),"ShortSaleTodayBalance":parse_num_text(raw[12]),
+                "ShortSaleLimit":parse_num_text(raw[13]),"OffsetLoanAndShort":parse_num_text(raw[14]),"Note":raw[15],
+            }]
+    return []
+
+
+def parse_twse_revenue_rows(payload: list[dict[str, Any]], ticker: str) -> list[dict[str, Any]]:
+    item=next((row for row in payload if str(row.get("公司代號") or "").strip()==ticker),None)
+    if not item: return []
+    ym=re.sub(r"\D","",str(item.get("資料年月") or ""))
+    if len(ym)!=5: return []
+    year=int(ym[:3])+1911; month=int(ym[3:])
+    current=parse_num_text(item.get("營業收入-當月營收"))
+    prior=parse_num_text(item.get("營業收入-去年當月營收"))
+    rows=[]
+    if prior is not None:
+        rows.append({"date":f"{year-1:04d}-{month:02d}-01","stock_id":ticker,"revenue_year":year-1,"revenue_month":month,"revenue":prior*1000})
+    if current is not None:
+        rows.append({"date":f"{year:04d}-{month:02d}-01","stock_id":ticker,"revenue_year":year,"revenue_month":month,"revenue":current*1000})
+    return rows
+
+
+async def fetch_twse_flow_fallback(ticker: str, trading_dates: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Fetch exact-code TWSE flow data for recent known trading dates."""
+    errors=[]; institutional=[]; margin=[]
+    dates=sorted({str(d)[:10] for d in trading_dates if d},reverse=True)[:24]
+    async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.5"}) as client:
+        async def one(day: str):
+            compact=day.replace("-","")
+            try:
+                inst_r,margin_r=await asyncio.gather(
+                    client.get("https://www.twse.com.tw/rwd/zh/fund/T86",params={"date":compact,"selectType":"ALLBUT0999","response":"json"}),
+                    client.get("https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN",params={"date":compact,"selectType":"ALL","response":"json"}),
+                )
+                inst_r.raise_for_status(); margin_r.raise_for_status()
+                return parse_twse_institutional_payload(inst_r.json(),ticker,day),parse_twse_margin_payload(margin_r.json(),ticker,day)
+            except Exception as exc:
+                errors.append(f"TWSE_FLOW {day}: {type(exc).__name__}"); return [],[]
+        groups=await asyncio.gather(*(one(day) for day in dates))
+    for inst_rows,margin_rows in groups:
+        institutional.extend(inst_rows); margin.extend(margin_rows)
+    return sorted(institutional,key=lambda x:x["date"]),sorted(margin,key=lambda x:x["date"]),errors
+
+
+async def fetch_twse_revenue_fallback(ticker: str) -> tuple[list[dict[str, Any]], list[str]]:
+    try:
+        payload=await openapi_json(TWSE_OPENAPI,"/opendata/t187ap05_L")
+        return parse_twse_revenue_rows(payload,ticker),[]
+    except Exception as exc:
+        return [],[f"TWSE_REVENUE: {type(exc).__name__}: {exc}"]
+
+
 
 MOPS_CSV_BASE = "https://mopsfin.twse.com.tw/opendata"
 MOPS_HISTORY_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t163sb04"
@@ -2715,15 +2801,28 @@ def narrative(s: dict[str, int], tech: dict[str, Any], revenue: dict[str, Any], 
 
 async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any]:
     ticker=normalize_ticker(ticker)
-    if not force_refresh and ticker in _CACHE and time.time() - _CACHE[ticker][0] < CACHE_TTL:
-        cached = dict(_CACHE[ticker][1]); cached["cache"] = {"hit": True, "ttl_seconds": CACHE_TTL}; return cached
+    if not force_refresh and ticker in _CACHE:
+        cached_age=time.time()-_CACHE[ticker][0]
+        cached_ttl=int(_CACHE[ticker][1].get("cache",{}).get("ttl_seconds") or CACHE_TTL)
+        if cached_age < cached_ttl:
+            cached=dict(_CACHE[ticker][1]); cached["cache"]={"hit":True,"ttl_seconds":cached_ttl}; return cached
     today = date.today(); errors: list[str] = []
     provider_status={"price_provider":None,"info_provider":None,"fallback_used":False,"fallback_errors":[],
                      "finmind_available":False,"finmind_price_available":False,"official_price_fallback_success":False,
-                     "twse_fallback_success":False,"tpex_fallback_success":False,"price_rows":0,"latest_price_date":None}
+                     "twse_fallback_success":False,"tpex_fallback_success":False,"price_rows":0,"latest_price_date":None,
+                     "institutional_provider":None,"margin_provider":None,"revenue_provider":None,
+                     "supplemental_fallback_datasets":[]}
     async def grab(dataset: str, days: int):
-        try: return await finmind(dataset, ticker, today - timedelta(days=days), today)
-        except Exception as e: errors.append(f"{dataset}: {type(e).__name__}"); return []
+        last_error=None
+        for attempt in range(2):
+            try:
+                rows=await finmind(dataset,ticker,today-timedelta(days=days),today)
+                if rows: return rows
+                last_error="empty"
+            except Exception as exc:
+                last_error=type(exc).__name__
+            if attempt==0: await asyncio.sleep(0.25)
+        errors.append(f"{dataset}: {last_error or 'empty'} after retry"); return []
     async def info_grab():
         try:
             infos = await finmind("TaiwanStockInfo")
@@ -2757,6 +2856,28 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
             provider_status.update({"price_provider":official_price_provider,"official_price_fallback_success":True})
             provider_status["twse_fallback_success"]=official_price_provider=="TWSE STOCK_DAY"
             provider_status["tpex_fallback_success"]=official_price_provider=="TPEx afterTrading/tradingStock"
+
+    provider_status["institutional_provider"]="FinMind TaiwanStockInstitutionalInvestorsBuySellWide" if inst else None
+    provider_status["margin_provider"]="FinMind TaiwanStockMarginPurchaseShortSale" if margin else None
+    provider_status["revenue_provider"]="FinMind TaiwanStockMonthRevenue" if rev else None
+    if (not inst or not margin or not rev) and info.get("type")=="上市":
+        provider_status["fallback_used"]=True
+        trading_dates=[str(row.get("date") or "") for row in prices]
+        flow_task=fetch_twse_flow_fallback(ticker,trading_dates) if (not inst or not margin) else None
+        revenue_task=fetch_twse_revenue_fallback(ticker) if not rev else None
+        flow_result,revenue_result=await asyncio.gather(
+            flow_task if flow_task else asyncio.sleep(0,result=([],[],[])),
+            revenue_task if revenue_task else asyncio.sleep(0,result=([],[])),
+        )
+        official_inst,official_margin,flow_errors=flow_result
+        official_revenue,revenue_errors=revenue_result
+        provider_status["fallback_errors"].extend(flow_errors+revenue_errors)
+        if not inst and official_inst:
+            inst=official_inst; provider_status["institutional_provider"]="TWSE T86"; provider_status["supplemental_fallback_datasets"].append("institutional")
+        if not margin and official_margin:
+            margin=official_margin; provider_status["margin_provider"]="TWSE MI_MARGN"; provider_status["supplemental_fallback_datasets"].append("margin")
+        if not rev and official_revenue:
+            rev=official_revenue; provider_status["revenue_provider"]="TWSE/MOPS t187ap05_L"; provider_status["supplemental_fallback_datasets"].append("revenue")
 
     def calculate(label: str, fn, *args):
         try:
@@ -2822,9 +2943,9 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     evidence_graph=build_evidence_graph(ticker,tech,revenue,flow,perdata,financial,eps_stack,research,company_events,financial_integrity)
     source_status=[
         {"name":"股價","dataset":provider_status.get("price_provider") or "TaiwanStockPrice / TWSE STOCK_DAY / TPEx tradingStock","as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日收盤後"},
-        {"name":"三大法人","dataset":"TaiwanStockInstitutionalInvestorsBuySellWide","as_of":flow.get("last_date"),"status":"ok" if flow.get("last_date") else "missing","scheduled_update":"交易日約 20:00"},
-        {"name":"融資融券","dataset":"TaiwanStockMarginPurchaseShortSale","as_of":flow.get("margin_last_date"),"status":"ok" if flow.get("margin_last_date") else "missing","scheduled_update":"交易日約 21:00"},
-        {"name":"月營收","dataset":"TaiwanStockMonthRevenue","as_of":revenue.get("last_date") or revenue.get("revenue_period"),"status":"ok" if revenue else "missing","scheduled_update":"依公司公告"},
+        {"name":"三大法人","dataset":provider_status.get("institutional_provider") or "FinMind / TWSE T86","as_of":flow.get("last_date"),"status":"ok" if flow.get("last_date") else "missing","scheduled_update":"交易日約 20:00"},
+        {"name":"融資融券","dataset":provider_status.get("margin_provider") or "FinMind / TWSE MI_MARGN","as_of":flow.get("margin_last_date"),"status":"ok" if flow.get("margin_last_date") else "missing","scheduled_update":"交易日約 21:00"},
+        {"name":"月營收","dataset":provider_status.get("revenue_provider") or "FinMind / TWSE MOPS t187ap05_L","as_of":revenue.get("last_date") or revenue.get("revenue_period"),"status":"ok" if revenue else "missing","scheduled_update":"依公司公告"},
         {"name":"PER/PBR","dataset":"TaiwanStockPER","as_of":perdata.get("last_date"),"status":"ok" if perdata else "missing","scheduled_update":"交易日約 18:00"},
         {"name":"財務報表","dataset":financial.get("source") or "FinMind TaiwanStockFinancialStatements","as_of":financial.get("period") or financial.get("statement_date"),"status":"ok" if financial_integrity.get("official_verified") else "stale","scheduled_update":"僅官方最新季度驗證通過才標示 OK"},
         {"name":"財報完整性閘門","dataset":"Official period gate","as_of":financial_integrity.get("official_period") or eps_stack.get("structured_api_period"),"status":"ok" if financial_integrity.get("core_financials_allowed") else "stale","scheduled_update":financial_integrity.get("message")},
@@ -2833,11 +2954,13 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     ]
     source_status.append({"name":"Evidence Engine","dataset":"Multi-Source Evidence Schema v1","as_of":evidence_graph.get("generated_at"),"status":"ok" if evidence_graph.get("summary",{}).get("usable") else "missing","scheduled_update":f"Fact {evidence_graph.get('summary',{}).get('facts',0)} / Derived {evidence_graph.get('summary',{}).get('derived_facts',0)} / Conflicts {evidence_graph.get('summary',{}).get('conflicts',0)}"})
     conf=calc_confidence(source_status,valuation,research)
+    core_supplemental_complete=bool(flow.get("last_date") and flow.get("margin_last_date") and revenue)
+    result_cache_ttl=CACHE_TTL if core_supplemental_complete else min(CACHE_TTL,60)
     data={"ticker":ticker,"name":info.get("stock_name") or ticker,"industry":info.get("industry_category") or "—","market_type":info.get("type") or "—",
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
-          "source_status":source_status,"evidence_graph":evidence_graph,"errors":errors,"provider_status":provider_status,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,
-          "data_policy":"V5.3.5 Provider Fallback：FinMind 保留為結構化資料來源；行情或公司資料缺失時依上市／上櫃市場改用 TWSE／TPEx 官方資料，各區塊失敗彼此隔離，缺值不視為 0。"}
+          "source_status":source_status,"evidence_graph":evidence_graph,"errors":errors,"provider_status":provider_status,"cache":{"hit":False,"ttl_seconds":result_cache_ttl,"complete":core_supplemental_complete},"web_research_meta":web_research,"company_events":company_events,
+          "data_policy":"V5.3.5 Provider Fallback：FinMind 保留為結構化資料來源；上市股票的行情、公司資料、三大法人、融資融券或月營收缺失時改用 TWSE／MOPS 官方資料，各區塊失敗彼此隔離，缺值不視為 0。"}
     _CACHE[ticker]=(time.time(),data)
     return data
 

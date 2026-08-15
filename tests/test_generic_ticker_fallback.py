@@ -22,6 +22,28 @@ class CompanyEventIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("台積電", " ".join(row["title"] for row in result["rows"]))
 
 
+class OfficialSupplementalFallbackTests(unittest.TestCase):
+    def test_parses_twse_institutional_and_margin_for_exact_ticker(self):
+        institutional={"fields":["證券代號","證券名稱","外陸資買進股數(不含外資自營商)","外陸資賣出股數(不含外資自營商)","外資自營商買進股數","外資自營商賣出股數","投信買進股數","投信賣出股數","自營商買進股數(自行買賣)","自營商賣出股數(自行買賣)","自營商買進股數(避險)","自營商賣出股數(避險)"],"data":[["2330","台積電","1","2","0","0","3","4","5","6","7","8"],["3661","世芯-KY","1,642,098","896,111","0","0","23,000","300,014","47,198","13,300","182,740","146,517"]]}
+        margin={"tables":[{"fields":["代號","名稱","買進","賣出","現金償還","前日餘額","今日餘額","次一營業日限額","買進","賣出","現券償還","前日餘額","今日餘額","次一營業日限額","資券互抵","註記"],"data":[["3661","世芯-KY","336","411","0","6,291","6,216","20,877","14","7","0","66","59","20,877","1"," "]]}]}
+        inst_rows=server.parse_twse_institutional_payload(institutional,"3661","2026-08-14")
+        margin_rows=server.parse_twse_margin_payload(margin,"3661","2026-08-14")
+        self.assertEqual(len(inst_rows),1)
+        self.assertEqual(inst_rows[0]["Foreign_Investor_buy"],1642098)
+        self.assertEqual(inst_rows[0]["Investment_Trust_sell"],300014)
+        self.assertEqual(margin_rows[0]["MarginPurchaseTodayBalance"],6216)
+        self.assertEqual(margin_rows[0]["ShortSaleTodayBalance"],59)
+
+    def test_parses_official_revenue_in_ntd_with_prior_year_comparison(self):
+        payload=[{"資料年月":"11507","公司代號":"3661","營業收入-當月營收":"7433152","營業收入-去年當月營收":"5359000"}]
+        rows=server.parse_twse_revenue_rows(payload,"3661")
+        self.assertEqual([row["revenue_year"] for row in rows],[2025,2026])
+        self.assertEqual(rows[-1]["revenue"],7433152000)
+        revenue=server.calc_revenue(rows)
+        self.assertEqual(revenue["revenue_period"],"2026-07")
+        self.assertAlmostEqual(revenue["revenue_yoy"],(7433152/5359000-1)*100)
+
+
 class TpexPriceParserTests(unittest.TestCase):
     def test_normalizes_full_width_ticker_digits(self):
         self.assertEqual(server.normalize_ticker(" ６４８８ "), "6488")
