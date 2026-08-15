@@ -2795,6 +2795,76 @@ def report_html(d: dict[str, Any]) -> str:
     </body></html>"""
 
 
+def write_report_pdf(d: dict[str, Any], output_path: Path) -> None:
+    """Create a self-contained Traditional Chinese investor PDF without native Pango dependencies."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    font_name="NotoSansTC"
+    font_path=ROOT / "assets" / "fonts" / "NotoSansTC-Regular.ttf"
+    if font_name not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(TTFont(font_name,str(font_path)))
+    styles=getSampleStyleSheet()
+    body=ParagraphStyle("zh-body",parent=styles["BodyText"],fontName=font_name,fontSize=9,leading=14,textColor=colors.HexColor("#263640"))
+    small=ParagraphStyle("zh-small",parent=body,fontSize=7.5,leading=11,textColor=colors.HexColor("#60727c"))
+    title=ParagraphStyle("zh-title",parent=body,fontSize=21,leading=27,textColor=colors.HexColor("#13202a"),spaceAfter=4)
+    section=ParagraphStyle("zh-section",parent=body,fontSize=13,leading=18,textColor=colors.HexColor("#173847"),spaceBefore=10,spaceAfter=6)
+    table_header=ParagraphStyle("zh-table-header",parent=small,textColor=colors.white)
+    esc=lambda value: html.escape("-" if value is None else str(value))
+    para=lambda value,style=body: Paragraph(esc(value),style)
+    story=[]
+
+    def table(rows,widths=None,header=True):
+        normalized=[]
+        for row_index,row in enumerate(rows):
+            style=table_header if header and row_index==0 else small
+            normalized.append([cell if isinstance(cell,Paragraph) else para(cell,style) for cell in row])
+        item=Table(normalized,colWidths=widths,repeatRows=1 if header else 0,hAlign="LEFT")
+        commands=[("FONTNAME",(0,0),(-1,-1),font_name),("VALIGN",(0,0),(-1,-1),"MIDDLE"),("GRID",(0,0),(-1,-1),.35,colors.HexColor("#d7e0e4")),("LEFTPADDING",(0,0),(-1,-1),5),("RIGHTPADDING",(0,0),(-1,-1),5),("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5)]
+        if header:
+            commands.extend([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#173847")),("TEXTCOLOR",(0,0),(-1,0),colors.white)])
+        item.setStyle(TableStyle(commands)); return item
+
+    def footer(canvas,doc):
+        canvas.saveState(); canvas.setFont(font_name,7); canvas.setFillColor(colors.HexColor("#60727c"))
+        canvas.drawString(14*mm,8*mm,"AI Stock Research Terminal V5.3.5")
+        canvas.drawRightString(A4[0]-14*mm,8*mm,f"Page {doc.page}"); canvas.restoreState()
+
+    doc=SimpleDocTemplate(str(output_path),pagesize=A4,rightMargin=13*mm,leftMargin=13*mm,topMargin=13*mm,bottomMargin=15*mm,title=f"{d.get('ticker')} AI Stock Research V5.3.5",author="AI Stock Research Terminal")
+    story.extend([para(f"{d.get('name','-')}  {d.get('ticker','-')}",title),para("AI STOCK RESEARCH TERMINAL V5.3.5 - TAIWAN EQUITY RESEARCH",small)])
+    header_rows=[["最新收盤","漲跌","產業／市場","報告時間"],[nfmt(d.get("price"),1),pct(d.get("change_pct")),f"{d.get('industry','-')} / {d.get('market_type','-')}",d.get("generated_at","-")]]
+    story.extend([Spacer(1,4*mm),table(header_rows,[30*mm,27*mm,48*mm,60*mm]),para("1. 投資摘要",section),para(d.get("thesis") or "目前資料不足。")])
+    scores_data=d.get("scores") or {}
+    story.extend([Spacer(1,2*mm),table([["綜合","基本面","籌碼面","技術面","估值"],[scores_data.get("綜合"),scores_data.get("基本面"),scores_data.get("籌碼面"),scores_data.get("技術面"),scores_data.get("估值")]],[33*mm]*5)])
+    story.extend([para("主要催化劑",section),para("；".join(d.get("catalysts") or ["資料不足"])),para("主要風險",section),para("；".join(d.get("risks") or ["資料不足"]))])
+
+    eps=d.get("eps_stack") or {}; financial=d.get("financial") or {}; revenue=d.get("revenue") or {}
+    story.extend([para("2. 基本面與 EPS",section),table([["項目","數值","期間／來源"],["最新月營收",nfmt(revenue.get("latest_revenue"),0),revenue.get("revenue_period") or revenue.get("last_date")],["營收 YoY",pct(revenue.get("revenue_yoy")),revenue.get("revenue_period")],["單季 EPS",nfmt(eps.get("quarter_eps"),2),eps.get("quarter_period")],["YTD EPS",nfmt(eps.get("ytd_eps"),2),eps.get("quarter_period")],["TTM EPS",nfmt(eps.get("ttm_eps"),2),financial.get("source")]], [48*mm,42*mm,75*mm])])
+
+    tech=d.get("technical") or {}; flow=d.get("flow") or {}
+    story.extend([para("3. 籌碼與技術",section),table([["指標","1日","5日","20日"],["外資",nfmt(flow.get("foreign_1"),0),nfmt(flow.get("foreign_5"),0),nfmt(flow.get("foreign_20"),0)],["投信",nfmt(flow.get("trust_1"),0),nfmt(flow.get("trust_5"),0),nfmt(flow.get("trust_20"),0)],["自營商",nfmt(flow.get("dealer_1"),0),nfmt(flow.get("dealer_5"),0),nfmt(flow.get("dealer_20"),0)],["融資變化",pct(flow.get("margin_1_pct")),pct(flow.get("margin_5_pct")),pct(flow.get("margin_20_pct"))]],[42*mm,41*mm,41*mm,41*mm]),Spacer(1,3*mm),table([["趨勢","MA20","MA60","RSI14","支撐","壓力"],[tech.get("trend"),nfmt((tech.get("ma") or {}).get(20) or (tech.get("ma") or {}).get("20"),1),nfmt((tech.get("ma") or {}).get(60) or (tech.get("ma") or {}).get("60"),1),nfmt(tech.get("rsi14"),1),nfmt(tech.get("support1"),1),nfmt(tech.get("resistance"),1)]],[27.5*mm]*6)])
+
+    story.append(PageBreak())
+    research=d.get("research") or {}; reports=research.get("reports") or []
+    story.append(para("4. 法人研究與預期修正",section))
+    report_rows=[["機構","日期","評級","目標價","Forward EPS"]]+[[r.get("institution"),r.get("report_date"),r.get("rating"),nfmt(safe_num(r.get("target_price")),0),nfmt(safe_num(r.get("forward_eps")),2)] for r in reports[:12]]
+    story.append(table(report_rows if len(report_rows)>1 else [["機構","日期","評級","目標價","Forward EPS"],["目前無可解析公開研究","-","-","-","-"]],[46*mm,29*mm,28*mm,30*mm,32*mm]))
+    valuation=d.get("valuation") or {}; scenarios=valuation.get("scenarios") or []
+    story.append(para("5. 估值情境",section))
+    scenario_rows=[["情境","EPS","PE","模型合理價","相對現價"]]+[[s.get("name"),nfmt(s.get("eps"),2),f"{nfmt(s.get('pe'),1)}x",nfmt(s.get("target"),0),pct(s.get("upside_pct"))] for s in scenarios]
+    story.append(table(scenario_rows if len(scenario_rows)>1 else [["情境","EPS","PE","模型合理價","相對現價"],["資料不足","-","-","-","-"]],[34*mm,30*mm,30*mm,37*mm,34*mm]))
+    story.append(para("6. 資料來源與新鮮度",section))
+    source_rows=[["資料","Provider / Dataset","截至","狀態"]]+[[s.get("name"),s.get("dataset"),s.get("as_of"),"OK" if s.get("status")=="ok" else "缺資料"] for s in d.get("source_status",[])]
+    story.append(table(source_rows,[30*mm,72*mm,40*mm,23*mm]))
+    story.extend([Spacer(1,4*mm),para("重要聲明：本報告為研究與資訊整理工具，不構成個人化投資建議、招攬或收益保證。價格、財務與籌碼資料可能因交易所或資料供應商更新時間而延遲。",small)])
+    doc.build(story,onFirstPage=footer,onLaterPages=footer)
+
+
 @app.get("/")
 async def home(): return FileResponse(ROOT / "index.html", headers={"Cache-Control":"no-store, max-age=0"})
 @app.get("/app.js")
@@ -2822,12 +2892,14 @@ async def stock_api(ticker: str, refresh: bool = Query(False)):
 
 @app.get("/api/stock/{ticker}/pdf")
 async def stock_pdf(ticker: str, refresh: bool = Query(True)):
-    from weasyprint import HTML
     d=await build_stock(ticker.strip(), force_refresh=refresh)
     if d["price"] is None: raise HTTPException(503,"目前無法取得股價資料，為避免輸出錯誤報告，PDF 未產生。")
     stamp=datetime.now().strftime("%Y%m%d_%H%M")
     out=REPORT_DIR/f"{ticker}_{stamp}_research_v5_3_5.pdf"
-    HTML(string=report_html(d),base_url=str(ROOT)).write_pdf(out)
+    try:
+        write_report_pdf(d,out)
+    except Exception as exc:
+        raise HTTPException(500,f"PDF 產生失敗：{type(exc).__name__}") from exc
     return FileResponse(out,media_type="application/pdf",filename=f"{ticker}_AI_research_V5_3_5_{stamp}.pdf")
 
 @app.post("/api/cache/clear")

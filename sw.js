@@ -1,13 +1,13 @@
 const CACHE_PREFIX = 'ai-stock-shell-';
-const CACHE = `${CACHE_PREFIX}20260815-2`;
+const CACHE = `${CACHE_PREFIX}20260815-3`;
 const APP_CACHE_PREFIX = 'ai-stock-';
 const SHELL = [
   '/',
-  '/styles.css?v=20260815-2',
-  '/app.js?v=20260815-2',
-  '/static/manifest.webmanifest?v=20260815-2',
-  '/static/icons/icon-192.png',
-  '/static/icons/icon-512.png'
+  '/styles.css?v=20260815-3',
+  '/app.js?v=20260815-3',
+  '/static/manifest.webmanifest?v=20260815-3',
+  '/static/icon-192.png',
+  '/static/icon-512.png'
 ];
 
 self.addEventListener('install', event => {
