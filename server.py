@@ -112,7 +112,7 @@ def _row_value(row: dict[str, Any], includes: list[str], excludes: list[str] | N
     return None
 
 async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.13"}) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.14"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
 
@@ -126,7 +126,7 @@ IR_FINANCIAL_PAGES = {
 async def mops_csv_rows(filename: str) -> list[dict[str, Any]]:
     """Official MOPS CSV fallback. Some foreign/KY issuers can appear here even when JSON feeds lag."""
     url=f"{MOPS_CSV_BASE}/{filename}"
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.13"}) as client:
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.14"}) as client:
         r=await client.get(url); r.raise_for_status()
     raw=r.content
     text=None
@@ -224,7 +224,7 @@ async def fetch_company_ir_financial(ticker: str, expected_year: int, expected_q
     page=IR_FINANCIAL_PAGES.get(ticker)
     if not page: return None
     try:
-        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.13"}) as client:
+        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.14"}) as client:
             r=await client.get(page); r.raise_for_status(); page_html=r.text
             hrefs=re.findall(r'href=["\']([^"\']+)["\']',page_html,re.I)
             embedded=re.findall(r'["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']',page_html,re.I)
@@ -344,7 +344,7 @@ async def fetch_mops_material_financial(ticker: str, expected_year: int | None=N
     historical-search endpoint so a disclosure from one or two days ago is still discoverable.
     """
     out=[]
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.13"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.14"}
     async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers=ua) as client:
         # A. Daily official material-information feed.
         try:
@@ -612,12 +612,20 @@ async def fetch_tsmc_quarterly_release(year: int, quarter: int) -> dict[str, Any
     """
     if quarter not in (1,2,3,4): return None
     landing=f"https://investor.tsmc.com/english/quarterly-results/{year}/q{quarter}"
-    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.13"}
+    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.14"}
     # Evidence-ledger seed URLs: official TSMC press releases are stable evidence pages.
     # Values are never hard-coded; the page itself is fetched and parsed.
+    # Stable company-official evidence pages. Values are NEVER embedded here; each URL is
+    # fetched live and EPS is parsed from the official publication. Multiple language URLs are
+    # supplied because one locale can occasionally be blocked or render differently.
     seed_urls={
-        (2026,1): "https://pr.tsmc.com/english/news/3297",
-        (2026,2): "https://pr.tsmc.com/english/news/3326",
+        (2026,1): ["https://pr.tsmc.com/english/news/3297", "https://pr.tsmc.com/schinese/news/3297"],
+        (2026,2): ["https://pr.tsmc.com/english/news/3326", "https://pr.tsmc.com/schinese/news/3326"],
+        (2025,1): ["https://pr.tsmc.com/english/news/3222", "https://pr.tsmc.com/schinese/news/3222"],
+        (2025,2): ["https://pr.tsmc.com/english/news/3249", "https://pr.tsmc.com/schinese/news/3249"],
+        (2025,3): ["https://pr.tsmc.com/english/news/3264", "https://pr.tsmc.com/schinese/news/3264"],
+        (2025,4): ["https://pr.tsmc.com/english/news/3281", "https://pr.tsmc.com/schinese/news/3281"],
+        (2024,4): ["https://pr.tsmc.com/english/news/3201", "https://pr.tsmc.com/schinese/news/3201"],
     }
 
     def extract(blob: str):
@@ -672,15 +680,17 @@ async def fetch_tsmc_quarterly_release(year: int, quarter: int) -> dict[str, Any
             # still parsed from the live official page, so the ledger records source evidence rather
             # than embedding a financial number in code.
             if qeps is None and (year,quarter) in seed_urls:
-                try:
-                    nr=await client.get(seed_urls[(year,quarter)]); nr.raise_for_status()
-                    article=" ".join(html.unescape(re.sub(r'<[^>]+>',' ',nr.text)).split())
-                    qe,gg,oo=extract(article)
-                    if qe is not None:
-                        qeps=qe; gm=gm if gm is not None else gg; om=om if om is not None else oo
-                        source_url=str(nr.url)
-                except Exception:
-                    pass
+                for seed in seed_urls[(year,quarter)]:
+                    try:
+                        nr=await client.get(seed); nr.raise_for_status()
+                        article=" ".join(html.unescape(re.sub(r'<[^>]+>',' ',nr.text)).split())
+                        qe,gg,oo=extract(article)
+                        if qe is not None:
+                            qeps=qe; gm=gm if gm is not None else gg; om=om if om is not None else oo
+                            source_url=str(nr.url)
+                            break
+                    except Exception:
+                        continue
 
             # Quarter Bridge fallback: TSMC official press archive. This is especially useful for
             # historical Q1 where the investor landing page can be JS-heavy while the press release
@@ -718,7 +728,7 @@ async def fetch_tsmc_quarterly_release(year: int, quarter: int) -> dict[str, Any
                     "feed_kind":"company_ir_quarter_bridge","company_code":"2330","quarter_eps_direct":qeps,
                     "gross_margin_direct":gm,"operating_margin_direct":om,
                     "eps_provenance":"company_official_direct","eps_confidence":100,
-                    "bridge_version":"5.2.13",
+                    "bridge_version":"5.2.14",
                     "completeness":sum(v is not None for v in (qeps,gm,om))}
     except Exception:
         return None
@@ -850,7 +860,7 @@ async def diagnose_official_financial_sources(ticker: str) -> dict[str, Any]:
     """
     now=datetime.now().astimezone()
     ey,eq,expected=expected_latest_financial_period(now.date())
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.13 diagnostics"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.14 diagnostics"}
     out={
         "ticker":ticker, "generated_at":now.isoformat(timespec="seconds"),
         "expected_period":expected, "expected_year":ey, "expected_quarter":eq,
@@ -1282,7 +1292,7 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
     official_key=(fy,fq) if fy and fq and official.get("official") else (None,None)
     stale_api=bool(official_key[0] and api_latest[0] and official_key>api_latest)
     prev_key=(fy,fq-1) if fy and fq and fq>1 else ((fy-1,4) if fy and fq else None)
-    # V5.2.13 EPS Evidence Ledger: every period carries a source/evidence state.
+    # V5.2.14 Historical EPS Backfill: every period carries a source/evidence state.
     # The calculation engine consumes only evidence marked official; missing evidence is explicit.
     evidence_ledger=[]
     if fy and fq:
@@ -1332,9 +1342,15 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
         "official_ytd_map":{f"{y} Q{q}":v for (y,q),v in sorted(official_ytd.items())},
         "eps_lookup_diagnostics":lookup_diagnostics,
         "evidence_ledger":evidence_ledger,
-        "evidence_ledger_version":"5.2.13",
+        "historical_backfill":{
+            "attempted_periods":[x.get("period") for x in evidence_ledger[1:]],
+            "resolved_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")=="usable"],
+            "missing_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")!="usable"],
+            "policy":"company_official_ir_then_official_disclosure; no third-party EPS for official derivation",
+        },
+        "evidence_ledger_version":"5.2.14",
         "blocked_mops_html_removed":True,
-        "note":"V5.2.13 EPS Evidence Ledger：每一季先建立官方證據帳本，再由可用證據推導單季與 TTM；缺少哪一季、哪個來源會明確標示。MOPS 被安全機制阻擋的歷史 HTML 不再是生產 EPS 來源。"
+        "note":"V5.2.14 Historical EPS Backfill：每一季先建立官方證據帳本，再由可用證據推導單季與 TTM；缺少哪一季、哪個來源會明確標示。MOPS 被安全機制阻擋的歷史 HTML 不再是生產 EPS 來源。"
     }
 
 
@@ -2054,7 +2070,7 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.2.13",
+        "ticker":ticker,"version":"5.2.14",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
@@ -2069,4 +2085,4 @@ async def eps_raw_diagnostics(ticker: str, year: int = Query(..., ge=1990, le=21
     return await trace_mops_company_ifrs(ticker,year,quarter)
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.2.13","mode":"cloud-mobile-eps-evidence-ledger","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.2.14","mode":"cloud-mobile-historical-eps-backfill","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
