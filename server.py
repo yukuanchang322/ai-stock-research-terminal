@@ -39,7 +39,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.3.1")
+app = FastAPI(title="AI Stock Research Terminal", version="5.3.2")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -124,7 +124,7 @@ def _row_value(row: dict[str, Any], includes: list[str], excludes: list[str] | N
     return None
 
 async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.15"}) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.2"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
 
@@ -138,7 +138,7 @@ IR_FINANCIAL_PAGES = {
 async def mops_csv_rows(filename: str) -> list[dict[str, Any]]:
     """Official MOPS CSV fallback. Some foreign/KY issuers can appear here even when JSON feeds lag."""
     url=f"{MOPS_CSV_BASE}/{filename}"
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.15"}) as client:
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.2"}) as client:
         r=await client.get(url); r.raise_for_status()
     raw=r.content
     text=None
@@ -236,7 +236,7 @@ async def fetch_company_ir_financial(ticker: str, expected_year: int, expected_q
     page=IR_FINANCIAL_PAGES.get(ticker)
     if not page: return None
     try:
-        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.15"}) as client:
+        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.2"}) as client:
             r=await client.get(page); r.raise_for_status(); page_html=r.text
             hrefs=re.findall(r'href=["\']([^"\']+)["\']',page_html,re.I)
             embedded=re.findall(r'["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']',page_html,re.I)
@@ -356,7 +356,7 @@ async def fetch_mops_material_financial(ticker: str, expected_year: int | None=N
     historical-search endpoint so a disclosure from one or two days ago is still discoverable.
     """
     out=[]
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.15"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.2"}
     async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers=ua) as client:
         # A. Daily official material-information feed.
         try:
@@ -624,7 +624,7 @@ async def fetch_tsmc_quarterly_release(year: int, quarter: int) -> dict[str, Any
     """
     if quarter not in (1,2,3,4): return None
     landing=f"https://investor.tsmc.com/english/quarterly-results/{year}/q{quarter}"
-    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.15"}
+    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.2"}
     # Evidence-ledger seed URLs: official TSMC press releases are stable evidence pages.
     # Values are never hard-coded; the page itself is fetched and parsed.
     # Stable company-official evidence pages. Values are NEVER embedded here; each URL is
@@ -872,7 +872,7 @@ async def diagnose_official_financial_sources(ticker: str) -> dict[str, Any]:
     """
     now=datetime.now().astimezone()
     ey,eq,expected=expected_latest_financial_period(now.date())
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.15 diagnostics"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.2 diagnostics"}
     out={
         "ticker":ticker, "generated_at":now.isoformat(timespec="seconds"),
         "expected_period":expected, "expected_year":ey, "expected_quarter":eq,
@@ -1455,7 +1455,7 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             "missing_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")!="usable"],
             "policy":"official_registry_then_company_ir_then_official_disclosure; no third-party EPS for official derivation",
         },
-        "evidence_ledger_version":"5.3.1",
+        "evidence_ledger_version":"5.3.2",
         "blocked_mops_html_removed":True,
         "note":"V5.3.1 Evidence Engine EPS takeover：歷史季度優先讀取可稽核的公司官方 Registry，再以公司 IR/官方揭露補抓。Registry 每筆保留官方來源 URL；缺資料才留白，第三方 EPS 不參與官方推導。"
     }
@@ -1981,13 +1981,13 @@ def _iso_now() -> str:
 def make_evidence(metric: str, value: Any, *, category: str, kind: str="fact", period: str | None=None,
                   as_of: str | None=None, source: str="", source_type: str="third_party", source_url: str | None=None,
                   confidence: int=70, status: str="usable", unit: str | None=None, derived_from: list[str] | None=None,
-                  note: str | None=None) -> dict[str, Any]:
+                  note: str | None=None, definition: str | None=None) -> dict[str, Any]:
     return {
         "id": f"{category}:{metric}:{period or as_of or 'na'}:{source_type}",
         "metric": metric, "category": category, "kind": kind, "value": value, "unit": unit,
         "period": period, "as_of": as_of, "source": source, "source_type": source_type,
         "source_url": source_url, "confidence": int(max(0,min(100,confidence))), "status": status,
-        "derived_from": derived_from or [], "note": note,
+        "derived_from": derived_from or [], "note": note, "definition": definition or metric,
     }
 
 
@@ -2016,8 +2016,15 @@ def build_evidence_graph(ticker: str, tech: dict[str,Any], revenue: dict[str,Any
     for key,metric in (("quarter_eps","quarter_eps"),("ytd_eps","ytd_eps"),("ttm_eps","ttm_eps")):
         val=eps_stack.get(key)
         if val is not None:
-            kind="derived_fact" if key in {"quarter_eps","ttm_eps"} else "fact"
-            ev.append(make_evidence(metric,val,category="fundamental",kind=kind,period=eps_stack.get("quarter_period") or financial.get("period"),source=financial.get("source") or eps_stack.get("source") or "financial feed",source_type=st,confidence=fin_conf,unit="TWD/share",note=eps_stack.get("note")))
+            qmethod=str(eps_stack.get("quarter_method") or "")
+            if key=="quarter_eps":
+                kind="fact" if qmethod in {"official_direct","official_registry_verified","official_ytd_q1"} else "derived_fact"
+                definition="standalone_quarter_eps"
+            elif key=="ttm_eps":
+                kind="derived_fact"; definition="trailing_four_quarter_eps"
+            else:
+                kind="fact"; definition="cumulative_ytd_eps"
+            ev.append(make_evidence(metric,val,category="fundamental",kind=kind,period=eps_stack.get("quarter_period") or financial.get("period"),source=(eps_stack.get("quarter_source") if key=="quarter_eps" else None) or financial.get("source") or eps_stack.get("source") or "financial feed",source_type=("company_official" if key=="quarter_eps" and qmethod in {"official_direct","official_registry_verified"} else st),confidence=fin_conf,unit="TWD/share",note=eps_stack.get("quarter_method_label") if key=="quarter_eps" else eps_stack.get("note"),definition=definition))
     for key in ("gross_margin","operating_margin"):
         if financial.get(key) is not None:
             ev.append(make_evidence(key,financial.get(key),category="fundamental",period=financial.get("period"),source=financial.get("source") or "financial statement",source_type=st,confidence=fin_conf,unit="%"))
@@ -2030,28 +2037,68 @@ def build_evidence_graph(ticker: str, tech: dict[str,Any], revenue: dict[str,Any
         if v is not None: ev.append(make_evidence(f"MA{n}",v,category="technical",kind="derived_fact",period=tech.get("last_date"),source="derived from daily prices",source_type="derived",confidence=90,unit="TWD",derived_from=["close_series"]))
     for row in (research.get("reports") or [])[:25]:
         if row.get("target_price") is not None:
-            ev.append(make_evidence("analyst_target_price",safe_num(row.get("target_price")),category="research",period=row.get("report_date"),source=row.get("institution") or row.get("publisher") or "public research",source_type="public_web",source_url=row.get("source_url"),confidence=int(row.get("confidence") or 60),unit="TWD",note=row.get("title")))
+            ev.append(make_evidence("analyst_target_price",safe_num(row.get("target_price")),category="research",kind="estimate",period=str(row.get("target_period") or "forward"),as_of=row.get("report_date"),source=row.get("institution") or row.get("publisher") or "public research",source_type="public_web",source_url=row.get("source_url"),confidence=int(row.get("confidence") or 60),unit="TWD",note=row.get("title"),definition="analyst_target_price_estimate"))
         if row.get("forward_eps") is not None:
-            ev.append(make_evidence("analyst_forward_eps",safe_num(row.get("forward_eps")),category="research",period=str(row.get("forward_eps_year") or row.get("report_date") or ""),source=row.get("institution") or "public research",source_type="public_web",source_url=row.get("source_url"),confidence=int(row.get("confidence") or 60),unit="TWD/share",note=row.get("title")))
+            ev.append(make_evidence("analyst_forward_eps",safe_num(row.get("forward_eps")),category="research",kind="estimate",period=str(row.get("forward_eps_year") or "forward"),as_of=row.get("report_date"),source=row.get("institution") or "public research",source_type="public_web",source_url=row.get("source_url"),confidence=int(row.get("confidence") or 60),unit="TWD/share",note=row.get("title"),definition="analyst_forward_eps_estimate"))
+    # V5.3.2 quality engine: only comparable Facts/Derived Facts can conflict.
+    # Estimates and model outputs are revisions/scenarios, not source conflicts.
     conflicts=[]; groups={}
+    comparable_kinds={"fact","derived_fact"}
     for x in ev:
-        if x.get("status")!="usable" or not isinstance(x.get("value"),(int,float)): continue
-        groups.setdefault((x["metric"],x.get("period")),[]).append(x)
-    for (metric,period),rows in groups.items():
+        if x.get("status")!="usable" or x.get("kind") not in comparable_kinds or not isinstance(x.get("value"),(int,float)):
+            continue
+        key=(x["metric"],x.get("period"),x.get("definition"),x.get("unit"))
+        groups.setdefault(key,[]).append(x)
+    for (metric,period,definition,unit),rows in groups.items():
+        # Duplicate observations from the same source are not independent corroboration.
+        independent={}
+        for x in rows:
+            independent[(x.get("source_type"),x.get("source"))]=x
+        rows=list(independent.values())
         if len(rows)<2: continue
-        vals=[float(x["value"]) for x in rows]; base=max(1e-9,abs(sum(vals)/len(vals))); spread=(max(vals)-min(vals))/base
+        vals=[float(x["value"]) for x in rows]
+        base=max(1e-9,abs(sum(vals)/len(vals)))
+        spread=(max(vals)-min(vals))/base
         if spread>0.02:
-            conflicts.append({"metric":metric,"period":period,"values":[{"value":x["value"],"source":x["source"],"source_type":x["source_type"]} for x in rows],"spread_pct":round(spread*100,2)})
-    usable=[x for x in ev if x.get("status")=="usable"]; official=[x for x in usable if x.get("source_type") in {"official_exchange","company_official","verified_registry","official_or_structured"}]
-    facts=[x for x in usable if x.get("kind")=="fact"]; derived=[x for x in usable if x.get("kind")=="derived_fact"]
-    score=max(0,round(min(100,(len(usable)*2.2)+(len(official)*2.8)-len(conflicts)*8))) if usable else 0
-    return {"schema_version":"1.0","generated_at":_iso_now(),"ticker":ticker,"records":ev,"conflicts":conflicts,"summary":{"records":len(ev),"usable":len(usable),"official_or_verified":len(official),"facts":len(facts),"derived_facts":len(derived),"analysis":0,"conflicts":len(conflicts),"evidence_score":score},"policy":"Fact → Derived Fact → Analysis. Numeric model inputs retain source, period and provenance; conflicts are surfaced rather than silently averaged."}
+            conflicts.append({"metric":metric,"period":period,"definition":definition,"unit":unit,
+                              "values":[{"value":x["value"],"source":x["source"],"source_type":x["source_type"]} for x in rows],
+                              "spread_pct":round(spread*100,2)})
+
+    # Estimate revisions are tracked separately and never penalize the Evidence Score.
+    revisions=[]
+    est_groups={}
+    for x in ev:
+        if x.get("status")=="usable" and x.get("kind")=="estimate" and isinstance(x.get("value"),(int,float)):
+            est_groups.setdefault((x["metric"],x.get("period"),x.get("source"),x.get("definition")),[]).append(x)
+    for (metric,period,source,definition),rows in est_groups.items():
+        rows=sorted(rows,key=lambda r:str(r.get("as_of") or ""))
+        for prev,cur in zip(rows,rows[1:]):
+            pv=float(prev["value"]); cv=float(cur["value"])
+            pct=None if abs(pv)<1e-9 else round((cv/pv-1)*100,2)
+            revisions.append({"metric":metric,"period":period,"source":source,"definition":definition,
+                              "from_as_of":prev.get("as_of"),"to_as_of":cur.get("as_of"),
+                              "from_value":pv,"to_value":cv,"revision_pct":pct})
+
+    usable=[x for x in ev if x.get("status")=="usable"]
+    official=[x for x in usable if x.get("source_type") in {"official_exchange","company_official","verified_registry","official_or_structured"}]
+    facts=[x for x in usable if x.get("kind")=="fact"]
+    derived=[x for x in usable if x.get("kind")=="derived_fact"]
+    estimates=[x for x in usable if x.get("kind")=="estimate"]
+    model_outputs=[x for x in usable if x.get("kind")=="model_output"]
+    score=max(0,round(min(100,(len(usable)*2.0)+(len(official)*3.0)+(len(facts)*0.5)-len(conflicts)*10))) if usable else 0
+    return {"schema_version":"1.1","generated_at":_iso_now(),"ticker":ticker,"records":ev,
+            "conflicts":conflicts,"estimate_revisions":revisions,
+            "summary":{"records":len(ev),"usable":len(usable),"official_or_verified":len(official),
+                       "facts":len(facts),"derived_facts":len(derived),"estimates":len(estimates),
+                       "model_outputs":len(model_outputs),"analysis":0,"conflicts":len(conflicts),
+                       "estimate_revisions":len(revisions),"evidence_score":score},
+            "policy":"V5.3.2: Official Fact → Derived Fact → Estimate → Model Output. Conflict requires identical metric + period + definition + unit across independent factual sources. Estimate changes are tracked as revisions, not conflicts."}
 
 
 async def probe_twstock_mcp() -> dict[str,Any]:
     out={"provider":"TWStock MCP compatible adapter","enabled":TWSTOCK_MCP_ENABLED,"url":TWSTOCK_MCP_URL,"mode":"shadow_crosscheck","status":"disabled"}
     if not TWSTOCK_MCP_ENABLED: return out
-    payload={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.3.1"}}}
+    payload={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.3.2"}}}
     try:
         async with httpx.AsyncClient(timeout=8,follow_redirects=True,headers={"Accept":"application/json, text/event-stream","Content-Type":"application/json"}) as client:
             r=await client.post(TWSTOCK_MCP_URL,json=payload)
@@ -2266,7 +2313,7 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.3.1",
+        "ticker":ticker,"version":"5.3.2",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
@@ -2286,7 +2333,7 @@ async def eps_registry_diagnostics(ticker: str):
     reg=_load_official_eps_registry()
     rows=[r for r in reg.get("records",[]) if str(r.get("ticker"))==ticker]
     rows=sorted(rows,key=lambda r:(r.get("year") or 0,r.get("quarter") or 0),reverse=True)
-    return {"ticker":ticker,"version":"5.3.1","registry_schema_version":reg.get("schema_version"),
+    return {"ticker":ticker,"version":"5.3.2","registry_schema_version":reg.get("schema_version"),
             "updated_at":reg.get("updated_at"),"record_count":len(rows),"records":rows}
 
 @app.get("/api/evidence/{ticker}")
@@ -2301,7 +2348,7 @@ async def provider_diagnostics(ticker: str):
     ticker=ticker.strip().upper()
     d=await build_stock(ticker, False)
     mcp=await probe_twstock_mcp()
-    return {"version":"5.3.1","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
+    return {"version":"5.3.2","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.3.1","mode":"cloud-mobile-evidence-eps-takeover","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.3.2","mode":"cloud-mobile-evidence-quality","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
