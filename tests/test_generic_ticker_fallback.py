@@ -4,6 +4,24 @@ from unittest.mock import AsyncMock, patch
 import server
 
 
+class CompanyEventIdentityTests(unittest.IsolatedAsyncioTestCase):
+    def test_rejects_another_ticker_and_accepts_target_company(self):
+        self.assertEqual(server._company_event_identity("6488","環球晶","台積電 2330 法說會"), (False,"different_ticker_in_title"))
+        self.assertEqual(server._company_event_identity("6488","環球晶","環球晶法說：展望新產能"), (True,"company_name_in_title"))
+        self.assertEqual(server._company_event_identity("6488","環球晶","6488 法人說明會重點"), (True,"ticker_in_title"))
+
+    async def test_company_events_never_include_cross_ticker_news(self):
+        news=[
+            {"title":"台積電 2330 法說會釋出展望","url":"https://example.com/wrong","snippet":"環球晶供應鏈相關","published_date":"2026-08-15","publisher":"Example"},
+            {"title":"環球晶法說會：產能展望","url":"https://example.com/right","snippet":"公司說明營運展望","published_date":"2026-08-14","publisher":"Example"},
+        ]
+        with patch.object(server,"google_news_rss",new=AsyncMock(return_value=news)), patch.object(server,"fetch_official_material_info",new=AsyncMock(return_value=([],[]))):
+            result=await server.fetch_company_events("6488","環球晶")
+        self.assertTrue(result["rows"])
+        self.assertTrue(all(row["ticker"]=="6488" and row["identity_verified"] for row in result["rows"]))
+        self.assertNotIn("台積電", " ".join(row["title"] for row in result["rows"]))
+
+
 class TpexPriceParserTests(unittest.TestCase):
     def test_normalizes_full_width_ticker_digits(self):
         self.assertEqual(server.normalize_ticker(" ６４８８ "), "6488")

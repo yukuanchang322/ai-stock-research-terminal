@@ -91,6 +91,9 @@ function renderSnapshotCompare(d){
 
 
 function eventTags(tags){return `<div class="event-tags">${(tags||[]).map(t=>`<span>${t}</span>`).join('')}</div>`}
+function eventBelongsToTicker(x,ticker){
+  return Boolean(x&&x.identity_verified&&String(x.ticker||'')===String(ticker||''));
+}
 function earningsCallCard(x,index){
   const bullets=(x.summary_bullets||[]).slice(0,4);
   const outlook=(x.management_outlook||[]).slice(0,2);
@@ -167,8 +170,8 @@ function render(d){
   $('analystTable').innerHTML=(rr.reports||[]).length?`<table class="clean-table analyst-web-table"><thead><tr><th>法人/券商</th><th>日期</th><th>評等</th><th>目標價</th><th>來源/標題</th><th>可信度</th></tr></thead><tbody>${rr.reports.map(x=>`<tr><td>${x.institution||'—'}</td><td>${x.report_date||'—'}</td><td>${x.rating||'—'}</td><td>${fmt0(x.target_price)}</td><td>${x.source_url?`<a href="${x.source_url}" target="_blank" rel="noopener noreferrer">${x.title||x.publisher||'查看來源'}</a>`:(x.title||x.publisher||'自行匯入')}</td><td>${x.confidence!=null?`${x.confidence}/100`:'—'}</td></tr>`).join('')}</tbody></table>`:'<div class="empty bordered">目前尚未搜尋到可解析的公開法人研究引用。可按「強制刷新」重新搜尋最新網路資料。</div>';
 
   const ce=d.company_events||{};
-  const calls=(ce.earnings_calls||[]).slice(0,3);
-  const material=(ce.material_info||[]);
+  const calls=(ce.earnings_calls||[]).filter(x=>eventBelongsToTicker(x,d.ticker)).slice(0,3);
+  const material=(ce.material_info||[]).filter(x=>eventBelongsToTicker(x,d.ticker));
   if($('earningsCallCount')) $('earningsCallCount').textContent=calls.length;
   if($('materialInfoCount')) $('materialInfoCount').textContent=material.length;
   if($('earningsCallList')) $('earningsCallList').innerHTML=calls.length?calls.map(earningsCallCard).join(''):'<div class="empty bordered">目前尚未取得最近法說會的公開摘要。</div>';
