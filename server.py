@@ -932,20 +932,48 @@ def _eps_from_lxml_rows(tables: list[dict[str, Any]], quarter: int) -> tuple[flo
             return val,{"table_index":table.get("table_index"),"row_index":ri,"row":row[:10],"numeric_candidates":[{"column_index":x[0],"raw":x[1],"number":x[2]} for x in nums[:8]],"selected_numeric_index":pick_idx,"selected_column_index":ci}
     return None,None
 
+def _income_amounts_from_lxml_rows(tables: list[dict[str, Any]], quarter: int) -> dict[str, float|None]:
+    """Extract current-period YTD income-statement amounts from MOPS company tables.
+
+    Q2/Q3 rows normally contain current quarter, prior-year quarter, current YTD and
+    prior-year YTD.  We select the third numeric amount, matching the EPS parser. Q1
+    is already both standalone and YTD. Missing/ambiguous rows remain None.
+    """
+    aliases={
+        "revenue_ytd":("營業收入合計","營業收入","operating revenue"),
+        "gross_profit_ytd":("營業毛利（毛損）淨額","營業毛利（毛損）","營業毛利","gross profit"),
+        "operating_income_ytd":("營業利益（損失）","營業利益","profit from operations","operating income"),
+        "net_income_ytd":("本期淨利（淨損）","本期淨利","本期稅後淨利","net profit for the period","net income"),
+    }
+    found={key:None for key in aliases}
+    for table in tables:
+        for row in table.get("rows") or []:
+            label=" | ".join(row[:3]).lower()
+            target=next((key for key,names in aliases.items() if found[key] is None and any(_norm_label(name) in _norm_label(label) for name in names)),None)
+            if target is None: continue
+            nums=[]
+            for value in row[1:]:
+                number=parse_num_text(value)
+                if number is not None: nums.append(float(number))
+            if not nums: continue
+            pick=0 if quarter==1 else (2 if quarter in (2,3) and len(nums)>=3 else 0)
+            found[target]=nums[pick]
+    return found
+
 def _extract_mops_ifrs_tables(html_text: str, ticker: str, year: int, quarter: int, report_id: str, url: str) -> dict[str, Any] | None:
     """Parse a company-specific MOPS IFRS page using lxml, without html5lib."""
     if "查無資料" in html_text or "無符合條件" in html_text or "HTTP Status 404" in html_text: return None
     tables=_mops_lxml_rows(html_text)
     if not tables: return None
     eps,meta=_eps_from_lxml_rows(tables,quarter)
-    # Historical resolver only needs EPS. Current-period financial metrics come from official CSV/OpenAPI.
-    if eps is None: return None
+    amounts=_income_amounts_from_lxml_rows(tables,quarter)
+    if eps is None and not any(value is not None for value in amounts.values()): return None
     return {
         "source":"MOPS company IFRS report","market":"MOPS","endpoint":url,"official":True,
         "period":f"{year} Q{quarter}","fiscal_year":year,"fiscal_quarter":quarter,
         "statement_date":None,"feed_kind":f"mops_company_{report_id}","company_code":ticker,
-        "ytd_eps":eps,"revenue_ytd":None,"gross_profit_ytd":None,
-        "operating_income_ytd":None,"net_income_ytd":None,"completeness":1,
+        "ytd_eps":eps,**amounts,
+        "completeness":sum(value is not None for value in (eps,*amounts.values())),
         "report_id":report_id,"table_count":len(tables),"selected_column":str((meta or {}).get("selected_column_index")),
         "eps_parser":"lxml","eps_parser_meta":meta,
     }
@@ -1535,6 +1563,87 @@ async def reconcile_official_financial_snapshot(ticker: str, selected: dict[str,
     merged["mapping_reconciled"]=True
     merged["mapping_sources"]=[{"source":x.get("source"),"endpoint":x.get("endpoint"),"period":x.get("period"),"completeness":x.get("completeness")} for x in latest]
     return merged
+
+FINANCIAL_AMOUNT_FIELDS=("revenue_ytd","gross_profit_ytd","operating_income_ytd","net_income_ytd")
+
+def _margin_block(snapshot: dict[str, Any], period: str, basis: str, method: str, note: str) -> dict[str, Any]:
+    revenue=safe_num(snapshot.get("revenue_ytd"))
+    gross=safe_num(snapshot.get("gross_profit_ytd"))
+    operating=safe_num(snapshot.get("operating_income_ytd"))
+    net=safe_num(snapshot.get("net_income_ytd"))
+    return {
+        "period":period,"basis":basis,"method":method,"note":note,
+        "source":snapshot.get("source"),"endpoint":snapshot.get("endpoint"),
+        "revenue":revenue,"gross_profit":gross,"operating_income":operating,"net_income":net,
+        "gross_margin":gross/revenue*100 if revenue not in (None,0) and gross is not None else None,
+        "operating_margin":operating/revenue*100 if revenue not in (None,0) and operating is not None else None,
+        "net_margin":net/revenue*100 if revenue not in (None,0) and net is not None else None,
+    }
+
+async def fetch_official_financial_amounts_for_period(ticker: str, year: int, quarter: int) -> dict[str, Any] | None:
+    """Resolve exact-period official YTD amounts without accepting EPS-only evidence."""
+    candidates=[]
+    try:
+        candidates.extend(await fetch_mops_company_ifrs(ticker,year,quarter))
+    except Exception:
+        pass
+    try:
+        ir=await fetch_company_ir_financial(ticker,year,quarter)
+        if ir: candidates.append(ir)
+    except Exception:
+        pass
+    try:
+        candidates.extend(await fetch_mops_material_financial(ticker,year,quarter))
+    except Exception:
+        pass
+    exact=[row for row in candidates if row.get("official") and row.get("fiscal_year")==year and row.get("fiscal_quarter")==quarter]
+    if not exact: return None
+    exact.sort(key=lambda row:sum(row.get(field) is not None for field in FINANCIAL_AMOUNT_FIELDS),reverse=True)
+    merged=dict(exact[0])
+    for row in exact[1:]:
+        for field in FINANCIAL_AMOUNT_FIELDS:
+            if merged.get(field) is None and row.get(field) is not None: merged[field]=row[field]
+    return merged if merged.get("revenue_ytd") is not None else None
+
+async def build_financial_margin_views(ticker: str, current: dict[str, Any]) -> dict[str, Any]:
+    """Keep cumulative and standalone-quarter profitability definitions separate."""
+    try:
+        year=int(current.get("fiscal_year")); quarter=int(current.get("fiscal_quarter"))
+    except (TypeError,ValueError):
+        year=quarter=None
+    if not current.get("official") or not year or not quarter:
+        return {"ytd":None,"quarter":None,"warning":"缺少可驗證的官方財報期間，獲利率不進行期間轉換。"}
+    if safe_num(current.get("revenue_ytd")) is None:
+        same_period=await fetch_official_financial_amounts_for_period(ticker,year,quarter)
+        if same_period:
+            current=dict(current)
+            for field in (*FINANCIAL_AMOUNT_FIELDS,"source","endpoint"):
+                if field in FINANCIAL_AMOUNT_FIELDS or current.get(field) is None:
+                    if same_period.get(field) is not None: current[field]=same_period[field]
+    ytd_period=f"{year} Q{quarter} YTD" if quarter<4 else f"{year} FY"
+    ytd=_margin_block(current,ytd_period,"cumulative_ytd","official_ytd","官方累計財報數字計算")
+    quarter_block=None
+    if quarter==1:
+        quarter_block=dict(ytd,period=f"{year} Q1 單季",basis="standalone_quarter",method="q1_equals_ytd",note="Q1 單季等於 Q1 累計")
+    else:
+        prior=await fetch_official_financial_amounts_for_period(ticker,year,quarter-1)
+        if prior and safe_num(current.get("revenue_ytd")) is not None and safe_num(prior.get("revenue_ytd")) is not None:
+            delta={field:(safe_num(current.get(field))-safe_num(prior.get(field)) if safe_num(current.get(field)) is not None and safe_num(prior.get(field)) is not None else None) for field in FINANCIAL_AMOUNT_FIELDS}
+            if delta["revenue_ytd"] and delta["revenue_ytd"]>0:
+                derived={**current,**delta}
+                quarter_block=_margin_block(derived,f"{year} Q{quarter} 單季","standalone_quarter","official_ytd_difference","依本期累計減前期累計回推，非公司單季公告")
+                quarter_block["derivation"]={
+                    "current_period":current.get("period"),"current_source":current.get("source"),"current_endpoint":current.get("endpoint"),
+                    "prior_period":prior.get("period"),"prior_source":prior.get("source"),"prior_endpoint":prior.get("endpoint"),
+                }
+        # Some issuers publish official standalone margins directly, even when amount subtraction is unavailable.
+        if quarter_block is None and (current.get("gross_margin_direct") is not None or current.get("operating_margin_direct") is not None):
+            quarter_block={"period":f"{year} Q{quarter} 單季","basis":"standalone_quarter","method":"company_official_direct",
+                           "note":"公司官方單季公告比率","source":current.get("source"),"endpoint":current.get("endpoint"),
+                           "revenue":None,"gross_profit":None,"operating_income":None,"net_income":None,
+                           "gross_margin":safe_num(current.get("gross_margin_direct")),"operating_margin":safe_num(current.get("operating_margin_direct")),"net_margin":None}
+    warning=None if quarter_block else f"缺少 {year} Q{quarter-1} 同口徑官方累計金額；只顯示 {ytd_period}，不推測單季獲利率。"
+    return {"ytd":ytd,"quarter":quarter_block,"warning":warning}
 
 def expected_latest_financial_period(as_of: date | None=None) -> tuple[int,int,str]:
     """Conservative Taiwan quarterly filing calendar used only as a freshness gate.
@@ -2784,9 +2893,13 @@ def build_evidence_graph(ticker: str, tech: dict[str,Any], revenue: dict[str,Any
             else:
                 kind="fact"; definition="cumulative_ytd_eps"
             ev.append(make_evidence(metric,val,category="fundamental",kind=kind,period=eps_stack.get("quarter_period") or financial.get("period"),source=(eps_stack.get("quarter_source") if key=="quarter_eps" else None) or financial.get("source") or eps_stack.get("source") or "financial feed",source_type=("company_official" if key=="quarter_eps" and qmethod in {"official_direct","official_registry_verified"} else st),confidence=fin_conf,unit="TWD/share",note=eps_stack.get("quarter_method_label") if key=="quarter_eps" else eps_stack.get("note"),definition=definition))
-    for key in ("gross_margin","operating_margin"):
+    for key in ("gross_margin","operating_margin","net_margin"):
         if financial.get(key) is not None:
-            ev.append(make_evidence(key,financial.get(key),category="fundamental",period=financial.get("period"),source=financial.get("source") or "financial statement",source_type=st,confidence=fin_conf,unit="%"))
+            ev.append(make_evidence(f"ytd_{key}",financial.get(key),category="fundamental",period=financial.get("margin_period") or financial.get("period"),source=financial.get("source") or "financial statement",source_type=st,confidence=fin_conf,unit="%",definition="cumulative_ytd_margin"))
+    quarter_margins=((financial.get("margin_views") or {}).get("quarter") or {})
+    for key in ("gross_margin","operating_margin","net_margin"):
+        if quarter_margins.get(key) is not None:
+            ev.append(make_evidence(f"quarter_{key}",quarter_margins.get(key),category="fundamental",kind="derived_fact" if quarter_margins.get("method")=="official_ytd_difference" else "fact",period=quarter_margins.get("period"),source=quarter_margins.get("source") or financial.get("source") or "financial statement",source_type=st,confidence=fin_conf,unit="%",note=quarter_margins.get("note"),definition="standalone_quarter_margin"))
     for key,metric in (("foreign_1","foreign_1d"),("foreign_5","foreign_5d"),("foreign_20","foreign_20d"),
                        ("trust_1","trust_1d"),("trust_5","trust_5d"),("trust_20","trust_20d"),
                        ("dealer_1","dealer_1d"),("dealer_5","dealer_5d"),("dealer_20","dealer_20d"),
@@ -3009,6 +3122,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         errors.append(f"OfficialReconcile: {type(e).__name__}")
     eps_stack=await build_eps_stack(ticker, fin, official_financial, financial)
     financial_integrity=assess_financial_integrity(official_financial, eps_stack, today)
+    margin_views=await build_financial_margin_views(ticker,official_financial)
     # Official snapshot has highest priority for latest period margins/amounts.
     if official_financial.get("official"):
         financial.update({
@@ -3024,10 +3138,10 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
             financial["gross_margin"]=(financial.get("gross_profit")/financial["revenue"]*100) if financial.get("gross_profit") is not None else financial.get("gross_margin")
             financial["operating_margin"]=(financial.get("operating_income")/financial["revenue"]*100) if financial.get("operating_income") is not None else financial.get("operating_margin")
             financial["net_margin"]=(financial.get("net_income")/financial["revenue"]*100) if financial.get("net_income") is not None else financial.get("net_margin")
-        if official_financial.get("gross_margin_direct") is not None:
-            financial["gross_margin"]=official_financial.get("gross_margin_direct")
-        if official_financial.get("operating_margin_direct") is not None:
-            financial["operating_margin"]=official_financial.get("operating_margin_direct")
+        financial["margin_views"]=margin_views
+        financial["margin_period"]=(margin_views.get("ytd") or {}).get("period")
+        financial["margin_basis"]="cumulative_ytd"
+        financial["margin_warning"]=margin_views.get("warning")
     if not financial_integrity.get("official_verified"):
         financial["official"]=False
         financial["source"]=(financial.get("source") or "FinMind") + "（未通過官方最新季度驗證）"
@@ -3080,6 +3194,7 @@ def report_html(d: dict[str, Any]) -> str:
     rrows="".join(f"<tr><td>{esc(x.get('institution'))}</td><td>{esc(x.get('report_date'))}</td><td>{esc(x.get('rating'))}</td><td>{nfmt(safe_num(x.get('target_price')),0)}</td><td>{nfmt(safe_num(x.get('forward_eps')),2)}</td></tr>" for x in research.get("reports",[])) or "<tr><td colspan='5'>目前尚未搜尋到可解析的公開法人研究引用。</td></tr>"
     erows="".join(f"<tr><td>{esc(x.get('institution'))}</td><td>{esc(x.get('previous_date'))} → {esc(x.get('latest_date'))}</td><td>{pct(x.get('eps_revision_pct'))}</td><td>{pct(x.get('target_revision_pct'))}</td><td>{nfmt(x.get('latest_target'),0)}</td></tr>" for x in exp.get("institution_revisions",[])) or "<tr><td colspan='5'>同機構前後修正資料不足。</td></tr>"
     cats="".join(f"<li>{esc(x)}</li>" for x in d.get("catalysts",[])); risks="".join(f"<li>{esc(x)}</li>" for x in d.get("risks",[]))
+    margins=fin.get("margin_views") or {}; qm=margins.get("quarter") or {}; ym=margins.get("ytd") or {}
     return f"""<!doctype html><html lang='zh-Hant'><head><meta charset='utf-8'><style>
     @page{{size:A4;margin:11mm}} body{{font-family:'Noto Sans TC','PingFang TC',sans-serif;color:#13202a;font-size:9.5pt;line-height:1.55}} h1{{font-size:23pt;margin:0}} h2{{font-size:14pt;border-bottom:2px solid #173847;padding-bottom:4px;margin:18px 0 8px}} .muted{{color:#60727c}} .head{{display:flex;justify-content:space-between;border-bottom:3px solid #173847;padding-bottom:9px}} .price{{font-size:23pt;font-weight:800;text-align:right}} .pill{{display:inline-block;border:1px solid #719188;border-radius:20px;padding:2px 8px;margin-right:5px}} .grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin:10px 0}} .card{{border:1px solid #d7e0e4;border-radius:7px;padding:8px}} .card b{{font-size:14pt;display:block}} table{{width:100%;border-collapse:collapse;font-size:8.4pt}} th,td{{padding:5px;border-bottom:1px solid #dce4e8;text-align:left}} th{{background:#f2f6f7}} .call{{border-left:4px solid #17866b;background:#f4faf8;padding:9px}} .warn{{border:1px solid #d7b94b;background:#fff9e7;padding:8px;margin-top:10px}} .small{{font-size:8pt}} .page-break{{break-before:page}} .cols{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} ul{{margin:4px 0 0;padding-left:18px}} .badge{{font-weight:700}}
     </style></head><body>
@@ -3090,6 +3205,7 @@ def report_html(d: dict[str, Any]) -> str:
     <div class='cols'><div><b>主要催化劑</b><ul>{cats}</ul></div><div><b>主要風險</b><ul>{risks}</ul></div></div>
     <h2>2. Expectation Gap & Revision Radar</h2><div class='call'><b>{esc(exp.get('regime'))}</b><br>{esc(exp.get('summary'))}</div><div class='grid'><div class='card'>預期修正分數<b>{exp.get('revision_score','—')}/100</b></div><div class='card'>EPS 修正<b>{pct(research.get('eps_revision_pct'))}</b></div><div class='card'>目標價修正<b>{pct(research.get('target_revision_pct'))}</b></div><div class='card'>估值區域<b style='font-size:10pt'>{esc(exp.get('valuation_zone'))}</b></div></div><table><tr><th>法人</th><th>前次 → 最新</th><th>EPS 修正</th><th>目標價修正</th><th>最新目標</th></tr>{erows}</table><p class='small muted'>{esc(exp.get('methodology'))}</p>
     <h2>3. Fundamentals & EPS Integrity</h2><table><tr><th>最新月營收</th><th>YoY</th><th>單季 EPS</th><th>YTD EPS</th><th>TTM EPS</th><th>財報期間</th></tr><tr><td>{nfmt(rev.get('latest_revenue'),0)}</td><td>{pct(rev.get('revenue_yoy'))}</td><td>{nfmt(d.get('eps_stack',{}).get('quarter_eps'),2)}</td><td>{nfmt(d.get('eps_stack',{}).get('ytd_eps'),2)}</td><td>{nfmt(d.get('eps_stack',{}).get('ttm_eps'),2)}</td><td>{esc(fin.get('period') or fin.get('statement_date'))}</td></tr></table><p class='small muted'>{esc(d.get('eps_stack',{}).get('note'))}</p>
+    <table><tr><th>獲利率口徑</th><th>期間</th><th>毛利率</th><th>營益率</th><th>淨利率</th><th>說明</th></tr><tr><td>單季</td><td>{esc(qm.get('period'))}</td><td>{pct(qm.get('gross_margin'))}</td><td>{pct(qm.get('operating_margin'))}</td><td>{pct(qm.get('net_margin'))}</td><td>{esc(qm.get('note') or margins.get('warning'))}</td></tr><tr><td>累計</td><td>{esc(ym.get('period'))}</td><td>{pct(ym.get('gross_margin'))}</td><td>{pct(ym.get('operating_margin'))}</td><td>{pct(ym.get('net_margin'))}</td><td>{esc(ym.get('note'))}</td></tr></table>
     <h2>4. Positioning & Technicals</h2><table><tr><th>外資20日</th><th>投信20日</th><th>融資餘額</th><th>融券餘額</th><th>券資比</th><th>借券餘額</th><th>借券賣出餘額</th></tr><tr><td>{nfmt(flow.get('foreign_20'),0)}</td><td>{nfmt(flow.get('trust_20'),0)}</td><td>{nfmt(flow.get('margin_balance'),0)} 張</td><td>{nfmt(flow.get('short_balance'),0)} 張</td><td>{pct(flow.get('short_margin_ratio_pct'))}</td><td>{nfmt(flow.get('sbl_balance'),0)} 張</td><td>{nfmt(flow.get('sbl_short_balance'),0)} 張</td></tr></table><p class='small muted'>借券餘額不等於放空；借券賣出餘額較接近尚未回補的借券放空部位。資料日 {esc(flow.get('lending_last_date') or flow.get('margin_last_date'))}。</p>
     <div class='page-break'></div><h2>5. Analyst Research & Revisions</h2><p>匯入報告數：<b>{research.get('count',0)}</b> ｜ Forward EPS 修正：<b>{pct(research.get('eps_revision_pct'))}</b></p><table><tr><th>法人/券商</th><th>日期</th><th>評等</th><th>目標價</th><th>Forward EPS</th></tr>{rrows}</table><p class='small muted'>本區彙整公開網路可取得之研究引用與使用者匯入資料；僅保存標題、摘要、數值、發布者與來源連結，不重製付費研究全文。</p>
     <h2>6. Company Events & Earnings-call Radar</h2><table><tr><th>日期</th><th>事件</th><th>發布者</th></tr>{''.join(f"<tr><td>{esc(x.get('date'))}</td><td>{esc(x.get('title'))}</td><td>{esc(x.get('publisher'))}</td></tr>" for x in d.get('company_events',{{}}).get('rows',[])[:8]) or "<tr><td colspan='3'>目前未搜尋到公司事件引用。</td></tr>"}</table>
@@ -3150,11 +3266,12 @@ def write_report_pdf(d: dict[str, Any], output_path: Path) -> None:
 
     eps=d.get("eps_stack") or {}; financial=d.get("financial") or {}; revenue=d.get("revenue") or {}
     story.extend([para("2. 基本面與 EPS",section),table([["項目","數值","期間／來源"],["最新月營收",nfmt(revenue.get("latest_revenue"),0),revenue.get("revenue_period") or revenue.get("last_date")],["營收 YoY",pct(revenue.get("revenue_yoy")),revenue.get("revenue_period")],["單季 EPS",nfmt(eps.get("quarter_eps"),2),eps.get("quarter_period")],["YTD EPS",nfmt(eps.get("ytd_eps"),2),eps.get("quarter_period")],["TTM EPS",nfmt(eps.get("ttm_eps"),2),financial.get("source")]], [48*mm,42*mm,75*mm])])
+    margin_views=financial.get("margin_views") or {}; qm=margin_views.get("quarter") or {}; ym=margin_views.get("ytd") or {}
+    story.extend([Spacer(1,3*mm),table([["口徑／期間","毛利率","營益率","淨利率","說明"],[f"單季 {qm.get('period') or '-'}",pct(qm.get("gross_margin")),pct(qm.get("operating_margin")),pct(qm.get("net_margin")),qm.get("note") or margin_views.get("warning")],[f"累計 {ym.get('period') or '-'}",pct(ym.get("gross_margin")),pct(ym.get("operating_margin")),pct(ym.get("net_margin")),ym.get("note")]], [34*mm,25*mm,25*mm,25*mm,56*mm])])
 
     tech=d.get("technical") or {}; flow=d.get("flow") or {}
     story.extend([para("3. 籌碼與技術",section),table([["指標","1日","5日","20日"],["外資",nfmt(flow.get("foreign_1"),0),nfmt(flow.get("foreign_5"),0),nfmt(flow.get("foreign_20"),0)],["投信",nfmt(flow.get("trust_1"),0),nfmt(flow.get("trust_5"),0),nfmt(flow.get("trust_20"),0)],["自營商",nfmt(flow.get("dealer_1"),0),nfmt(flow.get("dealer_5"),0),nfmt(flow.get("dealer_20"),0)],["融資變化",pct(flow.get("margin_1_pct")),pct(flow.get("margin_5_pct")),pct(flow.get("margin_20_pct"))],["融券變化",pct(flow.get("short_1_pct")),pct(flow.get("short_5_pct")),pct(flow.get("short_20_pct"))]],[42*mm,41*mm,41*mm,41*mm]),Spacer(1,3*mm),table([["融資餘額","融券餘額","券資比","借券餘額","借券賣出餘額"],[nfmt(flow.get("margin_balance"),0),nfmt(flow.get("short_balance"),0),pct(flow.get("short_margin_ratio_pct")),nfmt(flow.get("sbl_balance"),0),nfmt(flow.get("sbl_short_balance"),0)]],[33*mm]*5),Spacer(1,3*mm),table([["趨勢","MA20","MA60","RSI14","支撐","壓力"],[tech.get("trend"),nfmt((tech.get("ma") or {}).get(20) or (tech.get("ma") or {}).get("20"),1),nfmt((tech.get("ma") or {}).get(60) or (tech.get("ma") or {}).get("60"),1),nfmt(tech.get("rsi14"),1),nfmt(tech.get("support1"),1),nfmt(tech.get("resistance"),1)]],[27.5*mm]*6)])
 
-    story.append(PageBreak())
     research=d.get("research") or {}; reports=research.get("reports") or []
     story.append(para("4. 法人研究與預期修正",section))
     report_rows=[["機構","日期","評級","目標價","Forward EPS"]]+[[r.get("institution"),r.get("report_date"),r.get("rating"),nfmt(safe_num(r.get("target_price")),0),nfmt(safe_num(r.get("forward_eps")),2)] for r in reports[:12]]

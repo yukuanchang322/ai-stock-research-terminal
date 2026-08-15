@@ -136,6 +136,8 @@ function render(d){
   $('epsBasis').textContent=`EPS 基礎：${d.valuation.eps_basis||'資料不足'}`;
 
   const f=d.financial||{}, r=d.revenue||{}, p=d.per||{}, es=d.eps_stack||{}, fi=d.financial_integrity||{};
+  const marginViews=f.margin_views||{}, qm=marginViews.quarter||{}, ym=marginViews.ytd||{};
+  const quarterMarginNote=qm.note||marginViews.warning||'缺少同口徑官方累計資料，不推測單季比率';
   const diagLink=`<a class="diagnostic-link" href="/api/diagnostics/financial/${encodeURIComponent(d.ticker)}" target="_blank" rel="noopener noreferrer">查看官方資料診斷</a>`;
   const staleNote=fi.official_verified ? `✅ ${fi.message||'官方最新財報期已驗證'}` : `⚠ ${fi.message||'財報最新季度尚未通過官方驗證'} · ${diagLink}`;
   const perNote=fi.core_financials_allowed ? (p.last_date||'市場資料') : `${p.last_date||''} · 市場 PER 可顯示，但不代表財報已驗證`;
@@ -143,7 +145,9 @@ function render(d){
     metric('最新月營收',fmt0(r.latest_revenue),r.revenue_period||''), metric('營收 YoY',pct(r.revenue_yoy),'年增率'),
     metric('單季 EPS',fmt(es.quarter_eps,2),`${es.quarter_period||'—'} · ${es.quarter_method_label||'資料不足'}`), metric('YTD EPS',fmt(es.ytd_eps,2),`${es.ytd_period||'—'} · ${es.ytd_method_label||''}`),
     metric('TTM EPS',fmt(es.ttm_eps,2),`${es.ttm_period||'—'} · ${es.ttm_method_label||''}`), metric('財報來源',f.source||es.source||'—',`${f.period||f.statement_date||''} · ${staleNote}`),
-    metric('毛利率',pct(f.gross_margin),f.period||'最新財報期'), metric('營益率',pct(f.operating_margin),f.period||'最新財報期'), metric('PER / PBR',`${fmt(p.per,1)}x / ${fmt(p.pbr,1)}x`,perNote)
+    metric('單季毛利率',pct(qm.gross_margin),`${qm.period||'—'} · ${quarterMarginNote}`), metric('單季營益率',pct(qm.operating_margin),`${qm.period||'—'} · ${quarterMarginNote}`), metric('單季淨利率',pct(qm.net_margin),`${qm.period||'—'} · ${quarterMarginNote}`),
+    metric('累計毛利率',pct(ym.gross_margin),`${ym.period||f.margin_period||'—'} · ${ym.note||'官方累計財報'}`), metric('累計營益率',pct(ym.operating_margin),`${ym.period||f.margin_period||'—'} · ${ym.note||'官方累計財報'}`), metric('累計淨利率',pct(ym.net_margin),`${ym.period||f.margin_period||'—'} · ${ym.note||'官方累計財報'}`),
+    metric('PER / PBR',`${fmt(p.per,1)}x / ${fmt(p.pbr,1)}x`,perNote)
   ].join('');
   document.querySelectorAll('.eps-ledger,.evidence-matrix').forEach(node=>node.remove());
   const ledger=(es.evidence_ledger||[]);
