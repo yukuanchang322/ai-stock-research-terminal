@@ -39,7 +39,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.3.2")
+app = FastAPI(title="AI Stock Research Terminal", version="5.3.3")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -1455,7 +1455,7 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             "missing_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")!="usable"],
             "policy":"official_registry_then_company_ir_then_official_disclosure; no third-party EPS for official derivation",
         },
-        "evidence_ledger_version":"5.3.2",
+        "evidence_ledger_version":"5.3.3",
         "blocked_mops_html_removed":True,
         "note":"V5.3.1 Evidence Engine EPS takeover：歷史季度優先讀取可稽核的公司官方 Registry，再以公司 IR/官方揭露補抓。Registry 每筆保留官方來源 URL；缺資料才留白，第三方 EPS 不參與官方推導。"
     }
@@ -1761,61 +1761,132 @@ def calc_technical(prices: list[dict[str, Any]]) -> dict[str, Any]:
     for c in ["close", "max", "min", "open", "Trading_Volume"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+    # OHLC fallbacks keep older/partial feeds chartable without inventing values outside the close.
+    for c in ["open","max","min"]:
+        if c not in df.columns:
+            df[c]=df["close"]
+    df = df.dropna(subset=["close"]).copy()
     df = df[df["close"] > 0].sort_values("date")
     if df.empty:
         return {}
-    s = df["close"]
-    last = float(s.iloc[-1])
-    ma = {k: (float(s.tail(k).mean()) if len(s) >= k else None) for k in (5, 10, 20, 60, 120, 240)}
-    m, sig, hist = macd(s)
-    r = rsi(s)
-    high60 = float(s.tail(60).max()) if len(s) >= 20 else float(s.max())
-    low60 = float(s.tail(60).min()) if len(s) >= 20 else float(s.min())
-    support1 = ma[20] or low60
-    support2 = ma[60] or low60
-    trend = "多頭" if ma[20] and ma[60] and last > ma[20] > ma[60] else ("偏多" if ma[20] and last > ma[20] else "整理/偏弱")
-    vol_ratio = None
-    if "Trading_Volume" in df.columns and len(df) >= 21:
-        v20 = df["Trading_Volume"].iloc[-21:-1].mean()
-        vol_ratio = float(df["Trading_Volume"].iloc[-1] / v20) if v20 and not pd.isna(v20) else None
-    returns20 = (last / float(s.iloc[-21]) - 1) * 100 if len(s) >= 21 else None
-    returns60 = (last / float(s.iloc[-61]) - 1) * 100 if len(s) >= 61 else None
+
+    close=df["close"].astype(float)
+    high=df["max"].fillna(df["close"]).astype(float)
+    low=df["min"].fillna(df["close"]).astype(float)
+    open_=df["open"].fillna(df["close"]).astype(float)
+    last=float(close.iloc[-1])
+
+    ma_series={k:close.rolling(k).mean() for k in (5,10,20,60,120,240)}
+    ma={k:(float(ma_series[k].iloc[-1]) if len(close)>=k and pd.notna(ma_series[k].iloc[-1]) else None) for k in ma_series}
+
+    ema12=close.ewm(span=12,adjust=False).mean()
+    ema26=close.ewm(span=26,adjust=False).mean()
+    dif=ema12-ema26
+    dea=dif.ewm(span=9,adjust=False).mean()
+    macd_hist=(dif-dea)*2
+
+    delta=close.diff()
+    gain=delta.clip(lower=0)
+    loss=(-delta.clip(upper=0))
+    avg_gain=gain.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+    avg_loss=loss.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+    rs=avg_gain/avg_loss.replace(0,float("nan"))
+    rsi_series=100-(100/(1+rs))
+    if pd.isna(rsi_series.iloc[-1]) and avg_loss.iloc[-1]==0 and avg_gain.iloc[-1]>0:
+        rsi_series.iloc[-1]=100.0
+
+    ll9=low.rolling(9).min()
+    hh9=high.rolling(9).max()
+    denom=(hh9-ll9).replace(0,float("nan"))
+    rsv=((close-ll9)/denom*100).clip(lower=0,upper=100)
+    # Taiwan KD convention: K/D start at 50 and use 1/3 smoothing.
+    kvals=[]; dvals=[]; kprev=50.0; dprev=50.0
+    for rv in rsv:
+        if pd.isna(rv):
+            kvals.append(None); dvals.append(None); continue
+        kprev=(2/3)*kprev+(1/3)*float(rv)
+        dprev=(2/3)*dprev+(1/3)*kprev
+        kvals.append(kprev); dvals.append(dprev)
+    k_series=pd.Series(kvals,index=df.index,dtype="float64")
+    d_series=pd.Series(dvals,index=df.index,dtype="float64")
+
+    high60=float(close.tail(60).max()) if len(close)>=20 else float(close.max())
+    low60=float(close.tail(60).min()) if len(close)>=20 else float(close.min())
+    support1=ma[20] or low60
+    support2=ma[60] or low60
+    trend="多頭" if ma[20] and ma[60] and last>ma[20]>ma[60] else ("偏多" if ma[20] and last>ma[20] else "整理/偏弱")
+
+    vol_ratio=None
+    if "Trading_Volume" in df.columns and len(df)>=21:
+        v20=df["Trading_Volume"].iloc[-21:-1].mean()
+        vol_ratio=float(df["Trading_Volume"].iloc[-1]/v20) if v20 and not pd.isna(v20) else None
+    returns20=(last/float(close.iloc[-21])-1)*100 if len(close)>=21 else None
+    returns60=(last/float(close.iloc[-61])-1)*100 if len(close)>=61 else None
+
+    # One trading year. Every row carries OHLC + MA + oscillators so the browser can render
+    # a real daily K chart and aligned KD / MACD / RSI panels.
+    view=df.tail(252)
+    series=[]
+    for idx,row in view.iterrows():
+        def num(v):
+            return None if pd.isna(v) else float(v)
+        series.append({
+            "date":row["date"].date().isoformat(),
+            "open":num(open_.loc[idx]),"high":num(high.loc[idx]),"low":num(low.loc[idx]),"close":num(close.loc[idx]),
+            "volume":num(row.get("Trading_Volume")),
+            "ma20":num(ma_series[20].loc[idx]),"ma60":num(ma_series[60].loc[idx]),
+            "k":num(k_series.loc[idx]),"d":num(d_series.loc[idx]),
+            "macd":num(dif.loc[idx]),"macd_signal":num(dea.loc[idx]),"macd_hist":num(macd_hist.loc[idx]),
+            "rsi14":num(rsi_series.loc[idx]),
+        })
+
     return {
-        "last": last, "last_date": df.iloc[-1]["date"].date().isoformat(), "ma": ma,
-        "rsi14": r, "macd": m, "macd_signal": sig, "macd_hist": hist,
-        "support1": support1, "support2": support2, "resistance": high60,
-        "trend": trend, "volume_ratio_20": vol_ratio, "return_20d": returns20, "return_60d": returns60,
-        "series": [{"date": d.date().isoformat(), "close": float(c)} for d, c in zip(df.tail(180)["date"], df.tail(180)["close"])],
-        "high_52w": float(s.tail(252).max()), "low_52w": float(s.tail(252).min()),
+        "last":last,"last_date":df.iloc[-1]["date"].date().isoformat(),"ma":ma,
+        "rsi14":num(rsi_series.iloc[-1]),"k":num(k_series.iloc[-1]),"d":num(d_series.iloc[-1]),
+        "macd":num(dif.iloc[-1]),"macd_signal":num(dea.iloc[-1]),"macd_hist":num(macd_hist.iloc[-1]),
+        "support1":support1,"support2":support2,"resistance":high60,
+        "trend":trend,"volume_ratio_20":vol_ratio,"return_20d":returns20,"return_60d":returns60,
+        "series":series,"series_days":len(series),"chart_period":"近一年日K",
+        "high_52w":float(close.tail(252).max()),"low_52w":float(close.tail(252).min()),
     }
 
 
 def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    df = pd.DataFrame(rows)
-    result: dict[str, Any] = {}
+    df=pd.DataFrame(rows)
+    result: dict[str,Any]={}
     if not df.empty:
         for c in df.columns:
-            if c not in ("date", "stock_id"):
-                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-        df = df.sort_values("date")
-        def net(prefix: str, n: int) -> float:
-            buy = [c for c in df.columns if c.startswith(prefix) and c.endswith("_buy")]
-            sell = [c for c in df.columns if c.startswith(prefix) and c.endswith("_sell")]
-            tail = df.tail(n)
-            return float(tail[buy].sum().sum() - tail[sell].sum().sum()) if buy or sell else 0.0
+            if c not in ("date","stock_id"):
+                df[c]=pd.to_numeric(df[c],errors="coerce").fillna(0)
+        df=df.sort_values("date")
+        def net(prefix:str,n:int)->float:
+            buy=[c for c in df.columns if c.startswith(prefix) and c.endswith("_buy")]
+            sell=[c for c in df.columns if c.startswith(prefix) and c.endswith("_sell")]
+            tail=df.tail(n)
+            return float(tail[buy].sum().sum()-tail[sell].sum().sum()) if buy or sell else 0.0
         result.update({
-            "foreign_5": net("Foreign_", 5), "foreign_20": net("Foreign_", 20),
-            "trust_5": net("Investment_Trust", 5), "trust_20": net("Investment_Trust", 20),
-            "dealer_20": net("Dealer", 20), "last_date": str(df.iloc[-1]["date"]),
+            "foreign_1":net("Foreign_",1),"foreign_5":net("Foreign_",5),"foreign_20":net("Foreign_",20),
+            "trust_1":net("Investment_Trust",1),"trust_5":net("Investment_Trust",5),"trust_20":net("Investment_Trust",20),
+            "dealer_1":net("Dealer",1),"dealer_5":net("Dealer",5),"dealer_20":net("Dealer",20),
+            "last_date":str(df.iloc[-1]["date"]),
         })
-    mdf = pd.DataFrame(margin_rows)
+
+    mdf=pd.DataFrame(margin_rows)
     if not mdf.empty and "MarginPurchaseTodayBalance" in mdf.columns:
-        mdf["MarginPurchaseTodayBalance"] = pd.to_numeric(mdf["MarginPurchaseTodayBalance"], errors="coerce")
-        mdf = mdf.sort_values("date").dropna(subset=["MarginPurchaseTodayBalance"])
+        mdf["MarginPurchaseTodayBalance"]=pd.to_numeric(mdf["MarginPurchaseTodayBalance"],errors="coerce")
+        mdf=mdf.sort_values("date").dropna(subset=["MarginPurchaseTodayBalance"])
         if not mdf.empty:
-            latest = float(mdf.iloc[-1]["MarginPurchaseTodayBalance"])
-            prior = float(mdf.iloc[-21]["MarginPurchaseTodayBalance"]) if len(mdf) >= 21 else float(mdf.iloc[0]["MarginPurchaseTodayBalance"])
-            result.update({"margin_balance": latest, "margin_20_pct": ((latest / prior) - 1) * 100 if prior else None, "margin_last_date": str(mdf.iloc[-1]["date"])})
+            latest=float(mdf.iloc[-1]["MarginPurchaseTodayBalance"])
+            def balance_change(n:int):
+                if len(mdf)<2: return None
+                idx=max(0,len(mdf)-1-n)
+                prior=float(mdf.iloc[idx]["MarginPurchaseTodayBalance"])
+                return ((latest/prior)-1)*100 if prior else None
+            result.update({
+                "margin_balance":latest,
+                "margin_1_pct":balance_change(1),"margin_5_pct":balance_change(5),"margin_20_pct":balance_change(20),
+                "margin_last_date":str(mdf.iloc[-1]["date"])
+            })
     return result
 
 
@@ -2028,11 +2099,18 @@ def build_evidence_graph(ticker: str, tech: dict[str,Any], revenue: dict[str,Any
     for key in ("gross_margin","operating_margin"):
         if financial.get(key) is not None:
             ev.append(make_evidence(key,financial.get(key),category="fundamental",period=financial.get("period"),source=financial.get("source") or "financial statement",source_type=st,confidence=fin_conf,unit="%"))
-    for key,metric in (("foreign_20","foreign_20d"),("trust_20","trust_20d"),("dealer_20","dealer_20d"),("margin_balance","margin_balance")):
+    for key,metric in (("foreign_1","foreign_1d"),("foreign_5","foreign_5d"),("foreign_20","foreign_20d"),
+                       ("trust_1","trust_1d"),("trust_5","trust_5d"),("trust_20","trust_20d"),
+                       ("dealer_1","dealer_1d"),("dealer_5","dealer_5d"),("dealer_20","dealer_20d"),
+                       ("margin_1_pct","margin_1d_pct"),("margin_5_pct","margin_5d_pct"),("margin_20_pct","margin_20d_pct"),
+                       ("margin_balance","margin_balance")):
         if flow.get(key) is not None:
             ev.append(make_evidence(metric,flow.get(key),category="positioning",period=flow.get("last_date") or flow.get("margin_last_date"),source="institutional/margin feed",source_type="official_or_structured",confidence=82))
     if tech.get("rsi14") is not None:
         ev.append(make_evidence("RSI14",tech.get("rsi14"),category="technical",kind="derived_fact",period=tech.get("last_date"),source="derived from daily prices",source_type="derived",confidence=90,derived_from=["close_series"]))
+    for key,label in (("k","KD_K"),("d","KD_D"),("macd","MACD_DIF"),("macd_signal","MACD_SIGNAL"),("macd_hist","MACD_HIST")):
+        if tech.get(key) is not None:
+            ev.append(make_evidence(label,tech.get(key),category="technical",kind="derived_fact",period=tech.get("last_date"),source="derived from daily OHLC",source_type="derived",confidence=90,derived_from=["ohlc_series"]))
     for n,v in (tech.get("ma") or {}).items():
         if v is not None: ev.append(make_evidence(f"MA{n}",v,category="technical",kind="derived_fact",period=tech.get("last_date"),source="derived from daily prices",source_type="derived",confidence=90,unit="TWD",derived_from=["close_series"]))
     for row in (research.get("reports") or [])[:25]:
@@ -2098,7 +2176,7 @@ def build_evidence_graph(ticker: str, tech: dict[str,Any], revenue: dict[str,Any
 async def probe_twstock_mcp() -> dict[str,Any]:
     out={"provider":"TWStock MCP compatible adapter","enabled":TWSTOCK_MCP_ENABLED,"url":TWSTOCK_MCP_URL,"mode":"shadow_crosscheck","status":"disabled"}
     if not TWSTOCK_MCP_ENABLED: return out
-    payload={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.3.2"}}}
+    payload={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.3.3"}}}
     try:
         async with httpx.AsyncClient(timeout=8,follow_redirects=True,headers={"Accept":"application/json, text/event-stream","Content-Type":"application/json"}) as client:
             r=await client.post(TWSTOCK_MCP_URL,json=payload)
@@ -2313,7 +2391,7 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.3.2",
+        "ticker":ticker,"version":"5.3.3",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
@@ -2333,7 +2411,7 @@ async def eps_registry_diagnostics(ticker: str):
     reg=_load_official_eps_registry()
     rows=[r for r in reg.get("records",[]) if str(r.get("ticker"))==ticker]
     rows=sorted(rows,key=lambda r:(r.get("year") or 0,r.get("quarter") or 0),reverse=True)
-    return {"ticker":ticker,"version":"5.3.2","registry_schema_version":reg.get("schema_version"),
+    return {"ticker":ticker,"version":"5.3.3","registry_schema_version":reg.get("schema_version"),
             "updated_at":reg.get("updated_at"),"record_count":len(rows),"records":rows}
 
 @app.get("/api/evidence/{ticker}")
@@ -2348,7 +2426,7 @@ async def provider_diagnostics(ticker: str):
     ticker=ticker.strip().upper()
     d=await build_stock(ticker, False)
     mcp=await probe_twstock_mcp()
-    return {"version":"5.3.2","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
+    return {"version":"5.3.3","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.3.2","mode":"cloud-mobile-evidence-quality","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.3.3","mode":"cloud-mobile-flow-technical-pro","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}

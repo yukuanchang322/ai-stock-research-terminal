@@ -10,6 +10,62 @@ function lineSvg(values){
   const pts=values.map((v,i)=>`${p+i*(w-2*p)/(Math.max(1,values.length-1))},${h-p-(v-min)*(h-2*p)/range}`).join(' ');
   return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><line x1="${p}" y1="${h-p}" x2="${w-p}" y2="${h-p}" stroke="#304653"/><polyline points="${pts}" fill="none" stroke="#4ce0b3" stroke-width="3" vector-effect="non-scaling-stroke"/></svg>`;
 }
+
+function flowMatrix(fl){
+  const rows=[['外資','foreign'],['投信','trust'],['自營商','dealer']];
+  const signed=v=>v==null?'—':`${Number(v)>0?'+':''}${fmt0(v)}`;
+  return `<div class="flow-matrix"><div class="flow-head"><b>法人</b><b>1日</b><b>5日</b><b>20日</b></div>${rows.map(([label,key])=>`<div class="flow-matrix-row"><b>${label}</b>${[1,5,20].map(n=>{const v=fl[`${key}_${n}`];return `<span class="${v<0?'neg':'pos'}">${signed(v)}</span>`}).join('')}</div>`).join('')}<div class="flow-matrix-row margin-row"><b>融資%</b>${[1,5,20].map(n=>{const v=fl[`margin_${n}_pct`];return `<span class="${v>0?'neg':'pos'}">${v==null?'—':`${v>0?'+':''}${fmt(v,1)}%`}</span>`}).join('')}</div></div>`;
+}
+function _techLinePoints(series,key,w,h,p,min,max){
+  const vals=series.map(x=>x[key]);
+  const range=(max-min)||1;
+  let chunks=[],cur=[];
+  vals.forEach((v,i)=>{if(v==null||!Number.isFinite(Number(v))){if(cur.length){chunks.push(cur);cur=[]}return}
+    cur.push(`${p+i*(w-2*p)/Math.max(1,series.length-1)},${h-p-(Number(v)-min)*(h-2*p)/range}`)});
+  if(cur.length)chunks.push(cur);
+  return chunks.map(c=>c.join(' '));
+}
+function candleSvg(series){
+  if(!series?.length)return '<div class="empty">K線資料不足</div>';
+  const data=series.filter(x=>[x.open,x.high,x.low,x.close].every(v=>v!=null&&Number.isFinite(Number(v))));
+  if(!data.length)return '<div class="empty">K線資料不足</div>';
+  const w=720,h=300,p=24, vals=data.flatMap(x=>[x.high,x.low,x.ma20,x.ma60].filter(v=>v!=null).map(Number));
+  const min=Math.min(...vals),max=Math.max(...vals),range=max-min||1, xstep=(w-2*p)/Math.max(1,data.length);
+  const y=v=>h-p-(Number(v)-min)*(h-2*p)/range;
+  const body=Math.max(1,Math.min(5,xstep*.66));
+  const candles=data.map((x,i)=>{const cx=p+(i+.5)*xstep, up=Number(x.close)>=Number(x.open), cls=up?'up':'down';
+    const yo=y(x.open),yc=y(x.close),yh=y(x.high),yl=y(x.low),top=Math.min(yo,yc),bh=Math.max(1,Math.abs(yc-yo));
+    return `<g class="candle ${cls}"><line x1="${cx}" y1="${yh}" x2="${cx}" y2="${yl}"/><rect x="${cx-body/2}" y="${top}" width="${body}" height="${bh}"/></g>`}).join('');
+  const p20=_techLinePoints(data,'ma20',w,h,p,min,max).map(points=>`<polyline class="ma20" points="${points}"/>`).join('');
+  const p60=_techLinePoints(data,'ma60',w,h,p,min,max).map(points=>`<polyline class="ma60" points="${points}"/>`).join('');
+  const first=data[0]?.date||'', last=data[data.length-1]?.date||'';
+  return `<div class="tech-chart-title"><b>近一年日K</b><span>MA20 · MA60</span></div><svg class="candle-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><line class="axis" x1="${p}" y1="${h-p}" x2="${w-p}" y2="${h-p}"/>${candles}${p20}${p60}<text x="${p}" y="${h-5}">${first}</text><text x="${w-p}" y="${h-5}" text-anchor="end">${last}</text></svg><div class="chart-legend"><span>MA20</span><span>MA60</span></div>`;
+}
+function oscillatorSvg(series,keys,title,minFixed=null,maxFixed=null,levels=[]){
+  if(!series?.length)return '';
+  const w=720,h=120,p=20;
+  const vals=series.flatMap(x=>keys.map(k=>x[k]).filter(v=>v!=null&&Number.isFinite(Number(v))).map(Number));
+  if(!vals.length)return `<div class="indicator-panel"><b>${title}</b><div class="empty">資料不足</div></div>`;
+  const min=minFixed==null?Math.min(...vals):minFixed,max=maxFixed==null?Math.max(...vals):maxFixed,range=(max-min)||1;
+  const levelSvg=levels.map(v=>{const yy=h-p-(v-min)*(h-2*p)/range;return `<line class="guide" x1="${p}" y1="${yy}" x2="${w-p}" y2="${yy}"/><text x="${p+2}" y="${yy-2}">${v}</text>`}).join('');
+  const paths=keys.map((k,j)=>_techLinePoints(series,k,w,h,p,min,max).map(points=>`<polyline class="indicator-line line${j}" points="${points}"/>`).join('')).join('');
+  return `<div class="indicator-panel"><div class="indicator-title"><b>${title}</b><span>${keys.map(k=>k.toUpperCase()).join(' / ')}</span></div><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">${levelSvg}${paths}</svg></div>`;
+}
+function macdSvg(series){
+  if(!series?.length)return '';
+  const w=720,h=130,p=20;
+  const vals=series.flatMap(x=>['macd','macd_signal','macd_hist'].map(k=>x[k]).filter(v=>v!=null).map(Number));
+  if(!vals.length)return `<div class="indicator-panel"><b>MACD</b><div class="empty">資料不足</div></div>`;
+  const min=Math.min(...vals,0),max=Math.max(...vals,0),range=(max-min)||1,y=v=>h-p-(Number(v)-min)*(h-2*p)/range,xstep=(w-2*p)/Math.max(1,series.length-1),zero=y(0);
+  const bars=series.map((x,i)=>x.macd_hist==null?'':`<rect class="macd-bar ${x.macd_hist<0?'neg':''}" x="${p+i*xstep-1}" y="${Math.min(zero,y(x.macd_hist))}" width="${Math.max(1,xstep*.55)}" height="${Math.max(1,Math.abs(y(x.macd_hist)-zero))}"/>`).join('');
+  const dif=_techLinePoints(series,'macd',w,h,p,min,max).map(points=>`<polyline class="indicator-line line0" points="${points}"/>`).join('');
+  const sig=_techLinePoints(series,'macd_signal',w,h,p,min,max).map(points=>`<polyline class="indicator-line line1" points="${points}"/>`).join('');
+  return `<div class="indicator-panel"><div class="indicator-title"><b>MACD</b><span>DIF / Signal / Histogram</span></div><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><line class="guide" x1="${p}" y1="${zero}" x2="${w-p}" y2="${zero}"/>${bars}${dif}${sig}</svg></div>`;
+}
+function technicalDashboard(t){
+  const s=t.series||[];
+  return `<div class="technical-dashboard">${candleSvg(s)}${oscillatorSvg(s,['k','d'],'KD',0,100,[20,80])}${macdSvg(s)}${oscillatorSvg(s,['rsi14'],'RSI 14',0,100,[30,70])}</div>`;
+}
 function metric(k,v,note=''){return `<div class="metric"><span>${k}</span><b>${v}</b><em>${note}</em></div>`}
 function targetRow(x){return `<div class="target-row ${x.name==='悲觀'?'bear':x.name==='樂觀'?'bull':'base'}"><span>${x.name}</span><b>${fmt0(x.target)}</b></div>`}
 
@@ -38,7 +94,7 @@ function render(d){
   $('companyName').textContent=d.name; $('tickerLabel').textContent=d.ticker; $('sector').textContent=d.industry; $('marketType').textContent=d.market_type;
   $('stanceTag').textContent=d.stance; $('confidenceScore').textContent=d.confidence?.overall ?? '—'; $('price').textContent=fmt(d.price,1); $('dayChange').textContent=pct(d.change_pct);
   $('thesis').textContent=d.thesis; $('dataPolicy').textContent=d.data_policy; $('overallScore').textContent=d.scores['綜合'];
-  $('kpis').innerHTML=[['預期狀態',d.expectation_gap?.regime||'—','V5.2.15'],['Research Score',`${d.scores['綜合']}/100`,'量化綜合'],['可信度',`${d.confidence?.overall??'—'}/100`,'資料+估值'],['PER',`${fmt(d.per?.per,1)}x`,'最新可得'],['營收 YoY',pct(d.revenue?.revenue_yoy),'最新月'],['外資20日',fmt0(d.flow?.foreign_20),'淨買賣'],['RSI14',fmt(d.technical?.rsi14,1),'技術動能']].map(x=>`<div class="kpi"><span>${x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`).join('');
+  $('kpis').innerHTML=[['預期狀態',d.expectation_gap?.regime||'—','V5.2.15'],['Research Score',`${d.scores['綜合']}/100`,'量化綜合'],['可信度',`${d.confidence?.overall??'—'}/100`,'資料+估值'],['PER',`${fmt(d.per?.per,1)}x`,'最新可得'],['營收 YoY',pct(d.revenue?.revenue_yoy),'最新月'],['外資 1/5/20日',`${fmt0(d.flow?.foreign_1)} / ${fmt0(d.flow?.foreign_5)} / ${fmt0(d.flow?.foreign_20)}`,'淨買賣'],['RSI14',fmt(d.technical?.rsi14,1),'技術動能']].map(x=>`<div class="kpi"><span>${x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`).join('');
   $('dockPdf').disabled=false; $('dockShare').disabled=false; $('lastFetch').textContent=`資料頁產生 ${new Date(d.generated_at).toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit'})}`;
   // Safari-safe URL update: avoid passing a URL object to history.replaceState.
   try {
@@ -73,15 +129,15 @@ function render(d){
   $('fundAnalysis').textContent=r.revenue_yoy==null?`營收年增資料不足。${staleNote}`:`最新月營收年增 ${pct(r.revenue_yoy)}；${fi.core_financials_allowed?`${es.quarter_period||'最新財報'} 單季 EPS ${fmt(es.quarter_eps,2)}、YTD EPS ${fmt(es.ytd_eps,2)}、TTM EPS ${fmt(es.ttm_eps,2)}。`:'財報 EPS 尚未通過最新季度閘門，不進核心估值。'} ${staleNote}`;
 
   const fl=d.flow||{};
-  $('flowTable').innerHTML=[metric('外資 5日',fmt0(fl.foreign_5),'股'),metric('外資 20日',fmt0(fl.foreign_20),'股'),metric('投信 20日',fmt0(fl.trust_20),'股'),metric('自營商 20日',fmt0(fl.dealer_20),'股'),metric('融資餘額',fmt0(fl.margin_balance),'張/資料原單位'),metric('融資20日',pct(fl.margin_20_pct),'變化')].join('');
+  $('flowTable').innerHTML=flowMatrix(fl);
   const flows={外資:fl.foreign_20||0,投信:fl.trust_20||0,自營商:fl.dealer_20||0}, mx=Math.max(1,...Object.values(flows).map(Math.abs));
-  $('flowBars').innerHTML=Object.entries(flows).map(([k,v])=>`<div class="flow-row"><span>${k}</span><div class="flow-track"><div class="flow-fill ${v<0?'neg':''}" style="width:${Math.abs(v)/mx*100}%"></div></div><b>${v>0?'+':''}${fmt0(v)}</b></div>`).join('');
-  $('flowAnalysis').textContent=`近20日外資 ${fl.foreign_20>=0?'偏買超':'偏賣超'}、投信 ${fl.trust_20>=0?'偏買超':'偏賣超'}；籌碼方向與股價趨勢應交叉解讀，不以單一天買賣超下結論。`;
+  $('flowBars').innerHTML=Object.entries(flows).map(([k,v])=>`<div class="flow-row"><span>${k} 20日</span><div class="flow-track"><div class="flow-fill ${v<0?'neg':''}" style="width:${Math.abs(v)/mx*100}%"></div></div><b>${v>0?'+':''}${fmt0(v)}</b></div>`).join('');
+  $('flowAnalysis').textContent=`法人籌碼以 1日 / 5日 / 20日三個時間尺度判讀；短線看1日、波段轉折看5日、中期方向看20日。外資20日 ${fl.foreign_20>=0?'偏買超':'偏賣超'}，投信20日 ${fl.trust_20>=0?'偏買超':'偏賣超'}。`;
 
   const t=d.technical||{}; $('techPill').textContent=t.trend||'資料不足';
-  $('priceChart').innerHTML=lineSvg((t.series||[]).map(x=>x.close));
-  $('levels').innerHTML=[['MA20',t.ma?.['20']],['MA60',t.ma?.['60']],['第一支撐',t.support1],['60日壓力',t.resistance]].map(x=>`<div class="level"><span>${x[0]}</span><b>${fmt(x[1],1)}</b></div>`).join('');
-  $('techAnalysis').textContent=`趨勢：${t.trend||'—'}；RSI14 ${fmt(t.rsi14,1)}。支撐與壓力為量化參考，不是保證反轉點。`;
+  $('priceChart').innerHTML=technicalDashboard(t);
+  $('levels').innerHTML=[['MA20',t.ma?.['20']],['MA60',t.ma?.['60']],['第一支撐',t.support1],['60日壓力',t.resistance],['KD K',t.k],['KD D',t.d],['RSI14',t.rsi14],['MACD Hist',t.macd_hist]].map(x=>`<div class="level"><span>${x[0]}</span><b>${fmt(x[1],x[0].includes('MACD')?2:1)}</b></div>`).join('');
+  $('techAnalysis').textContent=`近一年日K；MA60 為中期趨勢核心。趨勢：${t.trend||'—'}；K/D ${fmt(t.k,1)}/${fmt(t.d,1)}；MACD Hist ${fmt(t.macd_hist,2)}；RSI14 ${fmt(t.rsi14,1)}。KD >80 / <20、RSI >70 / <30 僅代表動能極端，需搭配均線與量價確認。`;
 
   const rr=d.research||{}; $('reportCount').textContent=rr.count||0; $('consensusText').textContent=rr.median_target?`目標價中位數 ${fmt0(rr.median_target)} · 平均 ${fmt0(rr.average_target)}`:'目前尚無可解析的法人目標價共識'; $('revisionText').textContent=rr.forward_eps_year?`${rr.forward_eps_year}E EPS 中位數 ${fmt(rr.median_forward_eps,2)}（${rr.eps_coverage||0} 筆明確年度預估）`:(rr.target_revision_pct!=null?`同機構目標價修正中位數 ${pct(rr.target_revision_pct)}`:'Forward EPS：缺乏可比年度標註，不納入估值');
   if($('consensusStats')) $('consensusStats').innerHTML=[['法人機構',rr.institution_count||0],['最高目標',fmt0(rr.high_target)],['最低目標',fmt0(rr.low_target)],['買進/正向',rr.ratings?.['買進']||0],['中立',rr.ratings?.['中立']||0],['公開網路',rr.public_web_count||0]].map(x=>`<div><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
