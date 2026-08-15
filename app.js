@@ -272,6 +272,22 @@ $('dockShare').onclick=async()=>{
   const shareData={title:`${$('companyName').textContent} ${currentTicker} AI 研究報告`,text:'AI Stock Research Terminal 個股研究',url:shareUrl};
   try{if(navigator.share) await navigator.share(shareData); else {await navigator.clipboard.writeText(shareUrl); alert('研究連結已複製');}}catch(e){}
 };
-if('serviceWorker' in navigator){window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js').catch(()=>{}));}
+if('serviceWorker' in navigator){
+  window.addEventListener('load',async()=>{
+    try{
+      const registration=await navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'});
+      await registration.update();
+      document.addEventListener('visibilitychange',()=>{
+        if(document.visibilityState==='visible') registration.update().catch(()=>{});
+      });
+    }catch(e){}
+  });
+  let refreshing=false;
+  navigator.serviceWorker.addEventListener('controllerchange',()=>{
+    if(refreshing)return;
+    refreshing=true;
+    window.location.reload();
+  });
+}
 window.addEventListener('online',checkCloud); window.addEventListener('offline',checkCloud);
 checkCloud();

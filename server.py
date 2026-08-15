@@ -44,6 +44,18 @@ app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
 
+@app.middleware("http")
+async def prevent_stale_pwa_shell(request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path in {"/", "/index.html", "/app.js", "/styles.css", "/sw.js", "/static/manifest.webmanifest"}:
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+    if path == "/sw.js":
+        response.headers["Service-Worker-Allowed"] = "/"
+    return response
+
+
 def safe_num(v: Any, default: float | None = None) -> float | None:
     try:
         if v in (None, "", "--", "—"):
@@ -2405,13 +2417,13 @@ def report_html(d: dict[str, Any]) -> str:
 
 
 @app.get("/")
-async def home(): return FileResponse(ROOT / "index.html")
+async def home(): return FileResponse(ROOT / "index.html", headers={"Cache-Control":"no-store, max-age=0"})
 @app.get("/app.js")
 async def js(): return FileResponse(ROOT / "app.js", media_type="application/javascript", headers={"Cache-Control":"no-cache"})
 @app.get("/styles.css")
 async def css(): return FileResponse(ROOT / "styles.css", media_type="text/css", headers={"Cache-Control":"no-cache"})
 @app.get("/sw.js")
-async def sw(): return FileResponse(ROOT / "sw.js", media_type="application/javascript", headers={"Cache-Control":"no-cache", "Service-Worker-Allowed":"/"})
+async def sw(): return FileResponse(ROOT / "sw.js", media_type="application/javascript", headers={"Cache-Control":"no-store, max-age=0", "Service-Worker-Allowed":"/"})
 
 
 @app.get("/api/diagnostics/financial/{ticker}")
