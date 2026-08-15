@@ -39,7 +39,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.2.10")
+app = FastAPI(title="AI Stock Research Terminal", version="5.2.11")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -112,7 +112,7 @@ def _row_value(row: dict[str, Any], includes: list[str], excludes: list[str] | N
     return None
 
 async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.10"}) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.11"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
 
@@ -126,7 +126,7 @@ IR_FINANCIAL_PAGES = {
 async def mops_csv_rows(filename: str) -> list[dict[str, Any]]:
     """Official MOPS CSV fallback. Some foreign/KY issuers can appear here even when JSON feeds lag."""
     url=f"{MOPS_CSV_BASE}/{filename}"
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.10"}) as client:
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.11"}) as client:
         r=await client.get(url); r.raise_for_status()
     raw=r.content
     text=None
@@ -224,7 +224,7 @@ async def fetch_company_ir_financial(ticker: str, expected_year: int, expected_q
     page=IR_FINANCIAL_PAGES.get(ticker)
     if not page: return None
     try:
-        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.10"}) as client:
+        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.11"}) as client:
             r=await client.get(page); r.raise_for_status(); page_html=r.text
             hrefs=re.findall(r'href=["\']([^"\']+)["\']',page_html,re.I)
             embedded=re.findall(r'["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']',page_html,re.I)
@@ -344,7 +344,7 @@ async def fetch_mops_material_financial(ticker: str, expected_year: int | None=N
     historical-search endpoint so a disclosure from one or two days ago is still discoverable.
     """
     out=[]
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.10"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.11"}
     async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers=ua) as client:
         # A. Daily official material-information feed.
         try:
@@ -603,31 +603,70 @@ async def fetch_mops_company_ifrs(ticker: str, year: int, quarter: int) -> list[
 
 
 async def fetch_tsmc_quarterly_release(year: int, quarter: int) -> dict[str, Any] | None:
-    """TSMC official IR fallback. Gives a verified quarter even before MOPS aggregate refresh."""
+    """TSMC official IR EPS resolver.
+
+    V5.2.11 does not depend on MOPS historical HTML. It reads the official quarterly-results page,
+    follows the official Earnings Release PDF when present, and extracts the actual single-quarter
+    EPS plus margins. This is an authoritative direct-quarter value and may be used to derive YTD
+    differences without mixing in third-party estimates.
+    """
     if quarter not in (1,2,3,4): return None
-    url=f"https://investor.tsmc.com/english/quarterly-results/{year}/q{quarter}"
-    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.10"}
+    landing=f"https://investor.tsmc.com/english/quarterly-results/{year}/q{quarter}"
+    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.11"}
     try:
-        compact=""; source_url=url
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=headers) as client:
-            r=await client.get(url); r.raise_for_status(); compact=" ".join(html.unescape(re.sub(r"<[^>]+>"," ",r.text)).split())
-            # The quarterly landing page can omit EPS text. Search the official PR news index for the exact quarter.
-            if not re.search(r"(?:EPS|earnings per share).{0,40}NT\$?\s*[0-9.]+",compact,re.I):
-                nr=await client.get("https://pr.tsmc.com/english/latest-news")
-                if nr.status_code==200:
-                    news=" ".join(html.unescape(re.sub(r"<[^>]+>"," ",nr.text)).split())
-                    pat=rf"TSMC Reports {['','First','Second','Third','Fourth'][quarter]} Quarter EPS of NT\$([0-9.]+)"
-                    mm=re.search(pat,news,re.I)
-                    if mm: compact += f" EPS of NT${mm.group(1)}"; source_url="https://pr.tsmc.com/english/latest-news"
-        gm=None; om=None
-        mg=re.search(r"Gross Margin\s+([0-9.]+)%",compact,re.I); gm=parse_num_text(mg.group(1)) if mg else None
-        mo=re.search(r"Operating Margin\s+([0-9.]+)%",compact,re.I); om=parse_num_text(mo.group(1)) if mo else None
-        me=re.search(r"(?:EPS(?:\s+of)?|earnings per share(?:\s+of)?)\s*(?:of\s*)?NT\$\s*([0-9.]+)",compact,re.I); qeps=parse_num_text(me.group(1)) if me else None
-        if gm is None and om is None and qeps is None: return None
-        return {"source":"TSMC official quarterly results","market":"Company IR","endpoint":source_url,"official":True,
-                "period":f"{year} Q{quarter}","fiscal_year":year,"fiscal_quarter":quarter,"statement_date":None,
-                "feed_kind":"company_ir_quarter","company_code":"2330","quarter_eps_direct":qeps,
-                "gross_margin_direct":gm,"operating_margin_direct":om,"completeness":sum(v is not None for v in (qeps,gm,om))}
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as client:
+            r=await client.get(landing); r.raise_for_status()
+            page_html=r.text
+            compact=" ".join(html.unescape(re.sub(r"<[^>]+>"," ",page_html)).split())
+            source_url=str(r.url)
+            pdf_text=""
+            # Prefer the official Earnings Release PDF linked from the quarter landing page.
+            hrefs=re.findall(r'href=["\']([^"\']+)["\']',page_html,re.I)
+            candidates=[]
+            for href in hrefs:
+                lo=href.lower()
+                score=0
+                if 'earningsrelease' in lo or 'earnings-release' in lo or 'earnings_release' in lo: score+=10
+                if '.pdf' in lo: score+=3
+                if f'q{quarter}' in lo or f'{quarter}q' in lo: score+=2
+                if score: candidates.append((score,urljoin(str(r.url),href)))
+            for _,url in sorted(set(candidates), reverse=True):
+                try:
+                    pr=await client.get(url); pr.raise_for_status()
+                    if 'pdf' not in (pr.headers.get('content-type') or '').lower() and not url.lower().endswith('.pdf'):
+                        continue
+                    reader=PdfReader(io.BytesIO(pr.content))
+                    text="\n".join((pg.extract_text() or "") for pg in reader.pages[:6])
+                    if text:
+                        pdf_text=text; source_url=url; break
+                except Exception:
+                    continue
+            blob=" ".join((compact+" "+pdf_text).split())
+            # Official earnings releases use phrases such as "diluted earnings per share of NT$22.08"
+            eps_patterns=[
+                r"(?:diluted\s+)?earnings per share\s+of\s+NT\$\s*([0-9.]+)",
+                r"EPS\s+of\s+NT\$\s*([0-9.]+)",
+                r"Earnings per Share\s*-\s*Diluted\s+\$?\s*[0-9.]+\s+\$?\s*([0-9.]+)",
+            ]
+            qeps=None
+            for pat in eps_patterns:
+                m=re.search(pat,blob,re.I)
+                if m:
+                    qeps=parse_num_text(m.group(1)); break
+            gm=None; om=None
+            for pat in (r"Gross margin(?: for the quarter)? was\s*([0-9.]+)%", r"Gross Margin\s+([0-9.]+)%"):
+                m=re.search(pat,blob,re.I)
+                if m: gm=parse_num_text(m.group(1)); break
+            for pat in (r"operating margin(?: for the quarter)? was\s*([0-9.]+)%", r"Operating Margin\s+([0-9.]+)%"):
+                m=re.search(pat,blob,re.I)
+                if m: om=parse_num_text(m.group(1)); break
+            if gm is None and om is None and qeps is None: return None
+            return {"source":"TSMC official quarterly results","market":"Company IR","endpoint":source_url,"official":True,
+                    "period":f"{year} Q{quarter}","fiscal_year":year,"fiscal_quarter":quarter,"statement_date":None,
+                    "feed_kind":"company_ir_quarter","company_code":"2330","quarter_eps_direct":qeps,
+                    "gross_margin_direct":gm,"operating_margin_direct":om,
+                    "eps_provenance":"company_official_direct","eps_confidence":100,
+                    "completeness":sum(v is not None for v in (qeps,gm,om))}
     except Exception:
         return None
 
@@ -758,7 +797,7 @@ async def diagnose_official_financial_sources(ticker: str) -> dict[str, Any]:
     """
     now=datetime.now().astimezone()
     ey,eq,expected=expected_latest_financial_period(now.date())
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.10 diagnostics"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.11 diagnostics"}
     out={
         "ticker":ticker, "generated_at":now.isoformat(timespec="seconds"),
         "expected_period":expected, "expected_year":ey, "expected_quarter":eq,
@@ -1024,140 +1063,190 @@ def _best_period_snapshot(rows: list[dict[str, Any]], year: int, quarter: int) -
             if best.get(k) is None and r.get(k) is not None: best[k]=r[k]
     return best
 
-async def fetch_official_eps_ytd_for_period(ticker: str, year: int, quarter: int) -> dict[str, Any] | None:
-    """Fetch official cumulative EPS for one exact fiscal period.
+async def fetch_official_eps_for_period(ticker: str, year: int, quarter: int) -> dict[str, Any] | None:
+    """V5.2.11 multi-source official EPS resolver for an exact fiscal period.
 
-    Company-specific MOPS IFRS is primary because aggregate feeds only expose the latest batch.
-    For the current period, the already-selected official snapshot is used by the caller. This
-    helper is for historical predecessor quarters needed to derive true single-quarter EPS/TTM.
+    Priority:
+      1) official structured MOPS/TWSE data when it exactly matches the requested period;
+      2) company official IR / reviewed financial report;
+      3) official MOPS board-approved disclosure;
+      4) return None.  The blocked MOPS historical HTML endpoint is intentionally *not* in the
+         production EPS path. Third-party/FinMind values never fill an official predecessor quarter.
     """
-    rows=[]
+    # Layer 1: official structured CSV/OpenData. These feeds often expose only the latest quarter,
+    # but if it exactly matches the requested period it is the preferred cumulative source.
     try:
-        rows.extend(await fetch_mops_company_ifrs(ticker, year, quarter))
+        rows=await fetch_mops_csv_official(ticker)
+        best=_best_period_snapshot(rows,year,quarter)
+        if best and (best.get("ytd_eps") is not None or best.get("quarter_eps_direct") is not None):
+            best=dict(best); best["eps_provenance"]="official_structured"; best["eps_confidence"]=100
+            return best
     except Exception:
         pass
-    best=_best_period_snapshot(rows,year,quarter)
-    if best and best.get("ytd_eps") is not None: return best
-    # If the detailed historical endpoint changed, use official MOPS board-approved financial disclosures.
-    try:
-        mats=await fetch_mops_material_financial(ticker,year,quarter)
-        mb=_best_period_snapshot(mats,year,quarter)
-        if mb and mb.get("ytd_eps") is not None: return mb
-    except Exception:
-        pass
-    # TSMC company IR may expose direct quarter EPS. Keep it as a direct-quarter fallback,
-    # but never convert it to cumulative YTD here.
+
+    # Layer 2: company official IR. TSMC publishes a direct quarter EPS; mapped issuers such as
+    # Alchip are parsed from their reviewed/audited IR PDF when an explicit period match exists.
     if ticker=="2330":
         try:
             ir=await fetch_tsmc_quarterly_release(year,quarter)
             if ir and ir.get("quarter_eps_direct") is not None: return ir
         except Exception:
             pass
-    return best
+    try:
+        ir=await fetch_company_ir_financial(ticker,year,quarter)
+        if ir and (ir.get("ytd_eps") is not None or ir.get("quarter_eps_direct") is not None):
+            ir=dict(ir); ir["eps_provenance"]="company_official_report"; ir["eps_confidence"]=98
+            return ir
+    except Exception:
+        pass
+
+    # Layer 3: official board-approved disclosure, if it contains an exact period and EPS.
+    try:
+        mats=await fetch_mops_material_financial(ticker,year,quarter)
+        mb=_best_period_snapshot(mats,year,quarter)
+        if mb and (mb.get("ytd_eps") is not None or mb.get("quarter_eps_direct") is not None):
+            mb=dict(mb); mb["eps_provenance"]="official_material_disclosure"; mb["eps_confidence"]=96
+            return mb
+    except Exception:
+        pass
+    return None
+
+# Backward-compatible name for diagnostics/older call sites. Production behavior is the new resolver.
+async def fetch_official_eps_ytd_for_period(ticker: str, year: int, quarter: int) -> dict[str, Any] | None:
+    return await fetch_official_eps_for_period(ticker,year,quarter)
 
 async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official: dict[str, Any], fallback_financial: dict[str, Any]) -> dict[str, Any]:
-    """Official-first EPS engine.
+    """V5.2.11 multi-source EPS engine with explicit provenance.
 
-    * Q1 single-quarter EPS = Q1 YTD EPS.
-    * Q2/Q3 = current YTD - prior-quarter YTD from official MOPS.
-    * Q4 = full-year YTD - Q3 YTD.
-    * TTM = sum of four actual single-quarter EPS values only.
-    FinMind is retained only as a labeled fallback when official history cannot be obtained.
+    Official current-period data is never combined with a third-party predecessor. Quarter EPS is
+    either (a) a direct company-official value, or (b) derived from two official cumulative values.
+    TTM is reported only when four real quarters are available.
     """
     fin_hist=finmind_eps_history(fin_rows)
     fy=official.get("fiscal_year") if official.get("official") else None
     fq=official.get("fiscal_quarter") if official.get("official") else None
     ytd=official.get("ytd_eps") if official.get("official") else None
-    source="TWSE/MOPS official" if official.get("official") else "FinMind"
-    if ytd is None and fin_hist:
+    source=official.get("source") if official.get("official") else "FinMind"
+
+    # If no official period exists at all, preserve the old structured-data fallback, clearly labeled.
+    if (not fy or not fq) and fin_hist:
         last=fin_hist[-1]; fy,fq,ytd=last["year"],last["quarter"],last["ytd_eps"]; source=last["source"]
 
-    # Build an official cumulative-EPS map for enough periods to derive the latest quarter and TTM.
-    official_ytd={}
-    direct_quarter={}
+    official_ytd: dict[tuple[int,int],float]={}
+    direct_quarter: dict[tuple[int,int],float]={}
+    provenance: dict[tuple[int,int],dict[str,Any]]={}
     lookup_diagnostics=[]
+
     if fy and fq and official.get("official"):
-        if ytd is not None: official_ytd[(fy,fq)]=float(ytd)
-        if official.get("quarter_eps_direct") is not None: direct_quarter[(fy,fq)]=float(official.get("quarter_eps_direct"))
-        periods=[]
-        y,q=fy,fq
-        # Need latest 5 cumulative points to derive the last four standalone quarters.
+        cur_key=(fy,fq)
+        if ytd is not None:
+            official_ytd[cur_key]=float(ytd)
+            provenance[cur_key]={"method":"official_ytd","source":official.get("source"),"endpoint":official.get("endpoint"),"confidence":100}
+        if official.get("quarter_eps_direct") is not None:
+            direct_quarter[cur_key]=float(official.get("quarter_eps_direct"))
+            provenance[cur_key]={"method":"official_direct","source":official.get("source"),"endpoint":official.get("endpoint"),"confidence":100}
+
+        # Re-check company IR for the current quarter when the selected accounting feed has only YTD.
+        if cur_key not in direct_quarter:
+            try:
+                cur_ir=await fetch_official_eps_for_period(ticker,fy,fq)
+                if cur_ir:
+                    if cur_ir.get("quarter_eps_direct") is not None:
+                        direct_quarter[cur_key]=float(cur_ir.get("quarter_eps_direct"))
+                        provenance[cur_key]={"method":"official_direct","source":cur_ir.get("source"),"endpoint":cur_ir.get("endpoint"),"confidence":cur_ir.get("eps_confidence",98)}
+                        if fq==1 and cur_key not in official_ytd:
+                            official_ytd[cur_key]=float(cur_ir.get("quarter_eps_direct"))
+                    if cur_key not in official_ytd and cur_ir.get("ytd_eps") is not None:
+                        official_ytd[cur_key]=float(cur_ir.get("ytd_eps"))
+            except Exception:
+                pass
+
+        periods=[]; y,q=fy,fq
         for _ in range(5):
-            periods.append((y,q))
-            q-=1
+            periods.append((y,q)); q-=1
             if q==0: y-=1; q=4
-        # Fetch exact historical MOPS quarters in parallel, excluding current which is already selected.
-        tasks=[fetch_official_eps_ytd_for_period(ticker,y,q) for (y,q) in periods[1:]]
+        tasks=[fetch_official_eps_for_period(ticker,y,q) for (y,q) in periods[1:]]
         rows=await asyncio.gather(*tasks, return_exceptions=True)
         for (yq,row) in zip(periods[1:],rows):
             if isinstance(row,Exception):
-                lookup_diagnostics.append({"period":f"{yq[0]} Q{yq[1]}","status":"error","error":type(row).__name__})
-                continue
+                lookup_diagnostics.append({"period":f"{yq[0]} Q{yq[1]}","status":"error","error":type(row).__name__}); continue
             if not row:
-                lookup_diagnostics.append({"period":f"{yq[0]} Q{yq[1]}","status":"missing"})
-                continue
-            if row.get("ytd_eps") is not None: official_ytd[yq]=float(row.get("ytd_eps"))
+                lookup_diagnostics.append({"period":f"{yq[0]} Q{yq[1]}","status":"missing_official"}); continue
+            if row.get("ytd_eps") is not None:
+                official_ytd[yq]=float(row.get("ytd_eps"))
+            # For Q1, an official direct-quarter EPS is also the official cumulative YTD EPS.
+            if yq[1]==1 and row.get("ytd_eps") is None and row.get("quarter_eps_direct") is not None:
+                official_ytd[yq]=float(row.get("quarter_eps_direct"))
             if row.get("quarter_eps_direct") is not None: direct_quarter[yq]=float(row.get("quarter_eps_direct"))
-            lookup_diagnostics.append({
-                "period":f"{yq[0]} Q{yq[1]}",
-                "status":"ok" if row.get("ytd_eps") is not None or row.get("quarter_eps_direct") is not None else "no_eps",
-                "source":row.get("source"),"endpoint":row.get("endpoint"),
-                "ytd_eps":row.get("ytd_eps"),"quarter_eps_direct":row.get("quarter_eps_direct"),
-                "report_id":row.get("report_id"),"selected_column":row.get("selected_column")
-            })
+            provenance[yq]={"method":"official_direct" if row.get("quarter_eps_direct") is not None else "official_ytd",
+                            "source":row.get("source"),"endpoint":row.get("endpoint"),"confidence":row.get("eps_confidence",98)}
+            lookup_diagnostics.append({"period":f"{yq[0]} Q{yq[1]}","status":"ok",
+                "source":row.get("source"),"endpoint":row.get("endpoint"),"ytd_eps":row.get("ytd_eps"),
+                "quarter_eps_direct":row.get("quarter_eps_direct"),"eps_provenance":row.get("eps_provenance"),
+                "confidence":row.get("eps_confidence")})
 
-    # Structured API history is a fallback only; do not overwrite an official value.
-    ytd_map=dict(official_ytd)
-    ytd_source={k:"official" for k in official_ytd}
-    for x in fin_hist:
-        key=(x["year"],x["quarter"])
-        if key not in ytd_map:
-            ytd_map[key]=float(x["ytd_eps"]); ytd_source[key]="FinMind"
+    # Third-party history may be shown diagnostically, but never used to derive an official quarter.
+    fin_map={(x["year"],x["quarter"]):float(x["ytd_eps"]) for x in fin_hist}
 
     def standalone(year:int, quarter:int):
         key=(year,quarter)
-        if key in direct_quarter: return direct_quarter[key], "official_direct"
-        cur=ytd_map.get(key)
-        if cur is None: return None,None
-        if quarter==1: return cur,ytd_source.get(key)
-        prev=ytd_map.get((year,quarter-1))
-        if prev is None: return None,None
-        # Require official predecessor when current is official; otherwise we would mix stale API into an official quarter.
-        if ytd_source.get(key)=="official" and ytd_source.get((year,quarter-1))!="official": return None,None
-        return cur-prev, "official_derived" if ytd_source.get(key)=="official" else "structured_api_derived"
+        if key in direct_quarter:
+            p=provenance.get(key,{})
+            return direct_quarter[key], "official_direct", p
+        cur=official_ytd.get(key)
+        if cur is None: return None,None,None
+        if quarter==1:
+            p=provenance.get(key,{})
+            return cur,"official_ytd_q1",p
+        prev=official_ytd.get((year,quarter-1))
+        if prev is None: return None,None,None
+        p=provenance.get(key,{})
+        return cur-prev,"official_ytd_difference",p
 
-    quarter_eps=None; quarter_method=None
+    quarter_eps=None; quarter_method=None; quarter_meta=None
     if fy and fq:
-        quarter_eps,quarter_method=standalone(fy,fq)
+        if official.get("official"):
+            quarter_eps,quarter_method,quarter_meta=standalone(fy,fq)
+        elif ytd is not None:
+            # Structured fallback only when no official period exists.
+            if fq==1: quarter_eps=ytd; quarter_method="structured_api_q1"
+            elif (fy,fq-1) in fin_map: quarter_eps=ytd-fin_map[(fy,fq-1)]; quarter_method="structured_api_difference"
 
     quarters=[]
-    if fy and fq:
-        y,q=fy,fq
-        last4=[]
+    if fy and fq and official.get("official"):
+        y,q=fy,fq; last4=[]
         for _ in range(4):
             last4.append((y,q)); q-=1
             if q==0: y-=1; q=4
         for y,q in reversed(last4):
-            val,method=standalone(y,q)
+            val,method,meta=standalone(y,q)
             if val is not None:
-                quarters.append({"year":y,"quarter":q,"eps":val,"period":f"{y} Q{q}","method":method})
+                quarters.append({"year":y,"quarter":q,"eps":val,"period":f"{y} Q{q}","method":method,"source":(meta or {}).get("source")})
     ttm=sum(x["eps"] for x in quarters) if len(quarters)==4 else None
+
     latest_period=f"{fy} Q{fq}" if fy and fq else fallback_financial.get("statement_date")
     api_latest=(fin_hist[-1]["year"],fin_hist[-1]["quarter"]) if fin_hist else (None,None)
     official_key=(fy,fq) if fy and fq and official.get("official") else (None,None)
     stale_api=bool(official_key[0] and api_latest[0] and official_key>api_latest)
     prev_key=(fy,fq-1) if fy and fq and fq>1 else ((fy-1,4) if fy and fq else None)
+    q_label={"official_direct":"✅ 公司/官方單季值","official_ytd_q1":"✅ 官方 Q1 累計=單季","official_ytd_difference":"🧮 官方累計值差額推導",
+             "structured_api_q1":"△ 結構化 API","structured_api_difference":"△ 結構化 API 差額"}.get(quarter_method,"資料不足")
     return {
-        "quarter_eps":quarter_eps,"quarter_period":latest_period,"quarter_method":quarter_method,
+        "quarter_eps":quarter_eps,"quarter_period":latest_period,"quarter_method":quarter_method,"quarter_method_label":q_label,
+        "quarter_source":(quarter_meta or {}).get("source") if quarter_meta else source,
+        "quarter_source_url":(quarter_meta or {}).get("endpoint") if quarter_meta else None,
         "ytd_eps":ytd,"ytd_period":f"{fy} Q{fq} YTD" if fy and fq else latest_period,
-        "ttm_eps":ttm,"ttm_period":latest_period,"source":source,"official_period":official.get("period"),
-        "history":quarters,"quality":"official_eps_engine" if official.get("official") else "structured_api",
+        "ytd_method_label":"✅ 官方累計值" if official.get("official") and ytd is not None else ("△ 結構化 API" if ytd is not None else "資料不足"),
+        "ttm_eps":ttm,"ttm_period":latest_period,"ttm_method_label":"✅ 四個實際單季加總" if ttm is not None else "四季官方單季資料不足",
+        "source":source,"official_period":official.get("period"),"history":quarters,
+        "quality":"multi_source_official_eps" if official.get("official") else "structured_api",
         "structured_api_stale":stale_api,"structured_api_period":f"{api_latest[0]} Q{api_latest[1]}" if api_latest[0] else None,
         "prior_ytd_period":f"{prev_key[0]} Q{prev_key[1]} YTD" if prev_key else None,
-        "prior_ytd_eps":ytd_map.get(prev_key) if prev_key else None,
+        "prior_ytd_eps":official_ytd.get(prev_key) if prev_key else None,
         "official_ytd_map":{f"{y} Q{q}":v for (y,q),v in sorted(official_ytd.items())},
         "eps_lookup_diagnostics":lookup_diagnostics,
-        "note":"V5.2.8 Official EPS Resolver：MOPS 歷史公司財報使用民國年查詢；Q1=累計；Q2/Q3=本期累計－前季累計；Q4=全年累計－Q3累計。TTM 只加總四個實際單季 EPS，不做單季年化猜值。"
+        "blocked_mops_html_removed":True,
+        "note":"V5.2.11 多來源 EPS Resolver：官方結構化資料優先；歷史單季由公司官方 IR/財報補足；若同年度累計資料完整則以官方累計差額推導。MOPS 被安全機制阻擋的歷史 HTML 不再是生產 EPS 來源，缺資料就留白。"
     }
 
 
@@ -1877,12 +1966,12 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.2.10",
+        "ticker":ticker,"version":"5.2.11",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
         "raw_period_trace_links":raw_periods,
-        "note":"V5.2.10 traces current and legacy MOPS routes and parses EPS with lxml only; html5lib is not required."
+        "note":"V5.2.11 production EPS no longer depends on blocked MOPS historical HTML; raw endpoint diagnostics are retained only for troubleshooting."
     }
 
 @app.get("/api/diagnostics/eps-raw/{ticker}")
@@ -1892,4 +1981,4 @@ async def eps_raw_diagnostics(ticker: str, year: int = Query(..., ge=1990, le=21
     return await trace_mops_company_ifrs(ticker,year,quarter)
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.2.10","mode":"cloud-mobile-mops-endpoint-eps-parser","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.2.11","mode":"cloud-mobile-multi-source-eps-resolver","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}

@@ -1,4 +1,4 @@
-# AI Stock Research Terminal V5.2.10
+# AI Stock Research Terminal V5.2.11
 
 本版為 EPS 原始資料追蹤版。部署後可用 `/api/diagnostics/eps/2330` 與 `/api/diagnostics/eps-raw/2330?year=2026&quarter=1` 精確檢查 MOPS 歷史 EPS 查詢。
 
@@ -98,5 +98,9 @@ Health Check:
 - 官方當期資料不會混用 FinMind 舊季資料推算單季 EPS。
 
 
-## V5.2.10
+## V5.2.11
 修正歷史 MOPS endpoint 404 與 html5lib parser 問題；EPS 歷史回查改為多路由 + lxml + 官方重大訊息/公司 IR fallback。
+
+
+## V5.2.11 EPS policy
+Production EPS resolution uses official structured data and company IR. Blocked MOPS historical HTML endpoints are not used for production EPS.
