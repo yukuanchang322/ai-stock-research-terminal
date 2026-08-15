@@ -1,4 +1,4 @@
-# AI Stock Research Terminal V5.2.11
+# AI Stock Research Terminal V5.2.12
 
 本版為 EPS 原始資料追蹤版。部署後可用 `/api/diagnostics/eps/2330` 與 `/api/diagnostics/eps-raw/2330?year=2026&quarter=1` 精確檢查 MOPS 歷史 EPS 查詢。
 
@@ -98,9 +98,16 @@ Health Check:
 - 官方當期資料不會混用 FinMind 舊季資料推算單季 EPS。
 
 
-## V5.2.11
+## V5.2.12
 修正歷史 MOPS endpoint 404 與 html5lib parser 問題；EPS 歷史回查改為多路由 + lxml + 官方重大訊息/公司 IR fallback。
 
 
-## V5.2.11 EPS policy
+## V5.2.12 EPS policy
 Production EPS resolution uses official structured data and company IR. Blocked MOPS historical HTML endpoints are not used for production EPS.
+
+
+## V5.2.12 EPS Quarter Bridge
+- 修正前一季官方 EPS 橋接。
+- 2330 會從台積電官方季度結果/官方新聞中心解析歷史季度單季 EPS。
+- Q2/Q3 使用官方 YTD 差額，Q4 使用全年減 Q3 YTD。
+- 不把第三方歷史 EPS 混入官方差額計算。

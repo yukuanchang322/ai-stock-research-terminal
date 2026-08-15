@@ -39,7 +39,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.2.11")
+app = FastAPI(title="AI Stock Research Terminal", version="5.2.12")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -112,7 +112,7 @@ def _row_value(row: dict[str, Any], includes: list[str], excludes: list[str] | N
     return None
 
 async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.11"}) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.12"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
 
@@ -126,7 +126,7 @@ IR_FINANCIAL_PAGES = {
 async def mops_csv_rows(filename: str) -> list[dict[str, Any]]:
     """Official MOPS CSV fallback. Some foreign/KY issuers can appear here even when JSON feeds lag."""
     url=f"{MOPS_CSV_BASE}/{filename}"
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.11"}) as client:
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.12"}) as client:
         r=await client.get(url); r.raise_for_status()
     raw=r.content
     text=None
@@ -224,7 +224,7 @@ async def fetch_company_ir_financial(ticker: str, expected_year: int, expected_q
     page=IR_FINANCIAL_PAGES.get(ticker)
     if not page: return None
     try:
-        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.11"}) as client:
+        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.12"}) as client:
             r=await client.get(page); r.raise_for_status(); page_html=r.text
             hrefs=re.findall(r'href=["\']([^"\']+)["\']',page_html,re.I)
             embedded=re.findall(r'["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']',page_html,re.I)
@@ -344,7 +344,7 @@ async def fetch_mops_material_financial(ticker: str, expected_year: int | None=N
     historical-search endpoint so a disclosure from one or two days ago is still discoverable.
     """
     out=[]
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.11"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.12"}
     async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers=ua) as client:
         # A. Daily official material-information feed.
         try:
@@ -603,69 +603,102 @@ async def fetch_mops_company_ifrs(ticker: str, year: int, quarter: int) -> list[
 
 
 async def fetch_tsmc_quarterly_release(year: int, quarter: int) -> dict[str, Any] | None:
-    """TSMC official IR EPS resolver.
+    """TSMC official quarter bridge.
 
-    V5.2.11 does not depend on MOPS historical HTML. It reads the official quarterly-results page,
-    follows the official Earnings Release PDF when present, and extracts the actual single-quarter
-    EPS plus margins. This is an authoritative direct-quarter value and may be used to derive YTD
-    differences without mixing in third-party estimates.
+    Resolve a *single-quarter* EPS from TSMC official sources. The quarterly-results page is tried
+    first. If the page/PDF markup does not expose EPS to the server-side client, fall back to the
+    official TSMC press/news archive and locate the matching quarter's EPS announcement. This keeps
+    the bridge fully official while avoiding blocked historical MOPS HTML.
     """
     if quarter not in (1,2,3,4): return None
     landing=f"https://investor.tsmc.com/english/quarterly-results/{year}/q{quarter}"
-    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.11"}
+    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.12"}
+
+    def extract(blob: str):
+        blob=" ".join(html.unescape(blob or "").split())
+        eps_patterns=[
+            r"(?:diluted\s+)?earnings per share(?:\s+of|\s+was|\s*[:：])?\s*NT\$\s*([0-9.]+)",
+            r"EPS(?:\s+of|\s+was|\s*[:：])?\s*NT\$\s*([0-9.]+)",
+            r"每股盈餘(?:為|新台幣|\s*[:：])?\s*(?:新台幣)?\s*([0-9.]+)\s*元",
+            r"Earnings per Share\s*-\s*Diluted\s+\$?\s*[0-9.]+\s+\$?\s*([0-9.]+)",
+        ]
+        qeps=None
+        for pat in eps_patterns:
+            m=re.search(pat,blob,re.I)
+            if m:
+                qeps=parse_num_text(m.group(1)); break
+        gm=om=None
+        for pat in (r"Gross margin(?: for the quarter)? was\s*([0-9.]+)%", r"Gross Margin\s+([0-9.]+)%", r"毛利率(?:為)?\s*([0-9.]+)%"):
+            m=re.search(pat,blob,re.I)
+            if m: gm=parse_num_text(m.group(1)); break
+        for pat in (r"operating margin(?: for the quarter)? was\s*([0-9.]+)%", r"Operating Margin\s+([0-9.]+)%", r"營業利益率(?:為)?\s*([0-9.]+)%"):
+            m=re.search(pat,blob,re.I)
+            if m: om=parse_num_text(m.group(1)); break
+        return qeps,gm,om
+
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as client:
-            r=await client.get(landing); r.raise_for_status()
-            page_html=r.text
-            compact=" ".join(html.unescape(re.sub(r"<[^>]+>"," ",page_html)).split())
-            source_url=str(r.url)
-            pdf_text=""
-            # Prefer the official Earnings Release PDF linked from the quarter landing page.
-            hrefs=re.findall(r'href=["\']([^"\']+)["\']',page_html,re.I)
-            candidates=[]
-            for href in hrefs:
-                lo=href.lower()
-                score=0
-                if 'earningsrelease' in lo or 'earnings-release' in lo or 'earnings_release' in lo: score+=10
-                if '.pdf' in lo: score+=3
-                if f'q{quarter}' in lo or f'{quarter}q' in lo: score+=2
-                if score: candidates.append((score,urljoin(str(r.url),href)))
-            for _,url in sorted(set(candidates), reverse=True):
-                try:
-                    pr=await client.get(url); pr.raise_for_status()
-                    if 'pdf' not in (pr.headers.get('content-type') or '').lower() and not url.lower().endswith('.pdf'):
-                        continue
-                    reader=PdfReader(io.BytesIO(pr.content))
-                    text="\n".join((pg.extract_text() or "") for pg in reader.pages[:6])
-                    if text:
-                        pdf_text=text; source_url=url; break
-                except Exception:
-                    continue
-            blob=" ".join((compact+" "+pdf_text).split())
-            # Official earnings releases use phrases such as "diluted earnings per share of NT$22.08"
-            eps_patterns=[
-                r"(?:diluted\s+)?earnings per share\s+of\s+NT\$\s*([0-9.]+)",
-                r"EPS\s+of\s+NT\$\s*([0-9.]+)",
-                r"Earnings per Share\s*-\s*Diluted\s+\$?\s*[0-9.]+\s+\$?\s*([0-9.]+)",
-            ]
-            qeps=None
-            for pat in eps_patterns:
-                m=re.search(pat,blob,re.I)
-                if m:
-                    qeps=parse_num_text(m.group(1)); break
-            gm=None; om=None
-            for pat in (r"Gross margin(?: for the quarter)? was\s*([0-9.]+)%", r"Gross Margin\s+([0-9.]+)%"):
-                m=re.search(pat,blob,re.I)
-                if m: gm=parse_num_text(m.group(1)); break
-            for pat in (r"operating margin(?: for the quarter)? was\s*([0-9.]+)%", r"Operating Margin\s+([0-9.]+)%"):
-                m=re.search(pat,blob,re.I)
-                if m: om=parse_num_text(m.group(1)); break
+            source_url=landing; page_html=""; pdf_text=""
+            try:
+                r=await client.get(landing); r.raise_for_status(); page_html=r.text; source_url=str(r.url)
+                hrefs=re.findall(r'href=["\']([^"\']+)["\']',page_html,re.I)
+                candidates=[]
+                for href in hrefs:
+                    lo=href.lower(); score=0
+                    if 'earningsrelease' in lo or 'earnings-release' in lo or 'earnings_release' in lo: score+=10
+                    if '.pdf' in lo: score+=3
+                    if f'q{quarter}' in lo or f'{quarter}q' in lo: score+=2
+                    if score: candidates.append((score,urljoin(str(r.url),href)))
+                for _,url in sorted(set(candidates), reverse=True):
+                    try:
+                        pr=await client.get(url); pr.raise_for_status()
+                        if 'pdf' not in (pr.headers.get('content-type') or '').lower() and not url.lower().endswith('.pdf'): continue
+                        reader=PdfReader(io.BytesIO(pr.content))
+                        text="\n".join((pg.extract_text() or "") for pg in reader.pages[:6])
+                        if text: pdf_text=text; source_url=url; break
+                    except Exception: continue
+            except Exception:
+                pass
+            clean=" ".join(html.unescape(re.sub(r"<[^>]+>"," ",page_html)).split())
+            qeps,gm,om=extract(clean+" "+pdf_text)
+
+            # Quarter Bridge fallback: TSMC official press archive. This is especially useful for
+            # historical Q1 where the investor landing page can be JS-heavy while the press release
+            # is static and contains the direct EPS value in plain HTML.
+            if qeps is None:
+                ord_en={1:'First',2:'Second',3:'Third',4:'Fourth'}[quarter]
+                archive_urls=["https://pr.tsmc.com/english/latest-news","https://pr.tsmc.com/chinese/latest-news"]
+                article_candidates=[]
+                for archive in archive_urls:
+                    try:
+                        ar=await client.get(archive); ar.raise_for_status()
+                        for href,label_html in re.findall(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',ar.text,re.I|re.S):
+                            label=" ".join(html.unescape(re.sub(r'<[^>]+>',' ',label_html)).split())
+                            lo=label.lower()
+                            score=0
+                            if str(year) in label: score+=5
+                            if 'eps' in lo or '每股盈餘' in label: score+=5
+                            if ord_en.lower() in lo and 'quarter' in lo: score+=6
+                            if f'第{quarter}季' in label or {1:'第一季',2:'第二季',3:'第三季',4:'第四季'}[quarter] in label: score+=6
+                            if score>=10: article_candidates.append((score,urljoin(str(ar.url),href),label))
+                    except Exception: continue
+                for _,url,_label in sorted(article_candidates,reverse=True):
+                    try:
+                        nr=await client.get(url); nr.raise_for_status()
+                        article=" ".join(html.unescape(re.sub(r'<[^>]+>',' ',nr.text)).split())
+                        qe,gg,oo=extract(article)
+                        if qe is not None:
+                            qeps=qe; gm=gm if gm is not None else gg; om=om if om is not None else oo
+                            source_url=str(nr.url); break
+                    except Exception: continue
+
             if gm is None and om is None and qeps is None: return None
-            return {"source":"TSMC official quarterly results","market":"Company IR","endpoint":source_url,"official":True,
+            return {"source":"TSMC official quarter bridge","market":"Company IR","endpoint":source_url,"official":True,
                     "period":f"{year} Q{quarter}","fiscal_year":year,"fiscal_quarter":quarter,"statement_date":None,
-                    "feed_kind":"company_ir_quarter","company_code":"2330","quarter_eps_direct":qeps,
+                    "feed_kind":"company_ir_quarter_bridge","company_code":"2330","quarter_eps_direct":qeps,
                     "gross_margin_direct":gm,"operating_margin_direct":om,
                     "eps_provenance":"company_official_direct","eps_confidence":100,
+                    "bridge_version":"5.2.12",
                     "completeness":sum(v is not None for v in (qeps,gm,om))}
     except Exception:
         return None
@@ -797,7 +830,7 @@ async def diagnose_official_financial_sources(ticker: str) -> dict[str, Any]:
     """
     now=datetime.now().astimezone()
     ey,eq,expected=expected_latest_financial_period(now.date())
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.11 diagnostics"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.12 diagnostics"}
     out={
         "ticker":ticker, "generated_at":now.isoformat(timespec="seconds"),
         "expected_period":expected, "expected_year":ey, "expected_quarter":eq,
@@ -1064,7 +1097,7 @@ def _best_period_snapshot(rows: list[dict[str, Any]], year: int, quarter: int) -
     return best
 
 async def fetch_official_eps_for_period(ticker: str, year: int, quarter: int) -> dict[str, Any] | None:
-    """V5.2.11 multi-source official EPS resolver for an exact fiscal period.
+    """V5.2.12 multi-source official EPS resolver for an exact fiscal period.
 
     Priority:
       1) official structured MOPS/TWSE data when it exactly matches the requested period;
@@ -1116,7 +1149,7 @@ async def fetch_official_eps_ytd_for_period(ticker: str, year: int, quarter: int
     return await fetch_official_eps_for_period(ticker,year,quarter)
 
 async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official: dict[str, Any], fallback_financial: dict[str, Any]) -> dict[str, Any]:
-    """V5.2.11 multi-source EPS engine with explicit provenance.
+    """V5.2.12 multi-source EPS engine with explicit provenance.
 
     Official current-period data is never combined with a third-party predecessor. Quarter EPS is
     either (a) a direct company-official value, or (b) derived from two official cumulative values.
@@ -1246,7 +1279,7 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
         "official_ytd_map":{f"{y} Q{q}":v for (y,q),v in sorted(official_ytd.items())},
         "eps_lookup_diagnostics":lookup_diagnostics,
         "blocked_mops_html_removed":True,
-        "note":"V5.2.11 多來源 EPS Resolver：官方結構化資料優先；歷史單季由公司官方 IR/財報補足；若同年度累計資料完整則以官方累計差額推導。MOPS 被安全機制阻擋的歷史 HTML 不再是生產 EPS 來源，缺資料就留白。"
+        "note":"V5.2.12 多來源 EPS Resolver：官方結構化資料優先；歷史單季由公司官方 IR/財報補足；若同年度累計資料完整則以官方累計差額推導。MOPS 被安全機制阻擋的歷史 HTML 不再是生產 EPS 來源，缺資料就留白。"
     }
 
 
@@ -1966,12 +1999,12 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.2.11",
+        "ticker":ticker,"version":"5.2.12",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
         "raw_period_trace_links":raw_periods,
-        "note":"V5.2.11 production EPS no longer depends on blocked MOPS historical HTML; raw endpoint diagnostics are retained only for troubleshooting."
+        "note":"V5.2.12 production EPS no longer depends on blocked MOPS historical HTML; raw endpoint diagnostics are retained only for troubleshooting."
     }
 
 @app.get("/api/diagnostics/eps-raw/{ticker}")
@@ -1981,4 +2014,4 @@ async def eps_raw_diagnostics(ticker: str, year: int = Query(..., ge=1990, le=21
     return await trace_mops_company_ifrs(ticker,year,quarter)
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.2.11","mode":"cloud-mobile-multi-source-eps-resolver","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.2.12","mode":"cloud-mobile-eps-quarter-bridge","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
