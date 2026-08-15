@@ -202,6 +202,9 @@ async def fetch_twse_stock_info(ticker: str) -> tuple[dict[str, Any], list[str]]
 
 
 MOPS_CSV_BASE = "https://mopsfin.twse.com.tw/opendata"
+MOPS_HISTORY_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t163sb04"
+MOPS_HISTORY_CACHE_TTL = max(CACHE_TTL, 21600)
+_MOPS_HISTORY_CACHE: dict[tuple[str, int, int], tuple[float, dict[str, dict[str, Any]]]] = {}
 IR_FINANCIAL_PAGES = {
     "3661": "https://www.alchip.com/en/Investors/financials/report",
 }
@@ -546,6 +549,86 @@ def _mops_lxml_rows(html_text: str) -> list[dict[str, Any]]:
         if rows: out.append({"table_index":ti,"rows":rows})
     return out
 
+
+def _parse_mops_historical_eps(html_text: str, year: int, quarter: int, market_type: str) -> dict[str, dict[str, Any]]:
+    """Parse the official MOPS historical income-statement summary into ticker snapshots.
+
+    MOPS renders several industry-specific tables in one response. Each table has a slightly
+    different shape, so columns are resolved from the header instead of a fixed index. Reported
+    EPS is cumulative/YTD for Q2-Q4 and equals standalone EPS for Q1.
+    """
+    snapshots: dict[str, dict[str, Any]] = {}
+    for table in _mops_lxml_rows(html_text):
+        rows=table.get("rows") or []
+        header_index=None; code_index=None; name_index=None; eps_index=None
+        for ri,row in enumerate(rows):
+            normalized=[_norm_label(cell) for cell in row]
+            for ci,label in enumerate(normalized):
+                if code_index is None and ("公司代號" in label or label in {"代號","公司代碼"}): code_index=ci
+                if name_index is None and ("公司名稱" in label or label in {"名稱","公司簡稱"}): name_index=ci
+                if eps_index is None and ("基本每股盈餘" in label or "basicearningspershare" in label): eps_index=ci
+            if code_index is not None and eps_index is not None:
+                header_index=ri; break
+        if header_index is None or code_index is None or eps_index is None: continue
+        for row in rows[header_index+1:]:
+            if max(code_index,eps_index)>=len(row): continue
+            ticker=re.sub(r"\D","",str(row[code_index] or ""))
+            if not re.fullmatch(r"\d{4,6}",ticker): continue
+            eps=parse_num_text(row[eps_index])
+            if eps is None: continue
+            company_name=str(row[name_index]).strip() if name_index is not None and name_index<len(row) else ticker
+            endpoint=f"{MOPS_HISTORY_URL}?TYPEK={market_type}&year={year-1911}&season={quarter:02d}"
+            snapshots[ticker]={
+                "source":"MOPS historical income statement summary","market":"上市" if market_type=="sii" else "上櫃",
+                "endpoint":endpoint,"request_method":"POST",
+                "request_params":{"TYPEK":market_type,"year":year-1911,"season":f"{quarter:02d}"},
+                "official":True,"period":f"{year} Q{quarter}",
+                "fiscal_year":year,"fiscal_quarter":quarter,"statement_date":None,
+                "feed_kind":"mops_historical_summary","company_code":ticker,"company_name":company_name,
+                "ytd_eps":float(eps),"quarter_eps_direct":float(eps) if quarter==1 else None,
+                "eps_provenance":"official_mops_historical","eps_confidence":100,
+                "report_id":"t163sb04","table_index":table.get("table_index"),"completeness":1,
+            }
+    return snapshots
+
+
+async def _fetch_mops_historical_market(year: int, quarter: int, market_type: str) -> dict[str, dict[str, Any]]:
+    key=(market_type,year,quarter)
+    cached=_MOPS_HISTORY_CACHE.get(key)
+    if cached and time.time()-cached[0] < MOPS_HISTORY_CACHE_TTL:
+        return cached[1]
+    form={
+        # MOPS currently requires this literal historical form spelling; changing it to the
+        # grammatically correct "true" can return an empty/security response.
+        "encodeURIComponent":"1","step":"1","firstin":"ture","off":"1",
+        "TYPEK":market_type,"year":str(year-1911 if year>=1912 else year),"season":f"{quarter:02d}",
+    }
+    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.5","Referer":"https://mopsov.twse.com.tw/mops/"}
+    async with httpx.AsyncClient(timeout=35,follow_redirects=True,headers=headers) as client:
+        response=await client.post(MOPS_HISTORY_URL,data=form)
+        response.raise_for_status()
+    text=_decode_mops_html(response.content,response.encoding)
+    if "因為安全性考量" in text or len(text)<500:
+        raise RuntimeError("MOPS historical response was blocked or empty")
+    rows=_parse_mops_historical_eps(text,year,quarter,market_type)
+    _MOPS_HISTORY_CACHE[key]=(time.time(),rows)
+    return rows
+
+
+async def fetch_mops_historical_eps(ticker: str, year: int, quarter: int) -> dict[str, Any] | None:
+    """Resolve exact-period cumulative EPS from the official MOPS historical summary."""
+    errors=[]; successful=False
+    for market_type in ("sii","otc"):
+        try:
+            rows=await _fetch_mops_historical_market(year,quarter,market_type)
+            successful=True
+            if ticker in rows: return dict(rows[ticker])
+        except Exception as exc:
+            errors.append(f"{market_type}:{type(exc).__name__}:{exc}")
+    if not successful and errors:
+        raise RuntimeError("; ".join(errors))
+    return None
+
 def _eps_from_lxml_rows(tables: list[dict[str, Any]], quarter: int) -> tuple[float|None, dict[str, Any]|None]:
     aliases=("基本每股盈餘","每股盈餘","basic earnings per share","earnings per share")
     for table in tables:
@@ -835,13 +918,14 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
         candidates.append((TPEX_OPENAPI, f"/mopsfin_t187ap06_O_{suffix}", "TPEx/MOPS Income Statement", "上櫃", "detail"))
     errors=[]; found=[]
 
-    # Layer 0: company-specific MOPS IFRS report for the expected quarter.
-    # Aggregate OpenAPI feeds can be incomplete/staggered; direct company report is authoritative.
+    # Layer 0: official MOPS historical summary for the expected quarter. Unlike the legacy
+    # company HTML route, this aggregate endpoint remains accessible and also covers KY issuers.
     try:
         ey,eq,_=expected_latest_financial_period(date.today())
-        found.extend(await fetch_mops_company_ifrs(ticker,ey,eq))
+        historical_current=await fetch_mops_historical_eps(ticker,ey,eq)
+        if historical_current: found.append(historical_current)
     except Exception as e:
-        errors.append(f"mops_company:{type(e).__name__}")
+        errors.append(f"mops_history_current:{type(e).__name__}")
 
     # TSMC publishes quarterly results earlier than some MOPS aggregate refreshes.
     if ticker=="2330":
@@ -908,6 +992,24 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
         if ir: found.append(ir)
     except Exception as e:
         errors.append(f"company_ir:{type(e).__name__}")
+
+    # If the expected quarter has not been filed yet, retain the newest official prior quarter
+    # instead of falling through to a third-party snapshot. The integrity gate still marks it stale.
+    if not found:
+        ey,eq,_=expected_latest_financial_period(date.today())
+        y,q=ey,eq
+        for _ in range(3):
+            q-=1
+            if q==0: y-=1; q=4
+            try:
+                prior=await fetch_mops_historical_eps(ticker,y,q)
+                if prior:
+                    prior["latest_expected_period"]=f"{ey} Q{eq}"
+                    prior["current_period_status"]="not_published_or_unavailable"
+                    found.append(prior)
+                    break
+            except Exception as e:
+                errors.append(f"mops_history_{y}q{q}:{type(e).__name__}")
     if found:
         # Latest fiscal period always wins. Within the same period prefer the detailed row with more parsed fields.
         found.sort(key=lambda x: (x.get("fiscal_year") or 0, x.get("fiscal_quarter") or 0,
@@ -1227,7 +1329,10 @@ BUILTIN_OFFICIAL_EPS_REGISTRY = {
     ]
 }
 
-OFFICIAL_EPS_REGISTRY_PATH = Path(__file__).resolve().parent / "data" / "official_eps_registry.json"
+OFFICIAL_EPS_REGISTRY_PATHS = [
+    Path(__file__).resolve().parent / "data" / "official_eps_registry.json",
+    Path(__file__).resolve().parent / "official_eps_registry.json",
+]
 
 def _load_official_eps_registry() -> dict[str, Any]:
     """Load the verified EPS registry with a built-in cloud-safe seed.
@@ -1241,20 +1346,26 @@ def _load_official_eps_registry() -> dict[str, Any]:
     for row in BUILTIN_OFFICIAL_EPS_REGISTRY.get("records",[]):
         if row.get("verified") is True:
             by_key[(str(row.get("ticker")),int(row.get("year")),int(row.get("quarter")))]=dict(row)
-    try:
-        raw=json.loads(OFFICIAL_EPS_REGISTRY_PATH.read_text(encoding="utf-8"))
-        if isinstance(raw,dict):
-            for row in raw.get("records",[]):
-                try:
-                    if row.get("verified") is True:
-                        key=(str(row.get("ticker")),int(row.get("year")),int(row.get("quarter")))
-                        by_key[key]=dict(row)
-                except Exception:
-                    continue
-            merged["file_schema_version"]=raw.get("schema_version")
-            merged["file_updated_at"]=raw.get("updated_at")
-    except Exception as exc:
-        merged["file_load_error"]=type(exc).__name__
+    loaded_paths=[]; load_errors=[]
+    for registry_path in OFFICIAL_EPS_REGISTRY_PATHS:
+        if not registry_path.exists(): continue
+        try:
+            raw=json.loads(registry_path.read_text(encoding="utf-8"))
+            if isinstance(raw,dict):
+                for row in raw.get("records",[]):
+                    try:
+                        if row.get("verified") is True:
+                            key=(str(row.get("ticker")),int(row.get("year")),int(row.get("quarter")))
+                            by_key[key]=dict(row)
+                    except Exception:
+                        continue
+                merged["file_schema_version"]=raw.get("schema_version")
+                merged["file_updated_at"]=raw.get("updated_at")
+                loaded_paths.append(registry_path.name)
+        except Exception as exc:
+            load_errors.append(f"{registry_path.name}:{type(exc).__name__}")
+    if loaded_paths: merged["file_paths"]=loaded_paths
+    if load_errors: merged["file_load_errors"]=load_errors
     merged["records"]=list(by_key.values())
     merged["records"].sort(key=lambda r:(str(r.get("ticker")),int(r.get("year",0)),int(r.get("quarter",0))))
     merged["record_count"]=len(merged["records"])
@@ -1291,10 +1402,10 @@ async def fetch_official_eps_for_period(ticker: str, year: int, quarter: int) ->
 
     Priority:
       1) official structured MOPS/TWSE data when it exactly matches the requested period;
-      2) company official IR / reviewed financial report;
-      3) official MOPS board-approved disclosure;
-      4) return None.  The blocked MOPS historical HTML endpoint is intentionally *not* in the
-         production EPS path. Third-party/FinMind values never fill an official predecessor quarter.
+      2) official MOPS historical aggregate statement;
+      3) company official IR / reviewed financial report;
+      4) official MOPS board-approved disclosure;
+      5) return None. Third-party/FinMind values never fill an official predecessor quarter.
     """
     # Layer 0: verified company-official registry. This avoids re-scraping historical pages on every request
     # and makes evidence auditable/stable. Registry rows always carry their original official URL.
@@ -1312,7 +1423,16 @@ async def fetch_official_eps_for_period(ticker: str, year: int, quarter: int) ->
     except Exception:
         pass
 
-    # Layer 2: company official IR. TSMC publishes a direct quarter EPS; mapped issuers such as
+    # Layer 2: official historical aggregate. This supplies the prior cumulative quarter required
+    # to derive Q2/Q3/Q4 standalone EPS for any listed/OTC company, without per-ticker hard-coding.
+    try:
+        historical=await fetch_mops_historical_eps(ticker,year,quarter)
+        if historical and (historical.get("ytd_eps") is not None or historical.get("quarter_eps_direct") is not None):
+            return historical
+    except Exception:
+        pass
+
+    # Layer 3: company official IR. TSMC publishes a direct quarter EPS; mapped issuers such as
     # Alchip are parsed from their reviewed/audited IR PDF when an explicit period match exists.
     if ticker=="2330":
         try:
@@ -1328,7 +1448,7 @@ async def fetch_official_eps_for_period(ticker: str, year: int, quarter: int) ->
     except Exception:
         pass
 
-    # Layer 3: official board-approved disclosure, if it contains an exact period and EPS.
+    # Layer 4: official board-approved disclosure, if it contains an exact period and EPS.
     try:
         mats=await fetch_mops_material_financial(ticker,year,quarter)
         mb=_best_period_snapshot(mats,year,quarter)
@@ -1439,8 +1559,13 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             return cur,"official_ytd_q1",p
         prev=official_ytd.get((year,quarter-1))
         if prev is None: return None,None,None
-        p=provenance.get(key,{})
-        return cur-prev,"official_ytd_difference",p
+        current_p=provenance.get(key,{})
+        prior_p=provenance.get((year,quarter-1),{})
+        p={**current_p,"derivation_inputs":{
+            "current":{"period":f"{year} Q{quarter}","ytd_eps":cur,"source":current_p.get("source"),"endpoint":current_p.get("endpoint")},
+            "prior":{"period":f"{year} Q{quarter-1}","ytd_eps":prev,"source":prior_p.get("source"),"endpoint":prior_p.get("endpoint")},
+        }}
+        return round(cur-prev,4),"official_ytd_difference",p
 
     quarter_eps=None; quarter_method=None; quarter_meta=None
     if fy and fq:
@@ -1509,6 +1634,7 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
         "quarter_eps":quarter_eps,"quarter_period":latest_period,"quarter_method":quarter_method,"quarter_method_label":q_label,
         "quarter_source":(quarter_meta or {}).get("source") if quarter_meta else source,
         "quarter_source_url":(quarter_meta or {}).get("endpoint") if quarter_meta else None,
+        "quarter_derivation_inputs":(quarter_meta or {}).get("derivation_inputs") if quarter_meta else None,
         "ytd_eps":ytd,"ytd_period":f"{fy} Q{fq} YTD" if fy and fq else latest_period,
         "ytd_method_label":"✅ 官方累計值" if official.get("official") and ytd is not None else ("△ 結構化 API" if ytd is not None else "資料不足"),
         "ttm_eps":ttm,"ttm_period":latest_period,"ttm_method_label":"✅ 四個實際單季加總" if ttm is not None else "四季官方單季資料不足",
@@ -1524,11 +1650,12 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             "attempted_periods":[x.get("period") for x in evidence_ledger[1:]],
             "resolved_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")=="usable"],
             "missing_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")!="usable"],
-            "policy":"official_registry_then_company_ir_then_official_disclosure; no third-party EPS for official derivation",
+            "policy":"official_registry_then_structured_feed_then_mops_historical_then_company_ir_then_official_disclosure; no third-party EPS for official derivation",
         },
         "evidence_ledger_version":"5.3.5",
         "blocked_mops_html_removed":True,
-        "note":"V5.3.1 Evidence Engine EPS takeover：歷史季度優先讀取可稽核的公司官方 Registry，再以公司 IR/官方揭露補抓。Registry 每筆保留官方來源 URL；缺資料才留白，第三方 EPS 不參與官方推導。"
+        "blocked_mops_company_html_removed":True,
+        "note":"歷史季度優先讀取可稽核的官方 Registry、TWSE/MOPS 結構化資料與 MOPS 歷史彙總表，再以公司 IR/官方揭露補抓。Q2-Q4 單季 EPS 僅由同年度官方累計值差額推導；缺資料留白，第三方 EPS 不參與官方推導。"
     }
 
 
@@ -2580,7 +2707,7 @@ async def eps_diagnostics(ticker: str):
         "finmind_error":finmind_error,
         "eps_stack":stack,
         "raw_period_trace_links":raw_periods,
-        "note":"V5.2.13 production EPS no longer depends on blocked MOPS historical HTML; raw endpoint diagnostics are retained only for troubleshooting."
+        "note":"正式 EPS 路徑使用 MOPS 官方歷史彙總表，不依賴已封鎖的公司別舊版 HTML；raw endpoint 僅保留供故障排查。"
     }
 
 @app.get("/api/diagnostics/eps-raw/{ticker}")
