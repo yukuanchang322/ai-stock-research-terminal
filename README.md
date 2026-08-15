@@ -1,4 +1,4 @@
-# AI Stock Research Terminal V5.3.1
+# AI Stock Research Terminal V5.3.5
 
 Multi-Source Evidence Engine: data is normalized and verified before analysis. Official/verified sources are primary; third-party and public-web sources are fallback/context.
 

@@ -1,11 +1,11 @@
 const CACHE_PREFIX = 'ai-stock-shell-';
-const CACHE = `${CACHE_PREFIX}20260815-1`;
+const CACHE = `${CACHE_PREFIX}20260815-2`;
 const APP_CACHE_PREFIX = 'ai-stock-';
 const SHELL = [
   '/',
-  '/styles.css?v=20260815-1',
-  '/app.js?v=20260815-1',
-  '/static/manifest.webmanifest?v=20260815-1',
+  '/styles.css?v=20260815-2',
+  '/app.js?v=20260815-2',
+  '/static/manifest.webmanifest?v=20260815-2',
   '/static/icons/icon-192.png',
   '/static/icons/icon-512.png'
 ];
