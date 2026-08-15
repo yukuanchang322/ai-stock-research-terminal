@@ -1,4 +1,4 @@
-# AI Stock Research Terminal V5.2.9
+# AI Stock Research Terminal V5.2.10
 
 本版為 EPS 原始資料追蹤版。部署後可用 `/api/diagnostics/eps/2330` 與 `/api/diagnostics/eps-raw/2330?year=2026&quarter=1` 精確檢查 MOPS 歷史 EPS 查詢。
 
@@ -96,3 +96,7 @@ Health Check:
 - 官方回查前一季累計 EPS，推導 Q2/Q3/Q4 真實單季 EPS。
 - TTM 僅在四個實際單季 EPS 齊全時顯示。
 - 官方當期資料不會混用 FinMind 舊季資料推算單季 EPS。
+
+
+## V5.2.10
+修正歷史 MOPS endpoint 404 與 html5lib parser 問題；EPS 歷史回查改為多路由 + lxml + 官方重大訊息/公司 IR fallback。

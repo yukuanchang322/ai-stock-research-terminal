@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import quote_plus
 import re
 import xml.etree.ElementTree as ET
+from lxml import html as lxml_html
 import csv
 import io
 from urllib.parse import urljoin
@@ -38,7 +39,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.2.9")
+app = FastAPI(title="AI Stock Research Terminal", version="5.2.10")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -111,7 +112,7 @@ def _row_value(row: dict[str, Any], includes: list[str], excludes: list[str] | N
     return None
 
 async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.9"}) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.10"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
 
@@ -125,7 +126,7 @@ IR_FINANCIAL_PAGES = {
 async def mops_csv_rows(filename: str) -> list[dict[str, Any]]:
     """Official MOPS CSV fallback. Some foreign/KY issuers can appear here even when JSON feeds lag."""
     url=f"{MOPS_CSV_BASE}/{filename}"
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.9"}) as client:
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.10"}) as client:
         r=await client.get(url); r.raise_for_status()
     raw=r.content
     text=None
@@ -223,7 +224,7 @@ async def fetch_company_ir_financial(ticker: str, expected_year: int, expected_q
     page=IR_FINANCIAL_PAGES.get(ticker)
     if not page: return None
     try:
-        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.9"}) as client:
+        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.10"}) as client:
             r=await client.get(page); r.raise_for_status(); page_html=r.text
             hrefs=re.findall(r'href=["\']([^"\']+)["\']',page_html,re.I)
             embedded=re.findall(r'["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']',page_html,re.I)
@@ -343,7 +344,7 @@ async def fetch_mops_material_financial(ticker: str, expected_year: int | None=N
     historical-search endpoint so a disclosure from one or two days ago is still discoverable.
     """
     out=[]
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.9"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.10"}
     async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers=ua) as client:
         # A. Daily official material-information feed.
         try:
@@ -444,44 +445,61 @@ def _target_ytd_column(df: pd.DataFrame, quarter: int) -> Any | None:
     return None
 
 
-def _extract_mops_ifrs_tables(html_text: str, ticker: str, year: int, quarter: int, report_id: str, url: str) -> dict[str, Any] | None:
-    """Parse a company-specific MOPS IFRS report page into a same-period snapshot."""
-    if "查無資料" in html_text or "無符合條件" in html_text: return None
+def _mops_lxml_rows(html_text: str) -> list[dict[str, Any]]:
+    """Parse HTML tables with lxml only. Avoid pandas.read_html/html5lib runtime dependency."""
+    out=[]
     try:
-        tables=pd.read_html(io.StringIO(html_text))
+        root=lxml_html.fromstring(html_text)
     except Exception:
-        return None
-    income=None
-    for df in tables:
-        flat=" ".join(str(x) for x in df.astype(str).fillna("").values.ravel()[:800])
-        if ("每股盈餘" in flat or "Earnings per share" in flat) and ("營業收入" in flat or "Operating revenue" in flat):
-            income=df.copy(); break
-    if income is None: return None
-    col=_target_ytd_column(income, quarter)
-    if col is None: return None
-    def value(aliases):
-        idx=_pick_income_row(income, aliases)
-        if idx is None: return None
-        try:
-            return parse_num_text(income.loc[idx, col])
-        except Exception:
-            return None
-    eps=value(["基本每股盈餘合計","基本每股盈餘","每股盈餘","Basic earnings per share"])
-    revenue=value(["營業收入合計","營業收入","Operating revenue","Revenue"])
-    gross=value(["營業毛利（毛損）淨額","營業毛利（毛損）","營業毛利","Gross profit"])
-    op=value(["營業利益（損失）","營業利益","Profit from operations","Operating income"])
-    net=value(["本期淨利（淨損）","本期淨利","歸屬於母公司業主（淨利∕損）","歸屬於母公司業主之淨利","Net income"])
-    completeness=sum(v is not None for v in (eps,revenue,gross,op,net))
-    if completeness==0: return None
+        return out
+    for ti,table in enumerate(root.xpath("//table")):
+        rows=[]
+        for tr in table.xpath(".//tr"):
+            cells=[]
+            for cell in tr.xpath("./th|./td"):
+                txt=" ".join(" ".join(cell.itertext()).split())
+                cells.append(txt)
+            if cells: rows.append(cells)
+        if rows: out.append({"table_index":ti,"rows":rows})
+    return out
+
+def _eps_from_lxml_rows(tables: list[dict[str, Any]], quarter: int) -> tuple[float|None, dict[str, Any]|None]:
+    aliases=("基本每股盈餘","每股盈餘","basic earnings per share","earnings per share")
+    for table in tables:
+        rows=table.get("rows") or []
+        for ri,row in enumerate(rows):
+            label=" | ".join(row[:3]).lower()
+            if not any(a in label for a in aliases):
+                continue
+            nums=[]
+            for ci,v in enumerate(row[1:],start=1):
+                n=parse_num_text(v)
+                if n is not None: nums.append((ci,v,float(n)))
+            if not nums: continue
+            # IFRS Q2/Q3 income statement rows commonly expose current quarter, prior-year quarter,
+            # current YTD, prior-year YTD. Q1 is both quarter and YTD.
+            pick_idx=0 if quarter==1 else (2 if quarter in (2,3) and len(nums)>=3 else 0)
+            ci,raw,val=nums[pick_idx]
+            return val,{"table_index":table.get("table_index"),"row_index":ri,"row":row[:10],"numeric_candidates":[{"column_index":x[0],"raw":x[1],"number":x[2]} for x in nums[:8]],"selected_numeric_index":pick_idx,"selected_column_index":ci}
+    return None,None
+
+def _extract_mops_ifrs_tables(html_text: str, ticker: str, year: int, quarter: int, report_id: str, url: str) -> dict[str, Any] | None:
+    """Parse a company-specific MOPS IFRS page using lxml, without html5lib."""
+    if "查無資料" in html_text or "無符合條件" in html_text or "HTTP Status 404" in html_text: return None
+    tables=_mops_lxml_rows(html_text)
+    if not tables: return None
+    eps,meta=_eps_from_lxml_rows(tables,quarter)
+    # Historical resolver only needs EPS. Current-period financial metrics come from official CSV/OpenAPI.
+    if eps is None: return None
     return {
         "source":"MOPS company IFRS report","market":"MOPS","endpoint":url,"official":True,
         "period":f"{year} Q{quarter}","fiscal_year":year,"fiscal_quarter":quarter,
         "statement_date":None,"feed_kind":f"mops_company_{report_id}","company_code":ticker,
-        "ytd_eps":eps,"revenue_ytd":revenue,"gross_profit_ytd":gross,
-        "operating_income_ytd":op,"net_income_ytd":net,"completeness":completeness,
-        "report_id":report_id,"table_count":len(tables),"selected_column":str(col),
+        "ytd_eps":eps,"revenue_ytd":None,"gross_profit_ytd":None,
+        "operating_income_ytd":None,"net_income_ytd":None,"completeness":1,
+        "report_id":report_id,"table_count":len(tables),"selected_column":str((meta or {}).get("selected_column_index")),
+        "eps_parser":"lxml","eps_parser_meta":meta,
     }
-
 
 
 
@@ -521,94 +539,92 @@ def _eps_candidates_from_tables(tables: list[pd.DataFrame]) -> list[dict[str, An
             continue
     return out
 
+async def _request_mops_ifrs_candidates(client: httpx.AsyncClient, ticker: str, year: int, quarter: int, report_id: str):
+    """Try current MOPS web routes first; keep legacy server-java only as a diagnostic fallback."""
+    mops_year=year-1911 if year>=1912 else year
+    params={"step":"1","CO_ID":ticker,"SYEAR":str(mops_year),"SSEASON":str(quarter),"REPORT_ID":report_id}
+    candidates=[
+        ("GET","https://mops.twse.com.tw/mops/web/t164sb01",params),
+        ("POST","https://mops.twse.com.tw/mops/web/t164sb01",params),
+        ("POST","https://mops.twse.com.tw/mops/web/ajax_t164sb01",params),
+        ("GET","https://mops.twse.com.tw/server-java/t164sb01",params),
+    ]
+    results=[]
+    for method,url,payload in candidates:
+        try:
+            if method=="POST": r=await client.post(url,data=payload)
+            else: r=await client.get(url,params=payload)
+            text=_decode_mops_html(r.content,r.encoding)
+            results.append({"method":method,"url":url,"params":payload,"response":r,"text":text})
+            if r.status_code==200 and len(r.content)>500 and "HTTP Status 404" not in text and "Not Found" not in text:
+                snap=_extract_mops_ifrs_tables(text,ticker,year,quarter,report_id,str(r.url))
+                if snap:
+                    return snap,results
+        except Exception as e:
+            results.append({"method":method,"url":url,"params":payload,"error":f"{type(e).__name__}: {e}"})
+    return None,results
+
 async def trace_mops_company_ifrs(ticker: str, year: int, quarter: int) -> dict[str, Any]:
-    """Raw trace of company-specific MOPS historical IFRS lookup. No silent catches."""
-    base="https://mops.twse.com.tw/server-java/t164sb01"
+    """Raw trace of current/legacy MOPS historical IFRS routes plus lxml EPS parser output."""
     headers={"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1",
              "Referer":"https://mops.twse.com.tw/mops/"}
-    mops_year = year - 1911 if year >= 1912 else year
-    trace={"ticker":ticker,"gregorian_year":year,"mops_syear":mops_year,"quarter":quarter,"requests":[]}
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as client:
+    mops_year=year-1911 if year>=1912 else year
+    trace={"ticker":ticker,"gregorian_year":year,"mops_syear":mops_year,"quarter":quarter,"parser":"lxml","requests":[]}
+    async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers=headers) as client:
         for report_id in ("C","B","A"):
-            params={"step":"1","CO_ID":ticker,"SYEAR":str(mops_year),"SSEASON":str(quarter),"REPORT_ID":report_id}
-            item={"report_id":report_id,"request_url":base,"request_params":params}
-            try:
-                r=await client.get(base,params=params)
-                item.update({
-                    "http_status":r.status_code,"final_url":str(r.url),"content_type":r.headers.get("content-type"),
-                    "content_length":len(r.content),"encoding_hint":r.encoding
-                })
-                text=_decode_mops_html(r.content,r.encoding)
-                item["decoded_preview"]=_safe_preview_text(text,3500)
-                item["has_no_data_marker"]=("查無資料" in text or "無符合條件" in text)
-                try:
-                    tables=pd.read_html(io.StringIO(text))
-                    item["table_count"]=len(tables)
-                    item["eps_candidates"]=_eps_candidates_from_tables(tables)
-                    # Preview only tables likely to contain EPS or revenue.
-                    previews=[]
-                    for ti,df in enumerate(tables):
-                        flat=" ".join(str(x) for x in df.astype(str).fillna("").values.ravel()[:800])
-                        if ("每股盈餘" in flat or "Earnings per share" in flat or "營業收入" in flat or "Operating revenue" in flat):
-                            previews.append({"table_index":ti,**_df_preview(df)})
-                    item["relevant_table_previews"]=previews[:4]
-                except Exception as e:
-                    item["read_html_error"]=f"{type(e).__name__}: {e}"
-                snap=_extract_mops_ifrs_tables(text,ticker,year,quarter,report_id,str(r.url))
-                item["parser_snapshot"]=snap
-                if snap:
-                    item["parser_selected_column"]=snap.get("selected_column")
-                    item["parser_ytd_eps"]=snap.get("ytd_eps")
-            except Exception as e:
-                item["request_error"]=f"{type(e).__name__}: {e}"
-            trace["requests"].append(item)
+            snap,requests=await _request_mops_ifrs_candidates(client,ticker,year,quarter,report_id)
+            for x in requests:
+                item={"report_id":report_id,"method":x.get("method"),"request_url":x.get("url"),"request_params":x.get("params")}
+                if x.get("error"):
+                    item["request_error"]=x["error"]
+                else:
+                    r=x["response"]; text=x["text"]
+                    item.update({"http_status":r.status_code,"final_url":str(r.url),"content_type":r.headers.get("content-type"),"content_length":len(r.content),"encoding_hint":r.encoding,"decoded_preview":_safe_preview_text(text,2500)})
+                    tables=_mops_lxml_rows(text)
+                    eps,meta=_eps_from_lxml_rows(tables,quarter)
+                    item["lxml_table_count"]=len(tables); item["lxml_eps"]=eps; item["lxml_eps_meta"]=meta
+                trace["requests"].append(item)
+            if snap:
+                trace["selected"]=snap
+                break
     return trace
 
 async def fetch_mops_company_ifrs(ticker: str, year: int, quarter: int) -> list[dict[str, Any]]:
-    """Company-specific official MOPS report, avoiding incomplete aggregate feeds.
-
-    REPORT_ID C=consolidated, B=individual/standalone, A=individual legacy. We try all and
-    retain valid same-period results; downstream selection chooses the most complete row.
-    """
-    base="https://mops.twse.com.tw/server-java/t164sb01"
+    """Historical company EPS resolver using current MOPS routes and lxml parser."""
     out=[]
     headers={"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1",
              "Referer":"https://mops.twse.com.tw/mops/"}
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as client:
+    async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers=headers) as client:
         for report_id in ("C","B","A"):
-            # MOPS t164sb01 expects ROC year (e.g. 115 for 2026), not Gregorian year.
-            # Sending 2026 here silently returns no usable historical report, which prevented
-            # Q2/Q3 standalone EPS from being derived from prior-quarter YTD EPS.
-            mops_year = year - 1911 if year >= 1912 else year
-            params={"step":"1","CO_ID":ticker,"SYEAR":str(mops_year),"SSEASON":str(quarter),"REPORT_ID":report_id}
-            try:
-                r=await client.get(base,params=params)
-                if r.status_code!=200 or len(r.content)<500: continue
-                text=_decode_mops_html(r.content, r.encoding)
-                snap=_extract_mops_ifrs_tables(text,ticker,year,quarter,report_id,str(r.url))
-                if snap: out.append(snap)
-            except Exception:
-                continue
+            snap,_=await _request_mops_ifrs_candidates(client,ticker,year,quarter,report_id)
+            if snap: out.append(snap)
     return out
+
 
 
 async def fetch_tsmc_quarterly_release(year: int, quarter: int) -> dict[str, Any] | None:
     """TSMC official IR fallback. Gives a verified quarter even before MOPS aggregate refresh."""
     if quarter not in (1,2,3,4): return None
     url=f"https://investor.tsmc.com/english/quarterly-results/{year}/q{quarter}"
-    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.9"}
+    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.10"}
     try:
+        compact=""; source_url=url
         async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=headers) as client:
-            r=await client.get(url); r.raise_for_status(); text=html.unescape(re.sub(r"<[^>]+>"," ",r.text))
-        compact=" ".join(text.split())
-        # Quarterly results page reliably publishes actual gross and operating margins.
+            r=await client.get(url); r.raise_for_status(); compact=" ".join(html.unescape(re.sub(r"<[^>]+>"," ",r.text)).split())
+            # The quarterly landing page can omit EPS text. Search the official PR news index for the exact quarter.
+            if not re.search(r"(?:EPS|earnings per share).{0,40}NT\$?\s*[0-9.]+",compact,re.I):
+                nr=await client.get("https://pr.tsmc.com/english/latest-news")
+                if nr.status_code==200:
+                    news=" ".join(html.unescape(re.sub(r"<[^>]+>"," ",nr.text)).split())
+                    pat=rf"TSMC Reports {['','First','Second','Third','Fourth'][quarter]} Quarter EPS of NT\$([0-9.]+)"
+                    mm=re.search(pat,news,re.I)
+                    if mm: compact += f" EPS of NT${mm.group(1)}"; source_url="https://pr.tsmc.com/english/latest-news"
         gm=None; om=None
         mg=re.search(r"Gross Margin\s+([0-9.]+)%",compact,re.I); gm=parse_num_text(mg.group(1)) if mg else None
         mo=re.search(r"Operating Margin\s+([0-9.]+)%",compact,re.I); om=parse_num_text(mo.group(1)) if mo else None
-        # Try to catch EPS if the earnings release text is embedded/linked into the rendered page.
-        me=re.search(r"EPS(?:\s+of)?\s+NT\$\s*([0-9.]+)",compact,re.I); qeps=parse_num_text(me.group(1)) if me else None
+        me=re.search(r"(?:EPS(?:\s+of)?|earnings per share(?:\s+of)?)\s*(?:of\s*)?NT\$\s*([0-9.]+)",compact,re.I); qeps=parse_num_text(me.group(1)) if me else None
         if gm is None and om is None and qeps is None: return None
-        return {"source":"TSMC official quarterly results","market":"Company IR","endpoint":url,"official":True,
+        return {"source":"TSMC official quarterly results","market":"Company IR","endpoint":source_url,"official":True,
                 "period":f"{year} Q{quarter}","fiscal_year":year,"fiscal_quarter":quarter,"statement_date":None,
                 "feed_kind":"company_ir_quarter","company_code":"2330","quarter_eps_direct":qeps,
                 "gross_margin_direct":gm,"operating_margin_direct":om,"completeness":sum(v is not None for v in (qeps,gm,om))}
@@ -742,7 +758,7 @@ async def diagnose_official_financial_sources(ticker: str) -> dict[str, Any]:
     """
     now=datetime.now().astimezone()
     ey,eq,expected=expected_latest_financial_period(now.date())
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.9 diagnostics"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.10 diagnostics"}
     out={
         "ticker":ticker, "generated_at":now.isoformat(timespec="seconds"),
         "expected_period":expected, "expected_year":ey, "expected_quarter":eq,
@@ -1022,6 +1038,13 @@ async def fetch_official_eps_ytd_for_period(ticker: str, year: int, quarter: int
         pass
     best=_best_period_snapshot(rows,year,quarter)
     if best and best.get("ytd_eps") is not None: return best
+    # If the detailed historical endpoint changed, use official MOPS board-approved financial disclosures.
+    try:
+        mats=await fetch_mops_material_financial(ticker,year,quarter)
+        mb=_best_period_snapshot(mats,year,quarter)
+        if mb and mb.get("ytd_eps") is not None: return mb
+    except Exception:
+        pass
     # TSMC company IR may expose direct quarter EPS. Keep it as a direct-quarter fallback,
     # but never convert it to cumulative YTD here.
     if ticker=="2330":
@@ -1854,12 +1877,12 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.2.9",
+        "ticker":ticker,"version":"5.2.10",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
         "raw_period_trace_links":raw_periods,
-        "note":"V5.2.9 exposes exact historical MOPS request parameters, HTTP status, decoded response preview, table/column labels, EPS candidate numbers, and parser-selected value."
+        "note":"V5.2.10 traces current and legacy MOPS routes and parses EPS with lxml only; html5lib is not required."
     }
 
 @app.get("/api/diagnostics/eps-raw/{ticker}")
@@ -1869,4 +1892,4 @@ async def eps_raw_diagnostics(ticker: str, year: int = Query(..., ge=1990, le=21
     return await trace_mops_company_ifrs(ticker,year,quarter)
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.2.9","mode":"cloud-mobile-eps-raw-trace","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.2.10","mode":"cloud-mobile-mops-endpoint-eps-parser","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
