@@ -16,7 +16,13 @@ function lineSvg(values){
 function flowMatrix(fl){
   const rows=[['外資','foreign'],['投信','trust'],['自營商','dealer']];
   const signed=v=>v==null?'—':`${Number(v)>0?'+':''}${fmt0(v)}`;
-  return `<div class="flow-matrix"><div class="flow-head"><b>法人</b><b>1日</b><b>5日</b><b>20日</b></div>${rows.map(([label,key])=>`<div class="flow-matrix-row"><b>${label}</b>${[1,5,20].map(n=>{const v=fl[`${key}_${n}`];return `<span class="${v==null?'missing':v<0?'neg':'pos'}">${signed(v)}</span>`}).join('')}</div>`).join('')}<div class="flow-matrix-row margin-row"><b>融資%</b>${[1,5,20].map(n=>{const v=fl[`margin_${n}_pct`];return `<span class="${v==null?'missing':v>0?'neg':'pos'}">${v==null?'—':`${v>0?'+':''}${fmt(v,1)}%`}</span>`}).join('')}</div></div>`;
+  const pctRow=(label,key)=>`<div class="flow-matrix-row margin-row"><b>${label}</b>${[1,5,20].map(n=>{const v=fl[`${key}_${n}_pct`];return `<span class="${v==null?'missing':v>0?'neg':'pos'}">${v==null?'—':`${v>0?'+':''}${fmt(v,1)}%`}</span>`}).join('')}</div>`;
+  const cards=[
+    ['融資餘額',fl.margin_balance,'張'],['融券餘額',fl.short_balance,'張'],['券資比',fl.short_margin_ratio_pct,'%'],
+    ['借券餘額',fl.sbl_balance,'張'],['借券賣出餘額',fl.sbl_short_balance,'張'],['當日借券賣出',fl.sbl_short_sell,'張'],
+    ['當日還券',fl.sbl_return,'張'],['借券餘額變化',fl.sbl_balance_change,'張'],['借券賣出餘額變化',fl.sbl_short_change,'張']
+  ];
+  return `<div class="flow-matrix"><div class="flow-head"><b>法人</b><b>1日</b><b>5日</b><b>20日</b></div>${rows.map(([label,key])=>`<div class="flow-matrix-row"><b>${label}</b>${[1,5,20].map(n=>{const v=fl[`${key}_${n}`];return `<span class="${v==null?'missing':v<0?'neg':'pos'}">${signed(v)}</span>`}).join('')}</div>`).join('')}${pctRow('融資%','margin')}${pctRow('融券%','short')}</div><div class="credit-grid">${cards.map(([label,value,unit])=>`<div><span>${label}</span><b>${value==null?'—':`${fmt(value,label==='券資比'?1:0)}${unit}`}</b></div>`).join('')}</div>`;
 }
 function _techLinePoints(series,key,w,h,p,min,max){
   const vals=series.map(x=>x[key]);
@@ -158,14 +164,14 @@ function render(d){
     ? `<div class="flow-row missing"><span>${k} 20日</span><div class="flow-track"></div><b>—</b></div>`
     : `<div class="flow-row"><span>${k} 20日</span><div class="flow-track"><div class="flow-fill ${v<0?'neg':''}" style="width:${Math.abs(v)/mx*100}%"></div></div><b>${v>0?'+':''}${fmt0(v)}</b></div>`).join('');
   const direction=v=>v==null?'資料不足':Number(v)>0?'偏買超':Number(v)<0?'偏賣超':'買賣超相抵';
-  $('flowAnalysis').textContent=`法人籌碼以 1日 / 5日 / 20日三個時間尺度判讀；短線看1日、波段轉折看5日、中期方向看20日。外資20日 ${direction(fl.foreign_20)}，投信20日 ${direction(fl.trust_20)}。`;
+  $('flowAnalysis').textContent=`法人籌碼以 1日 / 5日 / 20日判讀；外資20日 ${direction(fl.foreign_20)}，投信20日 ${direction(fl.trust_20)}。融資與融券反映信用交易，借券餘額不等於放空；借券賣出餘額才較接近尚未回補的借券放空壓力。資料日 ${fl.lending_last_date||fl.margin_last_date||'—'}。`;
 
   const t=d.technical||{}; $('techPill').textContent=t.trend||'資料不足';
   $('priceChart').innerHTML=technicalDashboard(t);
   $('levels').innerHTML=[['MA20',t.ma?.['20']],['MA60',t.ma?.['60']],['第一支撐',t.support1],['60日壓力',t.resistance],['KD K',t.k],['KD D',t.d],['RSI14',t.rsi14],['MACD Hist',t.macd_hist]].map(x=>`<div class="level"><span>${x[0]}</span><b>${fmt(x[1],x[0].includes('MACD')?2:1)}</b></div>`).join('');
   $('techAnalysis').textContent=`近一年日K；MA60 為中期趨勢核心。趨勢：${t.trend||'—'}；K/D ${fmt(t.k,1)}/${fmt(t.d,1)}；MACD Hist ${fmt(t.macd_hist,2)}；RSI14 ${fmt(t.rsi14,1)}。KD >80 / <20、RSI >70 / <30 僅代表動能極端，需搭配均線與量價確認。`;
 
-  const rr=d.research||{}; $('reportCount').textContent=rr.count||0; $('consensusText').textContent=rr.median_target?`目標價中位數 ${fmt0(rr.median_target)} · 平均 ${fmt0(rr.average_target)}`:'目前尚無可解析的法人目標價共識'; $('revisionText').textContent=rr.forward_eps_year?`${rr.forward_eps_year}E EPS 中位數 ${fmt(rr.median_forward_eps,2)}（${rr.eps_coverage||0} 筆明確年度預估）`:(rr.target_revision_pct!=null?`同機構目標價修正中位數 ${pct(rr.target_revision_pct)}`:'Forward EPS：缺乏可比年度標註，不納入估值');
+  const rr=d.research||{}; $('reportCount').textContent=rr.count||0; $('consensusText').textContent=rr.median_target?`合格法人目標價中位數 ${fmt0(rr.median_target)} · ${rr.target_coverage||0} 筆去重報告`:'目前沒有符合機構身分、期限與可信度門檻的法人目標價共識'; $('revisionText').textContent=rr.forward_eps_year?`${rr.forward_eps_year}E EPS 中位數 ${fmt(rr.median_forward_eps,2)}（${rr.eps_coverage||0} 筆明確年度預估）`:`Forward EPS：缺少至少2筆可辨識機構且明確年度的預估；${rr.market_mention_count||0} 筆媒體目標價引用不納入共識`;
   if($('consensusStats')) $('consensusStats').innerHTML=[['法人機構',rr.institution_count||0],['最高目標',fmt0(rr.high_target)],['最低目標',fmt0(rr.low_target)],['買進/正向',rr.ratings?.['買進']||0],['中立',rr.ratings?.['中立']||0],['公開網路',rr.public_web_count||0]].map(x=>`<div><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
   $('analystTable').innerHTML=(rr.reports||[]).length?`<table class="clean-table analyst-web-table"><thead><tr><th>法人/券商</th><th>日期</th><th>評等</th><th>目標價</th><th>來源/標題</th><th>可信度</th></tr></thead><tbody>${rr.reports.map(x=>`<tr><td>${x.institution||'—'}</td><td>${x.report_date||'—'}</td><td>${x.rating||'—'}</td><td>${fmt0(x.target_price)}</td><td>${x.source_url?`<a href="${x.source_url}" target="_blank" rel="noopener noreferrer">${x.title||x.publisher||'查看來源'}</a>`:(x.title||x.publisher||'自行匯入')}</td><td>${x.confidence!=null?`${x.confidence}/100`:'—'}</td></tr>`).join('')}</tbody></table>`:'<div class="empty bordered">目前尚未搜尋到可解析的公開法人研究引用。可按「強制刷新」重新搜尋最新網路資料。</div>';
 
@@ -187,7 +193,8 @@ const ex=d.expectation_gap||{};
   renderSnapshotCompare(d);
 
   $('valuationBody').innerHTML=scenarios.length?scenarios.map(x=>`<tr><td>${x.name}</td><td>${fmt(x.eps,2)}</td><td>${fmt(x.pe,1)}x</td><td><b>${fmt0(x.target)}</b></td><td>${pct(x.upside_pct)}</td></tr>`).join(''):'<tr><td colspan="5">估值資料不足</td></tr>';
-  $('assumptions').innerHTML=`<div class="assumption-row"><b>EPS Basis</b><span>${d.valuation.eps_basis||'—'}</span></div><div class="assumption-row"><b>PE Basis</b><span>${d.valuation.pe_basis||'—'}</span></div><div class="assumption-row"><b>估值信心</b><span>${d.valuation.confidence||0}/100</span></div><div class="assumption-row"><b>模型原則</b><span>Bear/Base/Bull 對 EPS 與 PE 同時做情境化，而非單點預測。</span></div>`; $('peBand').innerHTML=`歷史 PER：P25 <b>${fmt(d.per?.pe_p25,1)}x</b> · Median <b>${fmt(d.per?.pe_median,1)}x</b> · P75 <b>${fmt(d.per?.pe_p75,1)}x</b>`;
+  const ac=d.valuation.analyst_consensus||{};
+  $('assumptions').innerHTML=`<div class="assumption-row"><b>目前採用</b><span>${d.valuation.selected_model==='forward_consensus'?'Forward 共識模型':'TTM／已驗證財報模型'}</span></div><div class="assumption-row"><b>TTM Basis</b><span>${d.valuation.trailing_eps_basis||'—'}</span></div><div class="assumption-row"><b>Forward Basis</b><span>${d.valuation.forward_eps_basis||'—'}</span></div><div class="assumption-row"><b>法人共識</b><span>${ac.median_target==null?'資料不足':`${fmt0(ac.median_target)} 元（${ac.coverage||0} 筆）`}</span></div><div class="assumption-row"><b>法人 vs 模型</b><span>${ac.gap_vs_model_pct==null?'無法比較':pct(ac.gap_vs_model_pct)} · ${ac.interpretation||''}</span></div><div class="assumption-row"><b>PE Basis</b><span>${d.valuation.pe_basis||'—'}</span></div><div class="assumption-row"><b>估值信心</b><span>${d.valuation.confidence||0}/100</span></div>`; $('peBand').innerHTML=`歷史 PER：P25 <b>${fmt(d.per?.pe_p25,1)}x</b> · Median <b>${fmt(d.per?.pe_median,1)}x</b> · P75 <b>${fmt(d.per?.pe_p75,1)}x</b>`;
 
   const base=scenarios.find(x=>x.name==='基準');
   $('strategyGrid').innerHTML=[

@@ -50,10 +50,12 @@
 .flow-head,.flow-matrix-row{display:grid;grid-template-columns:minmax(54px,.85fr) repeat(3,minmax(66px,1fr));gap:5px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--line);font-size:11px}
 .flow-head{background:#0a171f;color:var(--muted)}.flow-head b:not(:first-child){text-align:right}.flow-matrix-row:last-child{border-bottom:0}.flow-matrix-row span{text-align:right;font-weight:700;white-space:nowrap;min-width:0}
 .flow-matrix-row .pos{color:var(--accent)}.flow-matrix-row .neg{color:var(--red)}.flow-matrix-row .missing,.flow-row.missing{color:var(--muted)}.margin-row{background:rgba(255,255,255,.015)}
+.credit-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0 0 14px}.credit-grid>div{border:1px solid var(--line);border-radius:9px;padding:10px;background:rgba(255,255,255,.018);min-width:0}.credit-grid span{display:block;color:var(--muted);font-size:10px;margin-bottom:5px}.credit-grid b{display:block;font-size:13px;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}
 .levels{grid-template-columns:repeat(4,1fr)}
 @media(max-width:600px){
   .candle-svg{height:250px}.indicator-panel svg{height:92px}
   .flow-head,.flow-matrix-row{padding:9px 8px;font-size:10px}
+  .credit-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
   .levels{grid-template-columns:repeat(2,1fr)}
 }
 @media print{

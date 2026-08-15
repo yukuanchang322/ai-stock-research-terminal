@@ -436,6 +436,53 @@ async def fetch_twse_revenue_fallback(ticker: str) -> tuple[list[dict[str, Any]]
         return [],[f"TWSE_REVENUE: {type(exc).__name__}: {exc}"]
 
 
+def parse_twse_lending_snapshots(short_payload: dict[str, Any], borrow_payload: dict[str, Any], ticker: str, trading_date: str) -> dict[str, Any]:
+    """Normalize official share counts to lots for the dashboard."""
+    out={"lending_last_date":trading_date}
+    short_row=next((raw for raw in short_payload.get("data") or [] if raw and str(raw[0]).strip()==ticker),None)
+    if short_row and len(short_row)>=14:
+        values=[parse_num_text(v) for v in short_row]
+        out.update({
+            "sbl_short_previous":values[8]/1000 if values[8] is not None else None,
+            "sbl_short_sell":values[9]/1000 if values[9] is not None else None,
+            "sbl_short_return":values[10]/1000 if values[10] is not None else None,
+            "sbl_short_adjustment":values[11]/1000 if values[11] is not None else None,
+            "sbl_short_balance":values[12]/1000 if values[12] is not None else None,
+            "sbl_short_limit":values[13]/1000 if values[13] is not None else None,
+        })
+    borrow_row=next((raw for raw in borrow_payload.get("data") or [] if raw and str(raw[0]).strip()==ticker),None)
+    if borrow_row and len(borrow_row)>=8:
+        values=[parse_num_text(v) for v in borrow_row]
+        out.update({
+            "sbl_borrow_previous":values[2]/1000 if values[2] is not None else None,
+            "sbl_borrow":values[3]/1000 if values[3] is not None else None,
+            "sbl_return":values[4]/1000 if values[4] is not None else None,
+            "sbl_balance":values[5]/1000 if values[5] is not None else None,
+            "sbl_market_value":values[7],
+        })
+    for current,previous,key in [
+        (out.get("sbl_short_balance"),out.get("sbl_short_previous"),"sbl_short_change"),
+        (out.get("sbl_balance"),out.get("sbl_borrow_previous"),"sbl_balance_change"),
+    ]:
+        out[key]=(current-previous) if current is not None and previous is not None else None
+    return out if len(out)>1 else {}
+
+
+async def fetch_twse_lending_snapshot(ticker: str, trading_date: str) -> tuple[dict[str, Any], list[str]]:
+    compact=str(trading_date or "").replace("-","")[:8]
+    if len(compact)!=8: return {},["TWSE_LENDING: missing trading date"]
+    try:
+        async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.5"}) as client:
+            short_r,borrow_r=await asyncio.gather(
+                client.get("https://www.twse.com.tw/rwd/zh/marginTrading/TWT93U",params={"date":compact,"selectType":"ALL","response":"json"}),
+                client.get("https://www.twse.com.tw/rwd/zh/lending/TWT72U",params={"date":compact,"response":"json"}),
+            )
+            short_r.raise_for_status(); borrow_r.raise_for_status()
+        return parse_twse_lending_snapshots(short_r.json(),borrow_r.json(),ticker,trading_date),[]
+    except Exception as exc:
+        return {},[f"TWSE_LENDING: {type(exc).__name__}: {exc}"]
+
+
 
 MOPS_CSV_BASE = "https://mopsfin.twse.com.tw/opendata"
 MOPS_HISTORY_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t163sb04"
@@ -2157,6 +2204,8 @@ async def fetch_public_research(ticker: str, company_name: str) -> dict[str, Any
     for result in results:
         if isinstance(result, Exception): errors.append(type(result).__name__); continue
         for x in result:
+            identity_ok,identity_method=_company_event_identity(ticker,company_name,x.get("title") or "")
+            if not identity_ok: continue
             key=_normalize_title(x['title'])[:90]
             if not key or key in seen: continue
             seen.add(key)
@@ -2165,6 +2214,7 @@ async def fetch_public_research(ticker: str, company_name: str) -> dict[str, Any
             if not any([inst,target,rating,eps]): continue
             score=35 + (25 if inst else 0) + (25 if target else 0) + (10 if rating else 0) + (5 if eps else 0)
             rows.append({
+                "ticker":ticker,"company_name":company_name,"identity_verified":True,"identity_method":identity_method,
                 "institution":inst or "未辨識機構", "report_date":x['published_date'], "rating":rating,
                 "target_price":target, "forward_eps":eps, "eps_year":eps_year, "title":x['title'], "summary":x['snippet'][:220],
                 "publisher":x['publisher'], "source_url":x['url'], "source_type":"public_web_quote",
@@ -2179,13 +2229,26 @@ def merge_research(imported: list[dict[str, Any]], web_rows: list[dict[str, Any]
         y=dict(x); y.setdefault('source_type','manual_import'); y.setdefault('confidence',95); rows.append(y)
     rows.extend(web_rows)
     rows=sorted(rows,key=lambda x:x.get('report_date',''),reverse=True)
-    targets=[safe_num(x.get('target_price')) for x in rows if safe_num(x.get('target_price')) is not None]
+    cutoff=(date.today()-timedelta(days=365)).isoformat()
+    eligible_target_rows=[]; seen_targets=set()
+    for x in rows:
+        target=safe_num(x.get('target_price')); inst=x.get('institution'); report_date=x.get('report_date') or ''
+        if target is None or not inst or inst=='未辨識機構' or int(x.get('confidence') or 0)<70 or report_date<cutoff:
+            continue
+        key=(inst,report_date,round(target,2))
+        if key in seen_targets: continue
+        seen_targets.add(key); eligible_target_rows.append(x)
+    targets=[safe_num(x.get('target_price')) for x in eligible_target_rows]
+    market_mentions=[safe_num(x.get('target_price')) for x in rows if safe_num(x.get('target_price')) is not None and x not in eligible_target_rows]
     # Annual EPS consensus must have an explicit forecast year. Mixing quarterly/TTM/annual EPS is prohibited.
-    eps_by_year: dict[int,list[float]]={}
+    eps_by_year_inst: dict[int,dict[str,tuple[str,float]]]={}
     for x in rows:
         ep=safe_num(x.get('forward_eps')); ey=x.get('eps_year')
-        if ep is not None and isinstance(ey,int) and x.get('confidence',0)>=70:
-            eps_by_year.setdefault(ey,[]).append(ep)
+        if ep is not None and isinstance(ey,int) and x.get('confidence',0)>=70 and x.get('institution') not in (None,'未辨識機構'):
+            inst=str(x.get('institution')); report_date=str(x.get('report_date') or '')
+            current=eps_by_year_inst.setdefault(ey,{}).get(inst)
+            if current is None or report_date>current[0]: eps_by_year_inst[ey][inst]=(report_date,ep)
+    eps_by_year={year:[value for _,value in institutions_map.values()] for year,institutions_map in eps_by_year_inst.items()}
     eps_consensus={str(y):median(vals) for y,vals in sorted(eps_by_year.items()) if vals}
     current_year=date.today().year
     chosen_year=next((y for y in sorted(eps_by_year) if y>=current_year),None)
@@ -2199,7 +2262,7 @@ def merge_research(imported: list[dict[str, Any]], web_rows: list[dict[str, Any]
     by_inst={}; by_inst_eps={}
     for x in rows:
         inst=x.get('institution'); tp=safe_num(x.get('target_price')); ep=safe_num(x.get('forward_eps'))
-        if inst and inst!='未辨識機構':
+        if inst and inst!='未辨識機構' and int(x.get('confidence') or 0)>=70 and (x.get('report_date') or '')>=cutoff:
             if tp is not None: by_inst.setdefault(inst,[]).append((x.get('report_date',''),tp))
             if ep is not None: by_inst_eps.setdefault(inst,[]).append((x.get('report_date',''),ep))
     for vals in by_inst.values():
@@ -2211,9 +2274,12 @@ def merge_research(imported: list[dict[str, Any]], web_rows: list[dict[str, Any]
     return {
         "count":len(rows), "institution_count":len(institutions), "median_target":median(targets) if targets else None,
         "average_target":sum(targets)/len(targets) if targets else None, "high_target":max(targets) if targets else None, "low_target":min(targets) if targets else None,
+        "target_coverage":len(eligible_target_rows),"eligible_target_reports":eligible_target_rows,
+        "market_mention_count":len(market_mentions),"market_mention_median_target":median(market_mentions) if market_mentions else None,
         "median_forward_eps":median(epss) if epss else None, "forward_eps_year":chosen_year, "forward_eps_by_year":eps_consensus, "eps_coverage":len(epss), "target_revision_pct":median(revisions) if revisions else None, "eps_revision_pct":median(eps_revisions) if eps_revisions else None,
         "ratings":ratings, "reports":rows, "public_web_count":sum(1 for x in rows if x.get('source_type')=='public_web_quote'),
         "manual_count":sum(1 for x in rows if x.get('source_type')=='manual_import'),
+        "consensus_policy":"近12個月、可辨識機構、可信度至少70，且同機構同日期同目標價去重；未辨識媒體引用不納入法人共識。",
     }
 
 
@@ -2433,7 +2499,7 @@ def calc_technical(prices: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]]) -> dict[str, Any]:
+def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]], lending: dict[str, Any] | None=None) -> dict[str, Any]:
     df=pd.DataFrame(rows)
     result: dict[str,Any]={}
     if not df.empty:
@@ -2464,6 +2530,8 @@ def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]]) -> 
     mdf=pd.DataFrame(margin_rows)
     if not mdf.empty and "MarginPurchaseTodayBalance" in mdf.columns:
         mdf["MarginPurchaseTodayBalance"]=pd.to_numeric(mdf["MarginPurchaseTodayBalance"],errors="coerce")
+        if "ShortSaleTodayBalance" in mdf.columns:
+            mdf["ShortSaleTodayBalance"]=pd.to_numeric(mdf["ShortSaleTodayBalance"],errors="coerce")
         mdf=mdf.sort_values("date").dropna(subset=["MarginPurchaseTodayBalance"])
         if not mdf.empty:
             latest=float(mdf.iloc[-1]["MarginPurchaseTodayBalance"])
@@ -2477,6 +2545,18 @@ def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]]) -> 
                 "margin_1_pct":balance_change(1),"margin_5_pct":balance_change(5),"margin_20_pct":balance_change(20),
                 "margin_last_date":str(mdf.iloc[-1]["date"])
             })
+            if "ShortSaleTodayBalance" in mdf.columns:
+                short_df=mdf.dropna(subset=["ShortSaleTodayBalance"])
+                if not short_df.empty:
+                    short_latest=float(short_df.iloc[-1]["ShortSaleTodayBalance"])
+                    def short_change(n:int):
+                        if len(short_df)<2: return None
+                        prior=float(short_df.iloc[max(0,len(short_df)-1-n)]["ShortSaleTodayBalance"])
+                        return ((short_latest/prior)-1)*100 if prior else None
+                    result.update({"short_balance":short_latest,"short_1_pct":short_change(1),"short_5_pct":short_change(5),"short_20_pct":short_change(20),
+                                   "short_margin_ratio_pct":(short_latest/latest*100) if latest else None})
+    if lending:
+        result.update(lending)
     return result
 
 
@@ -2583,22 +2663,40 @@ def model_valuation(price: float | None, perdata: dict[str, Any], eps_stack: dic
     ttm=safe_num(eps_stack.get("ttm_eps")) if allow_financial else None
     ytd=safe_num(eps_stack.get("ytd_eps")) if allow_financial else None
     q=eps_stack.get("quarter_period")
-    if consensus_eps and coverage >= 2:
-        anchor_eps=consensus_eps; eps_basis=f"{research.get('forward_eps_year') or 'Forward'}E EPS 中位數（{coverage} 筆明確年度可比預估）"; eps_conf=82
-    elif ttm and ttm>0:
-        anchor_eps=ttm; eps_basis=f"TTM EPS {ttm:.2f}（截至 {q or 'latest'}；不使用單季×4）"; eps_conf=78
+    trailing_eps=None; trailing_basis="資料不足"; trailing_conf=0
+    if ttm and ttm>0:
+        trailing_eps=ttm; trailing_basis=f"TTM EPS {ttm:.2f}（截至 {q or 'latest'}；不使用單季×4）"; trailing_conf=78
     elif ytd and ytd>0:
-        anchor_eps=ytd; eps_basis=f"YTD EPS {ytd:.2f}（資料不足以形成 TTM，暫不年化單季）"; eps_conf=48
+        trailing_eps=ytd; trailing_basis=f"YTD EPS {ytd:.2f}（資料不足以形成 TTM，暫不年化單季）"; trailing_conf=48
     elif perdata.get("per") and perdata["per"]>0 and allow_financial:
-        anchor_eps=price/perdata["per"]; eps_basis="由現價 / 市場 PER 反推 TTM EPS（降級模型）"; eps_conf=32
-    else: return {"scenarios": [], "eps_basis":"資料不足", "confidence":0}
+        trailing_eps=price/perdata["per"]; trailing_basis="由現價 / 市場 PER 反推 TTM EPS（降級模型）"; trailing_conf=32
+    forward_eps=consensus_eps if consensus_eps and coverage>=2 else None
+    forward_basis=f"{research.get('forward_eps_year')}E EPS 中位數（{coverage} 筆獨立可比預估）" if forward_eps else "缺少至少2筆可辨識機構、明確年度的 Forward EPS"
+    if forward_eps:
+        anchor_eps=forward_eps; eps_basis=forward_basis; eps_conf=82; selected_model="forward_consensus"
+    elif trailing_eps:
+        anchor_eps=trailing_eps; eps_basis=trailing_basis; eps_conf=trailing_conf; selected_model="trailing"
+    else: return {"scenarios": [], "eps_basis":"資料不足", "confidence":0,"selected_model":"none"}
     if perdata.get("pe_median"):
         bear_pe=max(5.0,perdata["pe_p25"]); base_pe=perdata["pe_median"]; bull_pe=min(150.0,perdata["pe_p75"]); pe_basis=f"近年歷史 PER 分位數（樣本 {perdata.get('sample_count',0)} 日）"; pe_conf=85
     else:
         center=perdata.get("per") if perdata.get("per") and 5<=perdata["per"]<=120 else 20.0; bear_pe,base_pe,bull_pe=max(8.0,center*.8),center,min(150.0,center*1.2); pe_basis="目前 PER ±20%（歷史樣本不足降級模型）"; pe_conf=50
-    scenarios=[{"name":"悲觀","eps":anchor_eps*.90,"pe":bear_pe},{"name":"基準","eps":anchor_eps,"pe":base_pe},{"name":"樂觀","eps":anchor_eps*1.10,"pe":bull_pe}]
-    for x in scenarios: x["target"]=x["eps"]*x["pe"]; x["upside_pct"]=(x["target"]/price-1)*100
-    return {"eps_basis":eps_basis,"pe_basis":pe_basis,"confidence":round((eps_conf+pe_conf)/2),"anchor_eps":anchor_eps,"scenarios":scenarios}
+    def scenarios_for(eps: float | None):
+        if not eps: return []
+        values=[{"name":"悲觀","eps":eps*.90,"pe":bear_pe},{"name":"基準","eps":eps,"pe":base_pe},{"name":"樂觀","eps":eps*1.10,"pe":bull_pe}]
+        for item in values:
+            item["target"]=item["eps"]*item["pe"]; item["upside_pct"]=(item["target"]/price-1)*100
+        return values
+    trailing_scenarios=scenarios_for(trailing_eps); forward_scenarios=scenarios_for(forward_eps)
+    scenarios=forward_scenarios or trailing_scenarios
+    base=next((x for x in scenarios if x["name"]=="基準"),None)
+    analyst_target=safe_num(research.get("median_target")); analyst_coverage=int(research.get("target_coverage") or 0)
+    gap_pct=((analyst_target/base["target"])-1)*100 if analyst_target is not None and base and base.get("target") else None
+    return {"eps_basis":eps_basis,"trailing_eps_basis":trailing_basis,"forward_eps_basis":forward_basis,"pe_basis":pe_basis,
+            "confidence":round((eps_conf+pe_conf)/2),"anchor_eps":anchor_eps,"selected_model":selected_model,"scenarios":scenarios,
+            "trailing_scenarios":trailing_scenarios,"forward_scenarios":forward_scenarios,
+            "analyst_consensus":{"median_target":analyst_target,"coverage":analyst_coverage,"gap_vs_model_pct":gap_pct,
+              "interpretation":"法人目標價反映未來盈餘與研究假設；模型採可驗證 EPS 與歷史 PER，兩者不強制收斂。"}}
 
 
 def scores(technical: dict[str, Any], revenue: dict[str, Any], flow: dict[str, Any], perdata: dict[str, Any], financial: dict[str, Any], research: dict[str, Any]) -> dict[str, int]:
@@ -2811,7 +2909,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
                      "finmind_available":False,"finmind_price_available":False,"official_price_fallback_success":False,
                      "twse_fallback_success":False,"tpex_fallback_success":False,"price_rows":0,"latest_price_date":None,
                      "institutional_provider":None,"margin_provider":None,"revenue_provider":None,
-                     "supplemental_fallback_datasets":[]}
+                     "lending_provider":None,"supplemental_fallback_datasets":[]}
     async def grab(dataset: str, days: int):
         last_error=None
         for attempt in range(2):
@@ -2879,6 +2977,13 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         if not rev and official_revenue:
             rev=official_revenue; provider_status["revenue_provider"]="TWSE/MOPS t187ap05_L"; provider_status["supplemental_fallback_datasets"].append("revenue")
 
+    lending={}
+    if info.get("type")=="上市" and prices:
+        lending,lending_errors=await fetch_twse_lending_snapshot(ticker,str(prices[-1].get("date") or ""))
+        provider_status["fallback_errors"].extend(lending_errors)
+        if lending:
+            provider_status["lending_provider"]="TWSE TWT93U / TWT72U"
+
     def calculate(label: str, fn, *args):
         try:
             return fn(*args)
@@ -2887,7 +2992,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
             return {}
 
     tech=calculate("Technical",calc_technical,prices)
-    flow=calculate("InstitutionalOrMargin",calc_flow,inst,margin)
+    flow=calculate("InstitutionalOrMargin",calc_flow,inst,margin,lending)
     revenue=calculate("MonthRevenue",calc_revenue,rev)
     perdata=calculate("PER",calc_per,pers)
     financial=calculate("FinancialStatements",calc_financials,fin)
@@ -2945,6 +3050,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         {"name":"股價","dataset":provider_status.get("price_provider") or "TaiwanStockPrice / TWSE STOCK_DAY / TPEx tradingStock","as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日收盤後"},
         {"name":"三大法人","dataset":provider_status.get("institutional_provider") or "FinMind / TWSE T86","as_of":flow.get("last_date"),"status":"ok" if flow.get("last_date") else "missing","scheduled_update":"交易日約 20:00"},
         {"name":"融資融券","dataset":provider_status.get("margin_provider") or "FinMind / TWSE MI_MARGN","as_of":flow.get("margin_last_date"),"status":"ok" if flow.get("margin_last_date") else "missing","scheduled_update":"交易日約 21:00"},
+        {"name":"借券／借券賣出","dataset":provider_status.get("lending_provider") or "TWSE TWT72U / TWT93U","as_of":flow.get("lending_last_date"),"status":"ok" if flow.get("sbl_balance") is not None or flow.get("sbl_short_balance") is not None else "missing","scheduled_update":"交易日約 20:30–23:30"},
         {"name":"月營收","dataset":provider_status.get("revenue_provider") or "FinMind / TWSE MOPS t187ap05_L","as_of":revenue.get("last_date") or revenue.get("revenue_period"),"status":"ok" if revenue else "missing","scheduled_update":"依公司公告"},
         {"name":"PER/PBR","dataset":"TaiwanStockPER","as_of":perdata.get("last_date"),"status":"ok" if perdata else "missing","scheduled_update":"交易日約 18:00"},
         {"name":"財務報表","dataset":financial.get("source") or "FinMind TaiwanStockFinancialStatements","as_of":financial.get("period") or financial.get("statement_date"),"status":"ok" if financial_integrity.get("official_verified") else "stale","scheduled_update":"僅官方最新季度驗證通過才標示 OK"},
@@ -2954,13 +3060,14 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     ]
     source_status.append({"name":"Evidence Engine","dataset":"Multi-Source Evidence Schema v1","as_of":evidence_graph.get("generated_at"),"status":"ok" if evidence_graph.get("summary",{}).get("usable") else "missing","scheduled_update":f"Fact {evidence_graph.get('summary',{}).get('facts',0)} / Derived {evidence_graph.get('summary',{}).get('derived_facts',0)} / Conflicts {evidence_graph.get('summary',{}).get('conflicts',0)}"})
     conf=calc_confidence(source_status,valuation,research)
-    core_supplemental_complete=bool(flow.get("last_date") and flow.get("margin_last_date") and revenue)
+    lending_complete=info.get("type")!="上市" or flow.get("sbl_balance") is not None or flow.get("sbl_short_balance") is not None
+    core_supplemental_complete=bool(flow.get("last_date") and flow.get("margin_last_date") and revenue and lending_complete)
     result_cache_ttl=CACHE_TTL if core_supplemental_complete else min(CACHE_TTL,60)
     data={"ticker":ticker,"name":info.get("stock_name") or ticker,"industry":info.get("industry_category") or "—","market_type":info.get("type") or "—",
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
           "source_status":source_status,"evidence_graph":evidence_graph,"errors":errors,"provider_status":provider_status,"cache":{"hit":False,"ttl_seconds":result_cache_ttl,"complete":core_supplemental_complete},"web_research_meta":web_research,"company_events":company_events,
-          "data_policy":"V5.3.5 Provider Fallback：FinMind 保留為結構化資料來源；上市股票的行情、公司資料、三大法人、融資融券或月營收缺失時改用 TWSE／MOPS 官方資料，各區塊失敗彼此隔離，缺值不視為 0。"}
+          "data_policy":"V5.3.5 Provider Fallback：FinMind 保留為結構化來源；上市股票以 TWSE 補行情、法人、融資融券、借券及月營收。法人目標價僅採近12個月、可辨識機構且通過可信度門檻的去重資料；媒體引用與模型估值分開呈現。"}
     _CACHE[ticker]=(time.time(),data)
     return data
 
@@ -2983,10 +3090,10 @@ def report_html(d: dict[str, Any]) -> str:
     <div class='cols'><div><b>主要催化劑</b><ul>{cats}</ul></div><div><b>主要風險</b><ul>{risks}</ul></div></div>
     <h2>2. Expectation Gap & Revision Radar</h2><div class='call'><b>{esc(exp.get('regime'))}</b><br>{esc(exp.get('summary'))}</div><div class='grid'><div class='card'>預期修正分數<b>{exp.get('revision_score','—')}/100</b></div><div class='card'>EPS 修正<b>{pct(research.get('eps_revision_pct'))}</b></div><div class='card'>目標價修正<b>{pct(research.get('target_revision_pct'))}</b></div><div class='card'>估值區域<b style='font-size:10pt'>{esc(exp.get('valuation_zone'))}</b></div></div><table><tr><th>法人</th><th>前次 → 最新</th><th>EPS 修正</th><th>目標價修正</th><th>最新目標</th></tr>{erows}</table><p class='small muted'>{esc(exp.get('methodology'))}</p>
     <h2>3. Fundamentals & EPS Integrity</h2><table><tr><th>最新月營收</th><th>YoY</th><th>單季 EPS</th><th>YTD EPS</th><th>TTM EPS</th><th>財報期間</th></tr><tr><td>{nfmt(rev.get('latest_revenue'),0)}</td><td>{pct(rev.get('revenue_yoy'))}</td><td>{nfmt(d.get('eps_stack',{}).get('quarter_eps'),2)}</td><td>{nfmt(d.get('eps_stack',{}).get('ytd_eps'),2)}</td><td>{nfmt(d.get('eps_stack',{}).get('ttm_eps'),2)}</td><td>{esc(fin.get('period') or fin.get('statement_date'))}</td></tr></table><p class='small muted'>{esc(d.get('eps_stack',{}).get('note'))}</p>
-    <h2>4. Positioning & Technicals</h2><table><tr><th>外資20日</th><th>投信20日</th><th>融資20日</th><th>趨勢</th><th>RSI14</th><th>量比</th><th>支撐 / 壓力</th></tr><tr><td>{nfmt(flow.get('foreign_20'),0)}</td><td>{nfmt(flow.get('trust_20'),0)}</td><td>{pct(flow.get('margin_20_pct'))}</td><td>{esc(tech.get('trend'))}</td><td>{nfmt(tech.get('rsi14'),1)}</td><td>{nfmt(tech.get('volume_ratio_20'),2)}x</td><td>{nfmt(tech.get('support1'),1)} / {nfmt(tech.get('resistance'),1)}</td></tr></table>
+    <h2>4. Positioning & Technicals</h2><table><tr><th>外資20日</th><th>投信20日</th><th>融資餘額</th><th>融券餘額</th><th>券資比</th><th>借券餘額</th><th>借券賣出餘額</th></tr><tr><td>{nfmt(flow.get('foreign_20'),0)}</td><td>{nfmt(flow.get('trust_20'),0)}</td><td>{nfmt(flow.get('margin_balance'),0)} 張</td><td>{nfmt(flow.get('short_balance'),0)} 張</td><td>{pct(flow.get('short_margin_ratio_pct'))}</td><td>{nfmt(flow.get('sbl_balance'),0)} 張</td><td>{nfmt(flow.get('sbl_short_balance'),0)} 張</td></tr></table><p class='small muted'>借券餘額不等於放空；借券賣出餘額較接近尚未回補的借券放空部位。資料日 {esc(flow.get('lending_last_date') or flow.get('margin_last_date'))}。</p>
     <div class='page-break'></div><h2>5. Analyst Research & Revisions</h2><p>匯入報告數：<b>{research.get('count',0)}</b> ｜ Forward EPS 修正：<b>{pct(research.get('eps_revision_pct'))}</b></p><table><tr><th>法人/券商</th><th>日期</th><th>評等</th><th>目標價</th><th>Forward EPS</th></tr>{rrows}</table><p class='small muted'>本區彙整公開網路可取得之研究引用與使用者匯入資料；僅保存標題、摘要、數值、發布者與來源連結，不重製付費研究全文。</p>
     <h2>6. Company Events & Earnings-call Radar</h2><table><tr><th>日期</th><th>事件</th><th>發布者</th></tr>{''.join(f"<tr><td>{esc(x.get('date'))}</td><td>{esc(x.get('title'))}</td><td>{esc(x.get('publisher'))}</td></tr>" for x in d.get('company_events',{{}}).get('rows',[])[:8]) or "<tr><td colspan='3'>目前未搜尋到公司事件引用。</td></tr>"}</table>
-    <h2>7. Valuation Framework</h2><p>EPS：{esc(val.get('eps_basis'))}<br>PE：{esc(val.get('pe_basis'))}</p><table><tr><th>情境</th><th>EPS</th><th>合理 PE</th><th>模型合理價</th><th>相對現價</th></tr>{scenarios}</table>
+    <h2>7. Valuation Framework</h2><p>目前採用：{esc(val.get('selected_model'))}<br>TTM：{esc(val.get('trailing_eps_basis'))}<br>Forward：{esc(val.get('forward_eps_basis'))}<br>法人共識：{nfmt(val.get('analyst_consensus',{{}}).get('median_target'),0)}（{val.get('analyst_consensus',{{}}).get('coverage',0)} 筆）<br>法人相對模型差距：{pct(val.get('analyst_consensus',{{}}).get('gap_vs_model_pct'))}<br>PE：{esc(val.get('pe_basis'))}</p><table><tr><th>情境</th><th>EPS</th><th>合理 PE</th><th>模型合理價</th><th>相對現價</th></tr>{scenarios}</table>
     <p class='small muted'>歷史 PER：P25 {nfmt(per.get('pe_p25'),1)}x / Median {nfmt(per.get('pe_median'),1)}x / P75 {nfmt(per.get('pe_p75'),1)}x；模型合理價與法人目標價分開呈現。</p>
     <h2>8. Data Lineage & Freshness</h2><table><tr><th>資料</th><th>Dataset</th><th>截至</th><th>預定更新</th><th>狀態</th></tr>{src}</table>
     <div class='warn'><b>重要揭露</b><br>本報告為研究與資訊整理工具，不構成個人化投資建議、招攬或收益保證。模型估值對 EPS 與估值倍數高度敏感；請以每列資料截至日與來源為準。</div>
@@ -3045,7 +3152,7 @@ def write_report_pdf(d: dict[str, Any], output_path: Path) -> None:
     story.extend([para("2. 基本面與 EPS",section),table([["項目","數值","期間／來源"],["最新月營收",nfmt(revenue.get("latest_revenue"),0),revenue.get("revenue_period") or revenue.get("last_date")],["營收 YoY",pct(revenue.get("revenue_yoy")),revenue.get("revenue_period")],["單季 EPS",nfmt(eps.get("quarter_eps"),2),eps.get("quarter_period")],["YTD EPS",nfmt(eps.get("ytd_eps"),2),eps.get("quarter_period")],["TTM EPS",nfmt(eps.get("ttm_eps"),2),financial.get("source")]], [48*mm,42*mm,75*mm])])
 
     tech=d.get("technical") or {}; flow=d.get("flow") or {}
-    story.extend([para("3. 籌碼與技術",section),table([["指標","1日","5日","20日"],["外資",nfmt(flow.get("foreign_1"),0),nfmt(flow.get("foreign_5"),0),nfmt(flow.get("foreign_20"),0)],["投信",nfmt(flow.get("trust_1"),0),nfmt(flow.get("trust_5"),0),nfmt(flow.get("trust_20"),0)],["自營商",nfmt(flow.get("dealer_1"),0),nfmt(flow.get("dealer_5"),0),nfmt(flow.get("dealer_20"),0)],["融資變化",pct(flow.get("margin_1_pct")),pct(flow.get("margin_5_pct")),pct(flow.get("margin_20_pct"))]],[42*mm,41*mm,41*mm,41*mm]),Spacer(1,3*mm),table([["趨勢","MA20","MA60","RSI14","支撐","壓力"],[tech.get("trend"),nfmt((tech.get("ma") or {}).get(20) or (tech.get("ma") or {}).get("20"),1),nfmt((tech.get("ma") or {}).get(60) or (tech.get("ma") or {}).get("60"),1),nfmt(tech.get("rsi14"),1),nfmt(tech.get("support1"),1),nfmt(tech.get("resistance"),1)]],[27.5*mm]*6)])
+    story.extend([para("3. 籌碼與技術",section),table([["指標","1日","5日","20日"],["外資",nfmt(flow.get("foreign_1"),0),nfmt(flow.get("foreign_5"),0),nfmt(flow.get("foreign_20"),0)],["投信",nfmt(flow.get("trust_1"),0),nfmt(flow.get("trust_5"),0),nfmt(flow.get("trust_20"),0)],["自營商",nfmt(flow.get("dealer_1"),0),nfmt(flow.get("dealer_5"),0),nfmt(flow.get("dealer_20"),0)],["融資變化",pct(flow.get("margin_1_pct")),pct(flow.get("margin_5_pct")),pct(flow.get("margin_20_pct"))],["融券變化",pct(flow.get("short_1_pct")),pct(flow.get("short_5_pct")),pct(flow.get("short_20_pct"))]],[42*mm,41*mm,41*mm,41*mm]),Spacer(1,3*mm),table([["融資餘額","融券餘額","券資比","借券餘額","借券賣出餘額"],[nfmt(flow.get("margin_balance"),0),nfmt(flow.get("short_balance"),0),pct(flow.get("short_margin_ratio_pct")),nfmt(flow.get("sbl_balance"),0),nfmt(flow.get("sbl_short_balance"),0)]],[33*mm]*5),Spacer(1,3*mm),table([["趨勢","MA20","MA60","RSI14","支撐","壓力"],[tech.get("trend"),nfmt((tech.get("ma") or {}).get(20) or (tech.get("ma") or {}).get("20"),1),nfmt((tech.get("ma") or {}).get(60) or (tech.get("ma") or {}).get("60"),1),nfmt(tech.get("rsi14"),1),nfmt(tech.get("support1"),1),nfmt(tech.get("resistance"),1)]],[27.5*mm]*6)])
 
     story.append(PageBreak())
     research=d.get("research") or {}; reports=research.get("reports") or []
@@ -3056,6 +3163,8 @@ def write_report_pdf(d: dict[str, Any], output_path: Path) -> None:
     story.append(para("5. 估值情境",section))
     scenario_rows=[["情境","EPS","PE","模型合理價","相對現價"]]+[[s.get("name"),nfmt(s.get("eps"),2),f"{nfmt(s.get('pe'),1)}x",nfmt(s.get("target"),0),pct(s.get("upside_pct"))] for s in scenarios]
     story.append(table(scenario_rows if len(scenario_rows)>1 else [["情境","EPS","PE","模型合理價","相對現價"],["資料不足","-","-","-","-"]],[34*mm,30*mm,30*mm,37*mm,34*mm]))
+    analyst=valuation.get("analyst_consensus") or {}
+    story.append(para(f"TTM：{valuation.get('trailing_eps_basis') or '-'}；Forward：{valuation.get('forward_eps_basis') or '-'}；合格法人共識：{nfmt(analyst.get('median_target'),0)} 元（{analyst.get('coverage',0)} 筆）；法人相對模型差距：{pct(analyst.get('gap_vs_model_pct'))}。模型與法人假設分開呈現，不強制收斂。",small))
     story.append(para("6. 資料來源與新鮮度",section))
     source_rows=[["資料","Provider / Dataset","截至","狀態"]]+[[s.get("name"),s.get("dataset"),s.get("as_of"),"OK" if s.get("status")=="ok" else "缺資料"] for s in d.get("source_status",[])]
     story.append(table(source_rows,[30*mm,72*mm,40*mm,23*mm]))
