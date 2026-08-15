@@ -75,13 +75,24 @@
         </div>
         <div>
           <div class="section-title"><div><span>05</span><h3>法人研究共識</h3></div><div class="pill positive">Public Web Research</div></div>
-          <div class="panel"><div id="analystTable"></div><div class="consensus-box"><span>公開研究引用數</span><b id="reportCount"></b><small id="consensusText"></small><small id="revisionText"></small></div><div id="consensusStats" class="consensus-stats"></div><p class="analysis">V5.3.3 以 Multi-Source Evidence Engine 將 Fact、Derived Fact、Analysis 分層；法人研究保留來源與日期，來源衝突會揭露而不靜默平均。</p></div>
+          <div class="panel"><div id="analystTable"></div><div class="consensus-box"><span>公開研究引用數</span><b id="reportCount"></b><small id="consensusText"></small><small id="revisionText"></small></div><div id="consensusStats" class="consensus-stats"></div><p class="analysis">V5.3.4 以 Multi-Source Evidence Engine 將 Fact、Derived Fact、Analysis 分層；法人研究保留來源與日期，來源衝突會揭露而不靜默平均。</p></div>
         </div>
       </section>
 
-      <section class="section">
-        <div class="section-title"><div><span>06</span><h3>法說與重大訊息雷達</h3></div><div class="pill positive">Company Event Radar</div></div>
-        <div class="panel"><div id="eventRadar"></div><p class="analysis">聚合公司法說、財報、營收、展望、接單與重大訊息的公開網路引用；每筆保留日期、發布者與來源連結。</p></div>
+      <section class="section company-disclosure-section">
+        <div class="section-title"><div><span>06</span><h3>法說會與重大訊息</h3></div><div class="pill positive">Company Disclosure</div></div>
+        <div class="disclosure-grid">
+          <div class="panel earnings-panel">
+            <div class="subsection-head"><div><h4>最近三次法說會</h4><small>Latest 3 Earnings Calls</small></div><span id="earningsCallCount">0</span></div>
+            <div id="earningsCallList"></div>
+            <p class="analysis">每次法說整理日期、主題、公開摘要與管理層展望；保留原始來源連結。摘要不等同完整逐字稿。</p>
+          </div>
+          <div class="panel material-panel">
+            <div class="subsection-head"><div><h4>重大訊息</h4><small>Material Information</small></div><span id="materialInfoCount">0</span></div>
+            <div id="materialInfoList"></div>
+            <p class="analysis">重大訊息與法說分開呈現，依日期由新到舊列出；重大財務、董事會與公司事件優先。</p>
+          </div>
+        </div>
       </section>
 
       <section class="section expectation-section">

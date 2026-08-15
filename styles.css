@@ -60,3 +60,17 @@
   .technical-dashboard{gap:6px}.candle-svg{height:230px}.indicator-panel svg{height:75px}
   .indicator-panel{background:#f5f8fa;border-color:#d8e0e5}
 }
+
+.disclosure-grid{display:grid;grid-template-columns:1.25fr .9fr;gap:14px}
+.subsection-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.subsection-head h4{margin:0}.subsection-head small{color:var(--muted);font-size:9px}.subsection-head>span{background:rgba(76,224,179,.12);color:var(--accent);border:1px solid rgba(76,224,179,.35);border-radius:999px;padding:5px 10px;font-weight:800}
+#earningsCallList{display:grid;gap:12px}.earnings-call-card{border:1px solid var(--line);background:#091720;border-radius:12px;padding:14px}
+.earnings-call-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.earnings-call-head small{display:block;color:var(--accent);font-size:9px;margin-bottom:5px}
+.earnings-call-head a{font-weight:800;color:#fff;text-decoration:none;line-height:1.45}.earnings-call-head a:hover{text-decoration:underline}
+.call-summary,.call-outlook{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}.call-summary b,.call-outlook b{font-size:11px}.call-summary ul,.call-outlook ul{margin:7px 0 0;padding-left:18px;color:#c8d5dc;font-size:11px;line-height:1.6}
+.call-outlook{background:rgba(240,199,102,.04);padding:10px;border-radius:8px;border-top:0}.call-outlook b{color:var(--amber)}
+.call-source{display:flex;justify-content:space-between;color:var(--muted);font-size:9px;margin-top:10px}
+#materialInfoList{display:grid;gap:10px;max-height:650px;overflow:auto}.material-info-item{display:grid;grid-template-columns:92px 1fr;gap:10px;padding:12px;border:1px solid var(--line);border-radius:10px;background:#091720}
+.material-info-item time{font-size:10px;color:var(--accent)}.material-info-item a{color:#fff;font-weight:700;text-decoration:none;font-size:12px;line-height:1.4}.material-info-item p{color:var(--muted);font-size:10px;line-height:1.5;margin:6px 0}.material-info-item small{color:var(--muted)}
+@media(max-width:900px){.disclosure-grid{grid-template-columns:1fr}.material-info-item{grid-template-columns:1fr}.earnings-call-head{display:block}.earnings-call-head .event-tags{margin-top:7px}}
+@media print{.disclosure-grid{grid-template-columns:1fr}.earnings-call-card,.material-info-item{background:#fff;border-color:#d8e0e5}.earnings-call-head a,.material-info-item a{color:#17242d}.call-summary ul,.call-outlook ul{color:#53636d}#materialInfoList{max-height:none;overflow:visible}}

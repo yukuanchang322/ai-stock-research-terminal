@@ -87,6 +87,21 @@ function renderSnapshotCompare(d){
   localStorage.setItem(key,JSON.stringify(now));
 }
 
+
+function eventTags(tags){return `<div class="event-tags">${(tags||[]).map(t=>`<span>${t}</span>`).join('')}</div>`}
+function earningsCallCard(x,index){
+  const bullets=(x.summary_bullets||[]).slice(0,4);
+  const outlook=(x.management_outlook||[]).slice(0,2);
+  return `<article class="earnings-call-card">
+    <div class="earnings-call-head"><div><small>第 ${index+1} 筆 · ${x.date||'—'}</small><a href="${x.source_url||'#'}" target="_blank" rel="noopener noreferrer">${x.title||'法人說明會'}</a></div>${eventTags(x.tags)}</div>
+    <div class="call-summary"><b>內容摘要</b>${bullets.length?`<ul>${bullets.map(b=>`<li>${b}</li>`).join('')}</ul>`:'<p>公開摘要不足，請開啟原始來源。</p>'}</div>
+    ${outlook.length?`<div class="call-outlook"><b>管理層展望 / 市場重點</b><ul>${outlook.map(b=>`<li>${b}</li>`).join('')}</ul></div>`:''}
+    <div class="call-source"><span>${x.publisher||'公開來源'}</span><small>公開標題/摘要整理</small></div>
+  </article>`;
+}
+function materialInfoCard(x){
+  return `<article class="material-info-item"><div><time>${x.date||'—'}</time>${eventTags(x.tags)}</div><div><a href="${x.source_url||'#'}" target="_blank" rel="noopener noreferrer">${x.title||'—'}</a><p>${x.summary||''}</p><small>${x.publisher||'公開來源'}</small></div></article>`;
+}
 function render(d){
   currentTicker=d.ticker;
   $('report').classList.remove('hidden'); $('pdfBtn').disabled=false;
@@ -143,9 +158,15 @@ function render(d){
   if($('consensusStats')) $('consensusStats').innerHTML=[['法人機構',rr.institution_count||0],['最高目標',fmt0(rr.high_target)],['最低目標',fmt0(rr.low_target)],['買進/正向',rr.ratings?.['買進']||0],['中立',rr.ratings?.['中立']||0],['公開網路',rr.public_web_count||0]].map(x=>`<div><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
   $('analystTable').innerHTML=(rr.reports||[]).length?`<table class="clean-table analyst-web-table"><thead><tr><th>法人/券商</th><th>日期</th><th>評等</th><th>目標價</th><th>來源/標題</th><th>可信度</th></tr></thead><tbody>${rr.reports.map(x=>`<tr><td>${x.institution||'—'}</td><td>${x.report_date||'—'}</td><td>${x.rating||'—'}</td><td>${fmt0(x.target_price)}</td><td>${x.source_url?`<a href="${x.source_url}" target="_blank" rel="noopener noreferrer">${x.title||x.publisher||'查看來源'}</a>`:(x.title||x.publisher||'自行匯入')}</td><td>${x.confidence!=null?`${x.confidence}/100`:'—'}</td></tr>`).join('')}</tbody></table>`:'<div class="empty bordered">目前尚未搜尋到可解析的公開法人研究引用。可按「強制刷新」重新搜尋最新網路資料。</div>';
 
-  const ev=d.company_events?.rows||[]; if($('eventRadar')) $('eventRadar').innerHTML=ev.length?`<div class="event-list">${ev.map(x=>`<article class="event-item"><div><time>${x.date||'—'}</time><div class="event-tags">${(x.tags||[]).map(t=>`<span>${t}</span>`).join('')}</div></div><div><a href="${x.source_url||'#'}" target="_blank" rel="noopener noreferrer">${x.title||'—'}</a><small>${x.publisher||'公開來源'}</small></div></article>`).join('')}</div>`:'<div class="empty bordered">目前尚未搜尋到近期法說或重大訊息引用。</div>';
+  const ce=d.company_events||{};
+  const calls=(ce.earnings_calls||[]).slice(0,3);
+  const material=(ce.material_info||[]);
+  if($('earningsCallCount')) $('earningsCallCount').textContent=calls.length;
+  if($('materialInfoCount')) $('materialInfoCount').textContent=material.length;
+  if($('earningsCallList')) $('earningsCallList').innerHTML=calls.length?calls.map(earningsCallCard).join(''):'<div class="empty bordered">目前尚未取得最近法說會的公開摘要。</div>';
+  if($('materialInfoList')) $('materialInfoList').innerHTML=material.length?material.map(materialInfoCard).join(''):'<div class="empty bordered">目前沒有可辨識的近期重大訊息。</div>';
 
-  const ex=d.expectation_gap||{};
+const ex=d.expectation_gap||{};
   if($('expectationRegime')) $('expectationRegime').textContent=ex.regime||'資料不足';
   if($('expectationSummary')) $('expectationSummary').textContent=ex.summary||'目前無法形成預期差判斷。';
   if($('revisionScore')) $('revisionScore').textContent=ex.revision_score??'—';

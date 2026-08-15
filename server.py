@@ -39,7 +39,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.3.3")
+app = FastAPI(title="AI Stock Research Terminal", version="5.3.4")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -1455,7 +1455,7 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             "missing_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")!="usable"],
             "policy":"official_registry_then_company_ir_then_official_disclosure; no third-party EPS for official derivation",
         },
-        "evidence_ledger_version":"5.3.3",
+        "evidence_ledger_version":"5.3.4",
         "blocked_mops_html_removed":True,
         "note":"V5.3.1 Evidence Engine EPS takeover：歷史季度優先讀取可稽核的公司官方 Registry，再以公司 IR/官方揭露補抓。Registry 每筆保留官方來源 URL；缺資料才留白，第三方 EPS 不參與官方推導。"
     }
@@ -1546,22 +1546,100 @@ async def google_news_rss(query: str) -> list[dict[str, Any]]:
     return out
 
 async def fetch_company_events(ticker: str, company_name: str) -> dict[str, Any]:
-    queries=[f'"{company_name}" {ticker} 法說 展望', f'"{company_name}" {ticker} 重大訊息 營收 財報', f'"{company_name}" {ticker} 接單 產能 客戶']
+    """V5.3.4: keep earnings calls and material information as separate event streams.
+
+    Public search snippets are summarized rather than copied verbatim. The latest three
+    distinct earnings-call dates are exposed separately so the UI/PDF can show a compact
+    management-history view.
+    """
+    queries=[
+        f'"{company_name}" {ticker} 法說 法人說明會 展望 財報',
+        f'"{company_name}" {ticker} earnings call investor conference',
+        f'"{company_name}" {ticker} 重大訊息 公告',
+        f'"{company_name}" {ticker} 董事會 重大訊息 營收 財報',
+        f'"{company_name}" {ticker} 接單 產能 客戶 訂單',
+    ]
     results=await asyncio.gather(*(google_news_rss(q) for q in queries), return_exceptions=True)
     rows=[]; seen=set(); errors=[]
     for result in results:
-        if isinstance(result, Exception): errors.append(type(result).__name__); continue
+        if isinstance(result,Exception):
+            errors.append(type(result).__name__); continue
         for x in result:
-            key=_normalize_title(x['title'])[:90]
+            key=_normalize_title(x["title"])[:100]
             if not key or key in seen: continue
             seen.add(key)
-            text=f"{x['title']} {x['snippet']}"
+            title=x["title"] or ""; snippet=x["snippet"] or ""
+            text=f"{title} {snippet}"
+            low=text.lower()
+
             tags=[]
-            for tag, words in [("法說",["法說","法人說明會"]),("財報",["財報","獲利","EPS"]),("營收",["營收"]),("展望",["展望","上修","下修","看旺","看淡"]),("重大訊息",["重大訊息","公告"]),("營運",["接單","產能","客戶","訂單"])]:
-                if any(w.lower() in text.lower() for w in words): tags.append(tag)
+            for tag,words in [
+                ("法說",["法說","法人說明會","earnings call","investor conference","investor meeting"]),
+                ("財報",["財報","獲利","eps","毛利率","營益率"]),
+                ("營收",["營收"]),
+                ("展望",["展望","上修","下修","看旺","看淡","guidance","outlook"]),
+                ("重大訊息",["重大訊息","重大公告","重訊","公告"]),
+                ("營運",["接單","產能","客戶","訂單","capex","資本支出"]),
+            ]:
+                if any(w.lower() in low for w in words): tags.append(tag)
             if not tags: continue
-            rows.append({"date":x['published_date'],"title":x['title'],"summary":x['snippet'][:240],"publisher":x['publisher'],"source_url":x['url'],"tags":tags[:3]})
-    return {"rows":sorted(rows,key=lambda z:z.get('date',''),reverse=True)[:12],"errors":errors,"fetched_at":datetime.now().astimezone().isoformat(timespec='seconds')}
+
+            is_call=("法說" in tags)
+            is_material=("重大訊息" in tags) or any(w in text for w in ["董事會決議","處分","取得","增資","減資","發行","訴訟","合併","股利","除權息"])
+            event_type="earnings_call" if is_call else ("material_info" if is_material else "company_update")
+
+            # Concise bullet extraction from public title/snippet. No paid/full-text reproduction.
+            raw_parts=re.split(r"[。；;｜|]|(?:\s+-\s+)", snippet)
+            bullets=[]
+            for part in raw_parts:
+                p=" ".join(part.split()).strip(" -•")
+                if len(p)<10: continue
+                if p not in bullets:
+                    bullets.append(p[:120])
+                if len(bullets)>=4: break
+            if not bullets:
+                t=" ".join(title.split())
+                if t: bullets=[t[:120]]
+
+            outlook=[]
+            for b in bullets:
+                if any(w in b for w in ["展望","預期","看好","看旺","保守","需求","成長","下修","上修","guidance","outlook"]):
+                    outlook.append(b)
+            rows.append({
+                "date":x["published_date"],"title":title,"summary":snippet[:300],
+                "summary_bullets":bullets[:4],"management_outlook":outlook[:2],
+                "publisher":x["publisher"],"source_url":x["url"],"tags":tags[:4],
+                "event_type":event_type,
+                "summary_method":"public_title_snippet_summary",
+                "copyright_note":"僅整理公開標題與摘要，不重製付費或完整逐字稿。"
+            })
+
+    rows=sorted(rows,key=lambda z:z.get("date",""),reverse=True)[:24]
+
+    # Latest three distinct earnings-call dates, preferring richer rows.
+    calls=[]; used_dates=set()
+    for row in [r for r in rows if r.get("event_type")=="earnings_call"]:
+        d=(row.get("date") or "")[:10]
+        if d and d in used_dates: continue
+        used_dates.add(d)
+        calls.append(row)
+        if len(calls)>=3: break
+
+    material=[r for r in rows if r.get("event_type")=="material_info"][:12]
+    updates=[r for r in rows if r.get("event_type")=="company_update"][:8]
+    return {
+        "rows":rows,
+        "earnings_calls":calls,
+        "material_info":material,
+        "company_updates":updates,
+        "earnings_call_count":len(calls),
+        "material_info_count":len(material),
+        "errors":errors,
+        "queries":queries,
+        "fetched_at":datetime.now().astimezone().isoformat(timespec="seconds"),
+        "policy":"法說與重大訊息分流；法說最多顯示最近三次不同日期，摘要僅取公開標題/摘要。"
+    }
+
 
 async def fetch_public_research(ticker: str, company_name: str) -> dict[str, Any]:
     queries=[
@@ -2176,7 +2254,7 @@ def build_evidence_graph(ticker: str, tech: dict[str,Any], revenue: dict[str,Any
 async def probe_twstock_mcp() -> dict[str,Any]:
     out={"provider":"TWStock MCP compatible adapter","enabled":TWSTOCK_MCP_ENABLED,"url":TWSTOCK_MCP_URL,"mode":"shadow_crosscheck","status":"disabled"}
     if not TWSTOCK_MCP_ENABLED: return out
-    payload={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.3.3"}}}
+    payload={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.3.4"}}}
     try:
         async with httpx.AsyncClient(timeout=8,follow_redirects=True,headers={"Accept":"application/json, text/event-stream","Content-Type":"application/json"}) as client:
             r=await client.post(TWSTOCK_MCP_URL,json=payload)
@@ -2391,7 +2469,7 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.3.3",
+        "ticker":ticker,"version":"5.3.4",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
@@ -2411,7 +2489,7 @@ async def eps_registry_diagnostics(ticker: str):
     reg=_load_official_eps_registry()
     rows=[r for r in reg.get("records",[]) if str(r.get("ticker"))==ticker]
     rows=sorted(rows,key=lambda r:(r.get("year") or 0,r.get("quarter") or 0),reverse=True)
-    return {"ticker":ticker,"version":"5.3.3","registry_schema_version":reg.get("schema_version"),
+    return {"ticker":ticker,"version":"5.3.4","registry_schema_version":reg.get("schema_version"),
             "updated_at":reg.get("updated_at"),"record_count":len(rows),"records":rows}
 
 @app.get("/api/evidence/{ticker}")
@@ -2426,7 +2504,7 @@ async def provider_diagnostics(ticker: str):
     ticker=ticker.strip().upper()
     d=await build_stock(ticker, False)
     mcp=await probe_twstock_mcp()
-    return {"version":"5.3.3","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
+    return {"version":"5.3.4","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.3.3","mode":"cloud-mobile-flow-technical-pro","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.3.4","mode":"cloud-mobile-earnings-call-events","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
