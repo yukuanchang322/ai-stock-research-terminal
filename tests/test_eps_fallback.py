@@ -50,6 +50,7 @@ class EpsStackTests(unittest.IsolatedAsyncioTestCase):
             stack = await server.build_eps_stack("2454", [], official, {})
         self.assertEqual(stack["quarter_eps"], 15.27)
         self.assertEqual(stack["quarter_method"], "official_ytd_difference")
+        self.assertEqual(stack["quarter_method_label"], "🧮 H1－Q1 回推，非公司單季公告")
         self.assertEqual(stack["prior_ytd_eps"], 15.17)
         self.assertEqual(stack["quarter_derivation_inputs"]["prior"]["source"], "MOPS historical income statement summary")
 

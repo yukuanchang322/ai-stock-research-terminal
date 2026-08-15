@@ -1628,7 +1628,8 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
                 "evidence_url": p.get("endpoint") or diag.get("endpoint")
             })
 
-    q_label={"official_direct":"✅ 公司/官方單季值","official_registry_verified":"✅ 官方 EPS Registry","official_ytd_q1":"✅ 官方 Q1 累計=單季","official_ytd_difference":"🧮 官方累計值差額推導",
+    q_label={"official_direct":"✅ 公司/官方單季值","official_registry_verified":"✅ 官方 EPS Registry","official_ytd_q1":"✅ 官方 Q1 累計=單季",
+             "official_ytd_difference":("🧮 H1－Q1 回推，非公司單季公告" if fq==2 else "🧮 官方累計值差額回推，非公司單季公告"),
              "structured_api_q1":"△ 結構化 API","structured_api_difference":"△ 結構化 API 差額"}.get(quarter_method,"資料不足")
     return {
         "quarter_eps":quarter_eps,"quarter_period":latest_period,"quarter_method":quarter_method,"quarter_method_label":q_label,
