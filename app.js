@@ -3,6 +3,8 @@ const fmt=(v,d=1)=>v==null?'—':Number(v).toLocaleString('zh-TW',{maximumFracti
 const fmt0=v=>v==null?'—':Number(v).toLocaleString('zh-TW',{maximumFractionDigits:0});
 const pct=(v,d=1)=>v==null?'—':`${v>=0?'+':''}${Number(v).toFixed(d)}%`;
 let currentTicker='';
+let loadSequence=0;
+const normalizeTicker=value=>String(value||'').replace(/[０-９]/g,ch=>String.fromCharCode(ch.charCodeAt(0)-0xFEE0)).trim().toUpperCase();
 
 function lineSvg(values){
   if(!values.length)return '<div class="empty">資料不足</div>';
@@ -208,7 +210,9 @@ async function readApiResponse(response){
 }
 
 async function loadTicker(ticker, force=false){
-  ticker=String(ticker||'').trim().toUpperCase();
+  const requestId=++loadSequence;
+  ticker=normalizeTicker(ticker);
+  if($('tickerInput')) $('tickerInput').value=ticker;
   $('errorBox').classList.add('hidden');
   if(!/^\d{4,6}$/.test(ticker)){
     $('report').classList.add('hidden');
@@ -221,17 +225,19 @@ async function loadTicker(ticker, force=false){
     const path=`/api/stock/${encodeURIComponent(ticker)}${force?'?refresh=true':''}`;
     const r=await fetch(path,{method:'GET',headers:{'Accept':'application/json'},cache:force?'no-store':'default'});
     const j=await readApiResponse(r);
+    if(requestId!==loadSequence) return;
     if(!r.ok) throw new Error(j.detail||j.message||`資料取得失敗（HTTP ${r.status}）`);
     try{render(j);}catch(renderError){
       console.error('render failed',renderError);
       throw new Error(`畫面產生失敗：${renderError?.message||'未知錯誤'}`);
     }
   }catch(e){
+    if(requestId!==loadSequence) return;
     console.error('loadTicker failed',e);
     $('report').classList.add('hidden');
     $('errorBox').textContent=e?.message||'資料取得失敗，請稍後再試。';
     $('errorBox').classList.remove('hidden');
-  } finally {$('loading').classList.add('hidden'); $('searchBtn').disabled=false;}
+  } finally {if(requestId===loadSequence){$('loading').classList.add('hidden'); $('searchBtn').disabled=false;}}
 }
 $('searchBtn').onclick=()=>loadTicker($('tickerInput').value.trim()); $('refreshBtn').onclick=()=>loadTicker($('tickerInput').value.trim(), true);
 $('tickerInput').addEventListener('keydown',e=>{if(e.key==='Enter')loadTicker(e.target.value.trim())});

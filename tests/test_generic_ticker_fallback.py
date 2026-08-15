@@ -5,6 +5,10 @@ import server
 
 
 class TpexPriceParserTests(unittest.TestCase):
+    def test_normalizes_full_width_ticker_digits(self):
+        self.assertEqual(server.normalize_ticker(" ６４８８ "), "6488")
+        self.assertEqual(server.require_numeric_taiwan_ticker("２３３０"), "2330")
+
     def test_normalizes_tpex_monthly_ohlc_and_converts_lots_to_shares(self):
         payload = {
             "stat": "ok",

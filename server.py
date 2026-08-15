@@ -67,6 +67,21 @@ def safe_num(v: Any, default: float | None = None) -> float | None:
         return default
 
 
+FULLWIDTH_TICKER_TRANSLATION=str.maketrans("０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def normalize_ticker(value: Any) -> str:
+    """Normalize iPhone/Chinese-IME full-width ticker input to the API's canonical form."""
+    return str(value or "").translate(FULLWIDTH_TICKER_TRANSLATION).strip().upper()
+
+
+def require_numeric_taiwan_ticker(value: Any) -> str:
+    ticker=normalize_ticker(value)
+    if not re.fullmatch(r"\d{4,6}",ticker):
+        raise HTTPException(400,"請輸入有效台股代號")
+    return ticker
+
+
 def pct(v: float | None, digits: int = 1) -> str:
     return "—" if v is None else f"{v:+.{digits}f}%"
 
@@ -2640,6 +2655,7 @@ def narrative(s: dict[str, int], tech: dict[str, Any], revenue: dict[str, Any], 
 
 
 async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any]:
+    ticker=normalize_ticker(ticker)
     if not force_refresh and ticker in _CACHE and time.time() - _CACHE[ticker][0] < CACHE_TTL:
         cached = dict(_CACHE[ticker][1]); cached["cache"] = {"hit": True, "ttl_seconds": CACHE_TTL}; return cached
     today = date.today(); errors: list[str] = []
@@ -2877,22 +2893,21 @@ async def sw(): return FileResponse(ROOT / "sw.js", media_type="application/java
 
 @app.get("/api/diagnostics/financial/{ticker}")
 async def financial_diagnostics(ticker: str):
-    ticker=ticker.strip()
-    if not ticker.isdigit() or len(ticker) not in (4,5,6): raise HTTPException(400,"請輸入有效台股代號")
+    ticker=require_numeric_taiwan_ticker(ticker)
     result=await diagnose_official_financial_sources(ticker)
     return JSONResponse(result, headers={"Cache-Control":"no-store"})
 
 @app.get("/api/stock/{ticker}")
 async def stock_api(ticker: str, refresh: bool = Query(False)):
-    ticker=ticker.strip()
-    if not ticker.isdigit() or len(ticker) not in (4,5,6): raise HTTPException(400,"請輸入有效台股代號")
+    ticker=require_numeric_taiwan_ticker(ticker)
     d=await build_stock(ticker, force_refresh=refresh)
     if d["price"] is None and d["name"] == ticker: raise HTTPException(404,"查無股票或資料來源暫時無法連線")
     return JSONResponse(d, headers={"Cache-Control":"no-store"})
 
 @app.get("/api/stock/{ticker}/pdf")
 async def stock_pdf(ticker: str, refresh: bool = Query(True)):
-    d=await build_stock(ticker.strip(), force_refresh=refresh)
+    ticker=require_numeric_taiwan_ticker(ticker)
+    d=await build_stock(ticker, force_refresh=refresh)
     if d["price"] is None: raise HTTPException(503,"目前無法取得股價資料，為避免輸出錯誤報告，PDF 未產生。")
     stamp=datetime.now().strftime("%Y%m%d_%H%M")
     out=REPORT_DIR/f"{ticker}_{stamp}_research_v5_3_5.pdf"
@@ -2908,7 +2923,7 @@ async def cache_clear():
 
 @app.get("/api/diagnostics/eps/{ticker}")
 async def eps_diagnostics(ticker: str):
-    ticker=ticker.strip().upper()
+    ticker=require_numeric_taiwan_ticker(ticker)
     official=await fetch_official_income_statement(ticker)
     official=await reconcile_official_financial_snapshot(ticker, official)
     fin_rows=[]
@@ -2943,13 +2958,12 @@ async def eps_diagnostics(ticker: str):
 
 @app.get("/api/diagnostics/eps-raw/{ticker}")
 async def eps_raw_diagnostics(ticker: str, year: int = Query(..., ge=1990, le=2100), quarter: int = Query(..., ge=1, le=4)):
-    ticker=ticker.strip().upper()
-    if not ticker.isdigit(): raise HTTPException(400,"ticker must be numeric")
+    ticker=require_numeric_taiwan_ticker(ticker)
     return await trace_mops_company_ifrs(ticker,year,quarter)
 
 @app.get("/api/diagnostics/eps-registry/{ticker}")
 async def eps_registry_diagnostics(ticker: str):
-    ticker=normalize_ticker(ticker)
+    ticker=require_numeric_taiwan_ticker(ticker)
     reg=_load_official_eps_registry()
     rows=[r for r in reg.get("records",[]) if str(r.get("ticker"))==ticker]
     rows=sorted(rows,key=lambda r:(r.get("year") or 0,r.get("quarter") or 0),reverse=True)
@@ -2958,14 +2972,14 @@ async def eps_registry_diagnostics(ticker: str):
 
 @app.get("/api/evidence/{ticker}")
 async def evidence_api(ticker: str, refresh: int = 0):
-    ticker=ticker.strip().upper()
+    ticker=normalize_ticker(ticker)
     if not re.fullmatch(r"[0-9A-Z]{2,10}", ticker): raise HTTPException(400,"invalid ticker")
     d=await build_stock(ticker, bool(refresh))
     return d.get("evidence_graph") or {}
 
 @app.get("/api/diagnostics/providers/{ticker}")
 async def provider_diagnostics(ticker: str):
-    ticker=ticker.strip().upper()
+    ticker=require_numeric_taiwan_ticker(ticker)
     d=await build_stock(ticker, True)
     status=d.get("provider_status") or {}
     provider_errors=list(dict.fromkeys([*(status.get("fallback_errors") or []),*(d.get("errors") or [])]))
