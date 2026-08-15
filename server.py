@@ -1886,6 +1886,51 @@ def _extract_eps_year(text: str) -> int | None:
 def _normalize_title(s: str) -> str:
     return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", s).lower()
 
+def _company_event_identity(ticker: str, company_name: str, title: str) -> tuple[bool, str]:
+    """Conservatively bind a public event result to one stock."""
+    ticker=normalize_ticker(ticker)
+    title_text=" ".join(str(title or "").split())
+    title_key=_normalize_title(title_text)
+    title_tickers=set(re.findall(r"(?<!\d)(\d{4,6})(?!\d)",title_text))
+    if title_tickers and ticker not in title_tickers:
+        return False,"different_ticker_in_title"
+    if ticker in title_tickers:
+        return True,"ticker_in_title"
+    raw_name=str(company_name or "").strip()
+    aliases={raw_name}
+    for suffix in ("股份有限公司","有限公司","-KY","－KY","KY"):
+        aliases.add(raw_name.replace(suffix,""))
+    aliases={_normalize_title(x) for x in aliases if x}
+    aliases={x for x in aliases if len(x)>=3}
+    if any(alias in title_key for alias in aliases):
+        return True,"company_name_in_title"
+    return False,"target_identity_absent"
+
+async def fetch_official_material_info(ticker: str, company_name: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Fetch today's TWSE material disclosures and keep exact company-code matches only."""
+    endpoint=TWSE_OPENAPI+"/opendata/t187ap04_L"
+    errors=[]; rows=[]
+    try:
+        async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.5"}) as client:
+            response=await client.get(endpoint); response.raise_for_status(); payload=response.json()
+        for item in payload if isinstance(payload,list) else []:
+            code=re.sub(r"\D","",_text_field(item,"公司代號","公司代碼"))
+            if code != ticker: continue
+            subject=_text_field(item,"主旨","主旨 ")
+            description=_text_field(item,"說明")
+            rows.append({
+                "ticker":ticker,"company_name":_text_field(item,"公司名稱") or company_name,
+                "date":roc_date_to_iso(_text_field(item,"發言日期") or _text_field(item,"出表日期")),
+                "title":subject,"summary":description[:500],"summary_bullets":[],"management_outlook":[],
+                "publisher":"公開資訊觀測站","source_url":endpoint,"tags":["重大訊息"],
+                "event_type":"material_info","source_type":"official_mops_openapi",
+                "identity_verified":True,"identity_method":"official_company_code",
+                "summary_method":"official_disclosure","copyright_note":"官方重大訊息，依公司代號精確篩選。"
+            })
+    except Exception as exc:
+        errors.append(f"official_material_info:{type(exc).__name__}")
+    return rows,errors
+
 async def google_news_rss(query: str) -> list[dict[str, Any]]:
     url=f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
     async with httpx.AsyncClient(timeout=18, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.1"}) as client:
@@ -1918,12 +1963,16 @@ async def fetch_company_events(ticker: str, company_name: str) -> dict[str, Any]
         f'"{company_name}" {ticker} 董事會 重大訊息 營收 財報',
         f'"{company_name}" {ticker} 接單 產能 客戶 訂單',
     ]
+    official_task=asyncio.create_task(fetch_official_material_info(ticker,company_name))
     results=await asyncio.gather(*(google_news_rss(q) for q in queries), return_exceptions=True)
+    official_rows,official_errors=await official_task
     rows=[]; seen=set(); errors=[]
     for result in results:
         if isinstance(result,Exception):
             errors.append(type(result).__name__); continue
         for x in result:
+            identity_ok,identity_method=_company_event_identity(ticker,company_name,x.get("title") or "")
+            if not identity_ok: continue
             key=_normalize_title(x["title"])[:100]
             if not key or key in seen: continue
             seen.add(key)
@@ -1965,15 +2014,24 @@ async def fetch_company_events(ticker: str, company_name: str) -> dict[str, Any]
                 if any(w in b for w in ["展望","預期","看好","看旺","保守","需求","成長","下修","上修","guidance","outlook"]):
                     outlook.append(b)
             rows.append({
+                "ticker":ticker,"company_name":company_name,
                 "date":x["published_date"],"title":title,"summary":snippet[:300],
                 "summary_bullets":bullets[:4],"management_outlook":outlook[:2],
                 "publisher":x["publisher"],"source_url":x["url"],"tags":tags[:4],
                 "event_type":event_type,
+                "source_type":"public_web_quote","identity_verified":True,"identity_method":identity_method,
                 "summary_method":"public_title_snippet_summary",
                 "copyright_note":"僅整理公開標題與摘要，不重製付費或完整逐字稿。"
             })
 
-    rows=sorted(rows,key=lambda z:z.get("date",""),reverse=True)[:24]
+    errors.extend(official_errors)
+    rows.extend(official_rows)
+    deduped=[]; seen_rows=set()
+    for row in sorted(rows,key=lambda z:z.get("date","") or "",reverse=True):
+        key=(row.get("ticker"),_normalize_title(row.get("title") or "")[:120])
+        if key in seen_rows: continue
+        seen_rows.add(key); deduped.append(row)
+    rows=deduped[:24]
 
     # Latest three distinct earnings-call dates, preferring richer rows.
     calls=[]; used_dates=set()
@@ -1996,7 +2054,8 @@ async def fetch_company_events(ticker: str, company_name: str) -> dict[str, Any]
         "errors":errors,
         "queries":queries,
         "fetched_at":datetime.now().astimezone().isoformat(timespec="seconds"),
-        "policy":"法說與重大訊息分流；法說最多顯示最近三次不同日期，摘要僅取公開標題/摘要。"
+        "ticker":ticker,"company_name":company_name,
+        "policy":"所有事件須通過股票代號或公司名稱身分驗證；上市重大訊息優先採官方公司代號，法說最多顯示最近三次不同日期。"
     }
 
 
