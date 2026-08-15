@@ -38,7 +38,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.2.7")
+app = FastAPI(title="AI Stock Research Terminal", version="5.2.8")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -111,7 +111,7 @@ def _row_value(row: dict[str, Any], includes: list[str], excludes: list[str] | N
     return None
 
 async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.7"}) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.8"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
 
@@ -125,7 +125,7 @@ IR_FINANCIAL_PAGES = {
 async def mops_csv_rows(filename: str) -> list[dict[str, Any]]:
     """Official MOPS CSV fallback. Some foreign/KY issuers can appear here even when JSON feeds lag."""
     url=f"{MOPS_CSV_BASE}/{filename}"
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.7"}) as client:
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.8"}) as client:
         r=await client.get(url); r.raise_for_status()
     raw=r.content
     text=None
@@ -223,7 +223,7 @@ async def fetch_company_ir_financial(ticker: str, expected_year: int, expected_q
     page=IR_FINANCIAL_PAGES.get(ticker)
     if not page: return None
     try:
-        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.7"}) as client:
+        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.8"}) as client:
             r=await client.get(page); r.raise_for_status(); page_html=r.text
             hrefs=re.findall(r'href=["\']([^"\']+)["\']',page_html,re.I)
             embedded=re.findall(r'["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']',page_html,re.I)
@@ -343,7 +343,7 @@ async def fetch_mops_material_financial(ticker: str, expected_year: int | None=N
     historical-search endpoint so a disclosure from one or two days ago is still discoverable.
     """
     out=[]
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.7"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.8"}
     async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers=ua) as client:
         # A. Daily official material-information feed.
         try:
@@ -495,7 +495,11 @@ async def fetch_mops_company_ifrs(ticker: str, year: int, quarter: int) -> list[
              "Referer":"https://mops.twse.com.tw/mops/"}
     async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as client:
         for report_id in ("C","B","A"):
-            params={"step":"1","CO_ID":ticker,"SYEAR":str(year),"SSEASON":str(quarter),"REPORT_ID":report_id}
+            # MOPS t164sb01 expects ROC year (e.g. 115 for 2026), not Gregorian year.
+            # Sending 2026 here silently returns no usable historical report, which prevented
+            # Q2/Q3 standalone EPS from being derived from prior-quarter YTD EPS.
+            mops_year = year - 1911 if year >= 1912 else year
+            params={"step":"1","CO_ID":ticker,"SYEAR":str(mops_year),"SSEASON":str(quarter),"REPORT_ID":report_id}
             try:
                 r=await client.get(base,params=params)
                 if r.status_code!=200 or len(r.content)<500: continue
@@ -511,7 +515,7 @@ async def fetch_tsmc_quarterly_release(year: int, quarter: int) -> dict[str, Any
     """TSMC official IR fallback. Gives a verified quarter even before MOPS aggregate refresh."""
     if quarter not in (1,2,3,4): return None
     url=f"https://investor.tsmc.com/english/quarterly-results/{year}/q{quarter}"
-    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.7"}
+    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.8"}
     try:
         async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=headers) as client:
             r=await client.get(url); r.raise_for_status(); text=html.unescape(re.sub(r"<[^>]+>"," ",r.text))
@@ -657,7 +661,7 @@ async def diagnose_official_financial_sources(ticker: str) -> dict[str, Any]:
     """
     now=datetime.now().astimezone()
     ey,eq,expected=expected_latest_financial_period(now.date())
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.7 diagnostics"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.8 diagnostics"}
     out={
         "ticker":ticker, "generated_at":now.isoformat(timespec="seconds"),
         "expected_period":expected, "expected_year":ey, "expected_quarter":eq,
@@ -967,6 +971,7 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
     # Build an official cumulative-EPS map for enough periods to derive the latest quarter and TTM.
     official_ytd={}
     direct_quarter={}
+    lookup_diagnostics=[]
     if fy and fq and official.get("official"):
         if ytd is not None: official_ytd[(fy,fq)]=float(ytd)
         if official.get("quarter_eps_direct") is not None: direct_quarter[(fy,fq)]=float(official.get("quarter_eps_direct"))
@@ -981,9 +986,21 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
         tasks=[fetch_official_eps_ytd_for_period(ticker,y,q) for (y,q) in periods[1:]]
         rows=await asyncio.gather(*tasks, return_exceptions=True)
         for (yq,row) in zip(periods[1:],rows):
-            if isinstance(row,Exception) or not row: continue
+            if isinstance(row,Exception):
+                lookup_diagnostics.append({"period":f"{yq[0]} Q{yq[1]}","status":"error","error":type(row).__name__})
+                continue
+            if not row:
+                lookup_diagnostics.append({"period":f"{yq[0]} Q{yq[1]}","status":"missing"})
+                continue
             if row.get("ytd_eps") is not None: official_ytd[yq]=float(row.get("ytd_eps"))
             if row.get("quarter_eps_direct") is not None: direct_quarter[yq]=float(row.get("quarter_eps_direct"))
+            lookup_diagnostics.append({
+                "period":f"{yq[0]} Q{yq[1]}",
+                "status":"ok" if row.get("ytd_eps") is not None or row.get("quarter_eps_direct") is not None else "no_eps",
+                "source":row.get("source"),"endpoint":row.get("endpoint"),
+                "ytd_eps":row.get("ytd_eps"),"quarter_eps_direct":row.get("quarter_eps_direct"),
+                "report_id":row.get("report_id"),"selected_column":row.get("selected_column")
+            })
 
     # Structured API history is a fallback only; do not overwrite an official value.
     ytd_map=dict(official_ytd)
@@ -1034,7 +1051,9 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
         "structured_api_stale":stale_api,"structured_api_period":f"{api_latest[0]} Q{api_latest[1]}" if api_latest[0] else None,
         "prior_ytd_period":f"{prev_key[0]} Q{prev_key[1]} YTD" if prev_key else None,
         "prior_ytd_eps":ytd_map.get(prev_key) if prev_key else None,
-        "note":"V5.2.7 EPS Engine：Q1=累計；Q2/Q3=本期累計－前季累計；Q4=全年累計－Q3累計。TTM 只加總四個實際單季 EPS；官方當期若缺官方前季，不混用舊 API 推算。"
+        "official_ytd_map":{f"{y} Q{q}":v for (y,q),v in sorted(official_ytd.items())},
+        "eps_lookup_diagnostics":lookup_diagnostics,
+        "note":"V5.2.8 Official EPS Resolver：MOPS 歷史公司財報使用民國年查詢；Q1=累計；Q2/Q3=本期累計－前季累計；Q4=全年累計－Q3累計。TTM 只加總四個實際單季 EPS，不做單季年化猜值。"
     }
 
 
@@ -1597,7 +1616,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         official_financial=await fetch_official_income_statement(ticker)
     except Exception as e:
         errors.append(f"OfficialFinancial: {type(e).__name__}"); official_financial={"official":False,"errors":[type(e).__name__]}
-    # V5.2.7 official mapping + EPS engine guard: force the newest official MOPS quarter into the main payload.
+    # V5.2.8 official mapping + EPS resolver guard: force the newest official MOPS quarter into the main payload.
     try:
         official_financial=await reconcile_official_financial_snapshot(ticker, official_financial)
     except Exception as e:
@@ -1656,7 +1675,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
           "source_status":source_status,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,
-          "data_policy":"V5.2.7 EPS Engine：官方財報先映射最新季度，再回查前一季官方累計 EPS 計算真實單季 EPS；TTM 僅由四個實際單季 EPS 加總，不做年化猜值。"}
+          "data_policy":"V5.2.8 Official EPS Resolver：官方財報先映射最新季度，再回查前一季官方累計 EPS 計算真實單季 EPS；TTM 僅由四個實際單季 EPS 加總，不做年化猜值。"}
     _CACHE[ticker]=(time.time(),data)
     return data
 
@@ -1727,5 +1746,24 @@ async def stock_pdf(ticker: str, refresh: bool = Query(True)):
 async def cache_clear():
     _CACHE.clear(); return {"status":"ok","message":"cache cleared"}
 
+@app.get("/api/diagnostics/eps/{ticker}")
+async def eps_diagnostics(ticker: str):
+    ticker=ticker.strip().upper()
+    official=await fetch_official_income_statement(ticker)
+    official=await reconcile_official_financial_snapshot(ticker, official)
+    # FinMind history is optional here; diagnostics must still work without a token.
+    fin_rows=[]
+    try:
+        start=(date.today()-timedelta(days=900)).isoformat()
+        fin_rows=await fm("TaiwanStockFinancialStatements", ticker, start)
+    except Exception:
+        fin_rows=[]
+    stack=await build_eps_stack(ticker,fin_rows,official,{})
+    return {
+        "ticker":ticker,"version":"5.2.8",
+        "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
+        "eps_stack":stack
+    }
+
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.2.7","mode":"cloud-mobile-official-eps-engine","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.2.8","mode":"cloud-mobile-official-eps-resolver","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}

@@ -88,7 +88,16 @@ Health Check:
 3661 可直接開：`/api/diagnostics/financial/3661`。
 
 
-## V5.2.7 EPS Engine
+## V5.2.8 Official EPS Resolver
 - 官方回查前一季累計 EPS，推導 Q2/Q3/Q4 真實單季 EPS。
 - TTM 僅在四個實際單季 EPS 齊全時顯示。
 - 官方當期資料不會混用 FinMind 舊季資料推算單季 EPS。
+
+
+## V5.2.8 Official EPS Resolver
+
+- 修正 MOPS 單一公司 IFRS 歷史季度查詢年份：Gregorian 2026 會轉成 ROC 115 後送入 `SYEAR`。
+- Q2/Q3 會回查同年度前季官方 YTD EPS，再計算單季 EPS。
+- Q4 由全年 YTD 減 Q3 YTD；Q1 單季等於 Q1 YTD。
+- TTM 只由四個實際單季 EPS 加總。
+- 新增 `/api/diagnostics/eps/{ticker}`，可查看每一個歷史季度回查是否成功、來源、YTD EPS 與解析欄位。
