@@ -115,7 +115,7 @@ PROVIDER_REGISTRY = [
 def parse_num_text(v: Any) -> float | None:
     if v is None: return None
     s=str(v).strip().replace(",", "").replace("％", "").replace("%", "")
-    if s in ("", "-", "--", "—", "－"): return None
+    if not s or re.fullmatch(r"[-—－]+", s): return None
     try: return float(s)
     except Exception: return None
 
@@ -188,16 +188,151 @@ async def fetch_twse_stock_info(ticker: str) -> tuple[dict[str, Any], list[str]]
         rows=await openapi_json(TWSE_OPENAPI,"/opendata/t187ap03_L")
         row=next((item for item in rows if str(item.get("公司代號") or "").strip()==ticker),None)
         if not row:
-            return {},["TWSE_INFO: ticker not found in t187ap03_L"]
+            return {},[]
         return {
             "stock_id":ticker,
             "stock_name":str(row.get("公司簡稱") or row.get("公司名稱") or ticker).strip(),
-            "industry_category":str(row.get("產業別") or "—").strip(),
+            "industry_category":_industry_label(row.get("產業別")),
             "type":"上市",
             "source":"TWSE OpenAPI t187ap03_L",
         },[]
     except Exception as exc:
         return {},[f"TWSE_INFO: {type(exc).__name__}: {exc}"]
+
+
+def _industry_label(value: Any) -> str:
+    text=str(value or "").strip()
+    if not text:
+        return "—"
+    return f"產業代碼 {text}" if re.fullmatch(r"\d{2}",text) else text
+
+
+def _normalize_market_type(value: Any) -> str:
+    text=str(value or "").strip()
+    lowered=text.lower()
+    if lowered in {"twse","sii","上市"}:
+        return "上市"
+    if lowered in {"tpex","otc","上櫃"}:
+        return "上櫃"
+    return text or "—"
+
+
+def normalize_stock_info(info: dict[str, Any], ticker: str) -> dict[str, Any]:
+    if not info:
+        return {}
+    normalized=dict(info)
+    normalized["stock_id"]=str(normalized.get("stock_id") or ticker).strip()
+    normalized["stock_name"]=str(normalized.get("stock_name") or ticker).strip()
+    normalized["industry_category"]=_industry_label(normalized.get("industry_category"))
+    normalized["type"]=_normalize_market_type(normalized.get("type"))
+    return normalized
+
+
+async def fetch_tpex_stock_info(ticker: str) -> tuple[dict[str, Any], list[str]]:
+    """Resolve OTC-company identity from the official TPEx company OpenAPI."""
+    try:
+        rows=await openapi_json(TPEX_OPENAPI,"/mopsfin_t187ap03_O")
+        row=next((item for item in rows if str(item.get("SecuritiesCompanyCode") or "").strip()==ticker),None)
+        if not row:
+            return {},[]
+        return {
+            "stock_id":ticker,
+            "stock_name":str(row.get("CompanyAbbreviation") or row.get("CompanyName") or ticker).strip(),
+            "industry_category":_industry_label(row.get("SecuritiesIndustryCode")),
+            "type":"上櫃",
+            "source":"TPEx OpenAPI mopsfin_t187ap03_O",
+        },[]
+    except Exception as exc:
+        return {},[f"TPEX_INFO: {type(exc).__name__}: {exc}"]
+
+
+async def fetch_official_stock_info(ticker: str) -> tuple[dict[str, Any], list[str]]:
+    """Resolve listed or OTC identity without treating the other market as an error."""
+    twse_result,tpex_result=await asyncio.gather(fetch_twse_stock_info(ticker),fetch_tpex_stock_info(ticker))
+    twse_info,twse_errors=twse_result
+    tpex_info,tpex_errors=tpex_result
+    if twse_info:
+        return twse_info,[*twse_errors,*tpex_errors]
+    if tpex_info:
+        return tpex_info,[*twse_errors,*tpex_errors]
+    return {},[*twse_errors,*tpex_errors,"OFFICIAL_INFO: ticker not found in listed or OTC company data"]
+
+
+def parse_tpex_stock_day_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize one official TPEx monthly response to calc_technical() columns."""
+    if str(payload.get("stat") or "").lower() != "ok":
+        raise RuntimeError(str(payload.get("stat") or "TPEx response not OK"))
+    tables=payload.get("tables") or []
+    if not tables:
+        return []
+    table=tables[0] or {}
+    fields=[re.sub(r"\s+", "", str(field or "")) for field in (table.get("fields") or [])]
+
+    def column(*names: str) -> int | None:
+        for name in names:
+            if name in fields:
+                return fields.index(name)
+        return None
+
+    indices={
+        "date":column("日期"),
+        "volume":column("成交張數","成交股數"),
+        "open":column("開盤","開盤價"),
+        "high":column("最高","最高價"),
+        "low":column("最低","最低價"),
+        "close":column("收盤","收盤價"),
+    }
+    if any(index is None for index in indices.values()):
+        raise RuntimeError(f"TPEx fields missing: {fields}")
+    volume_is_lots=fields[indices["volume"]] == "成交張數"
+    rows=[]
+    for raw in table.get("data") or []:
+        if not isinstance(raw,list) or max(indices.values()) >= len(raw):
+            continue
+        open_=parse_num_text(raw[indices["open"]])
+        high=parse_num_text(raw[indices["high"]])
+        low=parse_num_text(raw[indices["low"]])
+        close=parse_num_text(raw[indices["close"]])
+        volume=parse_num_text(raw[indices["volume"]])
+        if None in (open_,high,low,close):
+            continue
+        if volume is not None and volume_is_lots:
+            volume*=1000
+        rows.append({"date":roc_date_to_iso(raw[indices["date"]]),"open":open_,"max":high,"min":low,"close":close,"Trading_Volume":volume})
+    return rows
+
+
+async def fetch_tpex_stock_day(ticker: str, months: int = 13) -> tuple[list[dict[str, Any]], list[str]]:
+    """Fetch official TPEx monthly OHLC; one failed month never aborts the series."""
+    url="https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock"
+    errors=[]
+    async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.5"}) as client:
+        async def fetch_month(month_start: date):
+            month_key=month_start.strftime("%Y%m")
+            try:
+                response=await client.post(url,data={"code":ticker,"date":month_start.strftime("%Y/%m/01"),"id":"","response":"json"})
+                response.raise_for_status()
+                return parse_tpex_stock_day_payload(response.json())
+            except Exception as exc:
+                errors.append(f"TPEX_TRADING_STOCK {month_key}: {type(exc).__name__}: {exc}")
+                return []
+        monthly=await asyncio.gather(*(fetch_month(month) for month in _month_starts(date.today(),months)))
+    rows=[row for group in monthly for row in group]
+    unique={row["date"]:row for row in rows if row.get("date")}
+    return [unique[key] for key in sorted(unique)],errors
+
+
+async def fetch_official_stock_day(ticker: str, market_type: str = "") -> tuple[list[dict[str, Any]], str | None, list[str]]:
+    """Choose the official listed/OTC history provider, with a cross-market fallback."""
+    market=_normalize_market_type(market_type)
+    providers=[("TPEx afterTrading/tradingStock",fetch_tpex_stock_day),("TWSE STOCK_DAY",fetch_twse_stock_day)] if market=="上櫃" else [("TWSE STOCK_DAY",fetch_twse_stock_day),("TPEx afterTrading/tradingStock",fetch_tpex_stock_day)]
+    errors=[]
+    for provider,fetcher in providers:
+        rows,provider_errors=await fetcher(ticker,13)
+        errors.extend(provider_errors)
+        if rows:
+            return rows,provider,errors
+    return [],None,errors
 
 
 
@@ -1223,6 +1358,16 @@ async def reconcile_official_financial_snapshot(ticker: str, selected: dict[str,
         candidates.extend(await fetch_mops_csv_official(ticker))
     except Exception:
         pass
+    # Re-probe the exact expected quarter through the generic official resolver. This gives a
+    # transiently failed MOPS/OpenAPI request a second independent chance and prevents a valid
+    # Q2 filing from being hidden merely because an older structured snapshot was also available.
+    try:
+        expected_year,expected_quarter,_=expected_latest_financial_period(date.today())
+        expected=await fetch_official_eps_for_period(ticker,expected_year,expected_quarter)
+        if expected:
+            candidates.append(expected)
+    except Exception:
+        pass
     if not candidates:
         return selected or {"official": False, "candidate_hits": 0, "errors": ["reconcile:no_official_candidate"]}
 
@@ -2134,19 +2279,27 @@ def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]]) -> 
     if not df.empty:
         for c in df.columns:
             if c not in ("date","stock_id"):
-                df[c]=pd.to_numeric(df[c],errors="coerce").fillna(0)
+                df[c]=pd.to_numeric(df[c],errors="coerce")
         df=df.sort_values("date")
-        def net(prefix:str,n:int)->float:
+        def net(prefix:str,n:int)->float | None:
             buy=[c for c in df.columns if c.startswith(prefix) and c.endswith("_buy")]
             sell=[c for c in df.columns if c.startswith(prefix) and c.endswith("_sell")]
+            if not buy or not sell:
+                return None
             tail=df.tail(n)
-            return float(tail[buy].sum().sum()-tail[sell].sum().sum()) if buy or sell else 0.0
-        result.update({
+            buy_total=tail[buy].sum(min_count=1).sum(min_count=1)
+            sell_total=tail[sell].sum(min_count=1).sum(min_count=1)
+            if pd.isna(buy_total) or pd.isna(sell_total):
+                return None
+            return float(buy_total-sell_total)
+        flow_values={
             "foreign_1":net("Foreign_",1),"foreign_5":net("Foreign_",5),"foreign_20":net("Foreign_",20),
             "trust_1":net("Investment_Trust",1),"trust_5":net("Investment_Trust",5),"trust_20":net("Investment_Trust",20),
             "dealer_1":net("Dealer",1),"dealer_5":net("Dealer",5),"dealer_20":net("Dealer",20),
-            "last_date":str(df.iloc[-1]["date"]),
-        })
+        }
+        result.update(flow_values)
+        if any(value is not None for value in flow_values.values()):
+            result["last_date"]=str(df.iloc[-1]["date"])
 
     mdf=pd.DataFrame(margin_rows)
     if not mdf.empty and "MarginPurchaseTodayBalance" in mdf.columns:
@@ -2491,7 +2644,8 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         cached = dict(_CACHE[ticker][1]); cached["cache"] = {"hit": True, "ttl_seconds": CACHE_TTL}; return cached
     today = date.today(); errors: list[str] = []
     provider_status={"price_provider":None,"info_provider":None,"fallback_used":False,"fallback_errors":[],
-                     "finmind_available":False,"twse_fallback_success":False,"price_rows":0,"latest_price_date":None}
+                     "finmind_available":False,"finmind_price_available":False,"official_price_fallback_success":False,
+                     "twse_fallback_success":False,"tpex_fallback_success":False,"price_rows":0,"latest_price_date":None}
     async def grab(dataset: str, days: int):
         try: return await finmind(dataset, ticker, today - timedelta(days=days), today)
         except Exception as e: errors.append(f"{dataset}: {type(e).__name__}"); return []
@@ -2506,24 +2660,28 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         grab("TaiwanStockMarginPurchaseShortSale", 120), grab("TaiwanStockMonthRevenue", 900),
         grab("TaiwanStockPER", 1100), grab("TaiwanStockFinancialStatements", 1100)
     )
-    if prices:
-        provider_status.update({"price_provider":"FinMind TaiwanStockPrice","finmind_available":True})
-    else:
-        provider_status["fallback_used"]=True
-        provider_status["fallback_errors"].append("FinMind TaiwanStockPrice returned no usable rows")
-        prices,twse_price_errors=await fetch_twse_stock_day(ticker,13)
-        provider_status["fallback_errors"].extend(twse_price_errors)
-        if prices:
-            provider_status.update({"price_provider":"TWSE STOCK_DAY","twse_fallback_success":True})
+    provider_status["finmind_available"]=any(bool(rows) for rows in (info,prices,inst,margin,rev,pers,fin))
+    info=normalize_stock_info(info,ticker)
     if info:
         provider_status["info_provider"]="FinMind TaiwanStockInfo"
     else:
         provider_status["fallback_used"]=True
         provider_status["fallback_errors"].append("FinMind TaiwanStockInfo returned no matching row")
-        info,twse_info_errors=await fetch_twse_stock_info(ticker)
-        provider_status["fallback_errors"].extend(twse_info_errors)
+        info,official_info_errors=await fetch_official_stock_info(ticker)
+        provider_status["fallback_errors"].extend(official_info_errors)
         if info:
-            provider_status["info_provider"]="TWSE OpenAPI t187ap03_L"
+            provider_status["info_provider"]=info.get("source")
+    if prices:
+        provider_status.update({"price_provider":"FinMind TaiwanStockPrice","finmind_price_available":True})
+    else:
+        provider_status["fallback_used"]=True
+        provider_status["fallback_errors"].append("FinMind TaiwanStockPrice returned no usable rows")
+        prices,official_price_provider,official_price_errors=await fetch_official_stock_day(ticker,info.get("type") or "")
+        provider_status["fallback_errors"].extend(official_price_errors)
+        if prices:
+            provider_status.update({"price_provider":official_price_provider,"official_price_fallback_success":True})
+            provider_status["twse_fallback_success"]=official_price_provider=="TWSE STOCK_DAY"
+            provider_status["tpex_fallback_success"]=official_price_provider=="TPEx afterTrading/tradingStock"
 
     def calculate(label: str, fn, *args):
         try:
@@ -2588,7 +2746,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     change=((lp/prev-1)*100) if lp and prev else None
     evidence_graph=build_evidence_graph(ticker,tech,revenue,flow,perdata,financial,eps_stack,research,company_events,financial_integrity)
     source_status=[
-        {"name":"股價","dataset":provider_status.get("price_provider") or "TaiwanStockPrice / TWSE STOCK_DAY","as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日約 17:30"},
+        {"name":"股價","dataset":provider_status.get("price_provider") or "TaiwanStockPrice / TWSE STOCK_DAY / TPEx tradingStock","as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日收盤後"},
         {"name":"三大法人","dataset":"TaiwanStockInstitutionalInvestorsBuySellWide","as_of":flow.get("last_date"),"status":"ok" if flow.get("last_date") else "missing","scheduled_update":"交易日約 20:00"},
         {"name":"融資融券","dataset":"TaiwanStockMarginPurchaseShortSale","as_of":flow.get("margin_last_date"),"status":"ok" if flow.get("margin_last_date") else "missing","scheduled_update":"交易日約 21:00"},
         {"name":"月營收","dataset":"TaiwanStockMonthRevenue","as_of":revenue.get("last_date") or revenue.get("revenue_period"),"status":"ok" if revenue else "missing","scheduled_update":"依公司公告"},
@@ -2604,7 +2762,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
           "source_status":source_status,"evidence_graph":evidence_graph,"errors":errors,"provider_status":provider_status,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,
-          "data_policy":"V5.3.5 Provider Fallback：FinMind 保留為結構化資料來源；行情或公司資料缺失時改用 TWSE 官方資料，各區塊失敗彼此隔離。"}
+          "data_policy":"V5.3.5 Provider Fallback：FinMind 保留為結構化資料來源；行情或公司資料缺失時依上市／上櫃市場改用 TWSE／TPEx 官方資料，各區塊失敗彼此隔離，缺值不視為 0。"}
     _CACHE[ticker]=(time.time(),data)
     return data
 
@@ -2620,7 +2778,7 @@ def report_html(d: dict[str, Any]) -> str:
     return f"""<!doctype html><html lang='zh-Hant'><head><meta charset='utf-8'><style>
     @page{{size:A4;margin:11mm}} body{{font-family:'Noto Sans TC','PingFang TC',sans-serif;color:#13202a;font-size:9.5pt;line-height:1.55}} h1{{font-size:23pt;margin:0}} h2{{font-size:14pt;border-bottom:2px solid #173847;padding-bottom:4px;margin:18px 0 8px}} .muted{{color:#60727c}} .head{{display:flex;justify-content:space-between;border-bottom:3px solid #173847;padding-bottom:9px}} .price{{font-size:23pt;font-weight:800;text-align:right}} .pill{{display:inline-block;border:1px solid #719188;border-radius:20px;padding:2px 8px;margin-right:5px}} .grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin:10px 0}} .card{{border:1px solid #d7e0e4;border-radius:7px;padding:8px}} .card b{{font-size:14pt;display:block}} table{{width:100%;border-collapse:collapse;font-size:8.4pt}} th,td{{padding:5px;border-bottom:1px solid #dce4e8;text-align:left}} th{{background:#f2f6f7}} .call{{border-left:4px solid #17866b;background:#f4faf8;padding:9px}} .warn{{border:1px solid #d7b94b;background:#fff9e7;padding:8px;margin-top:10px}} .small{{font-size:8pt}} .page-break{{break-before:page}} .cols{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} ul{{margin:4px 0 0;padding-left:18px}} .badge{{font-weight:700}}
     </style></head><body>
-    <div class='head'><div><div class='muted'>AI STOCK RESEARCH TERMINAL V5.2.5 • TAIWAN EQUITY RESEARCH</div><h1>{esc(d['name'])} <span class='muted'>{esc(d['ticker'])}</span></h1><div><span class='pill'>{esc(d['industry'])}</span><span class='pill'>{esc(d['stance'])}</span><span class='pill'>可信度 {conf['overall']}/100</span></div></div><div><div class='muted'>最新收盤</div><div class='price'>{nfmt(d['price'],1)}</div><div>{pct(d['change_pct'])}</div></div></div>
+    <div class='head'><div><div class='muted'>AI STOCK RESEARCH TERMINAL V5.3.5 • TAIWAN EQUITY RESEARCH</div><h1>{esc(d['name'])} <span class='muted'>{esc(d['ticker'])}</span></h1><div><span class='pill'>{esc(d['industry'])}</span><span class='pill'>{esc(d['stance'])}</span><span class='pill'>可信度 {conf['overall']}/100</span></div></div><div><div class='muted'>最新收盤</div><div class='price'>{nfmt(d['price'],1)}</div><div>{pct(d['change_pct'])}</div></div></div>
     <div class='small muted'>報告產生：{esc(d['generated_at'])} ｜ 資料完整度：{conf['data_completeness']}% ｜ 估值信心：{conf['valuation_confidence']}%</div>
     <h2>1. Executive Summary</h2><div class='call'>{esc(d['thesis'])}</div>
     <div class='grid'><div class='card'>綜合評分<b>{sc['綜合']}/100</b></div><div class='card'>基本面<b>{sc['基本面']}</b></div><div class='card'>籌碼面<b>{sc['籌碼面']}</b></div><div class='card'>技術面<b>{sc['技術面']}</b></div></div>
@@ -2668,9 +2826,9 @@ async def stock_pdf(ticker: str, refresh: bool = Query(True)):
     d=await build_stock(ticker.strip(), force_refresh=refresh)
     if d["price"] is None: raise HTTPException(503,"目前無法取得股價資料，為避免輸出錯誤報告，PDF 未產生。")
     stamp=datetime.now().strftime("%Y%m%d_%H%M")
-    out=REPORT_DIR/f"{ticker}_{stamp}_research_v5_2_4a.pdf"
+    out=REPORT_DIR/f"{ticker}_{stamp}_research_v5_3_5.pdf"
     HTML(string=report_html(d),base_url=str(ROOT)).write_pdf(out)
-    return FileResponse(out,media_type="application/pdf",filename=f"{ticker}_AI_research_V5_2_4a_{stamp}.pdf")
+    return FileResponse(out,media_type="application/pdf",filename=f"{ticker}_AI_research_V5_3_5_{stamp}.pdf")
 
 @app.post("/api/cache/clear")
 async def cache_clear():
@@ -2740,7 +2898,9 @@ async def provider_diagnostics(ticker: str):
     status=d.get("provider_status") or {}
     provider_errors=list(dict.fromkeys([*(status.get("fallback_errors") or []),*(d.get("errors") or [])]))
     return {"version":"5.3.5","ticker":ticker,"finmind_available":bool(status.get("finmind_available")),
-            "twse_fallback_success":bool(status.get("twse_fallback_success")),"price_provider":status.get("price_provider"),
+            "finmind_price_available":bool(status.get("finmind_price_available")),
+            "official_price_fallback_success":bool(status.get("official_price_fallback_success")),
+            "twse_fallback_success":bool(status.get("twse_fallback_success")),"tpex_fallback_success":bool(status.get("tpex_fallback_success")),"price_provider":status.get("price_provider"),
             "info_provider":status.get("info_provider"),"price_rows":status.get("price_rows",0),
             "latest_price_date":status.get("latest_price_date"),"provider_errors":provider_errors}
 

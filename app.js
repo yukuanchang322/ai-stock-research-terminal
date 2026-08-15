@@ -14,7 +14,7 @@ function lineSvg(values){
 function flowMatrix(fl){
   const rows=[['外資','foreign'],['投信','trust'],['自營商','dealer']];
   const signed=v=>v==null?'—':`${Number(v)>0?'+':''}${fmt0(v)}`;
-  return `<div class="flow-matrix"><div class="flow-head"><b>法人</b><b>1日</b><b>5日</b><b>20日</b></div>${rows.map(([label,key])=>`<div class="flow-matrix-row"><b>${label}</b>${[1,5,20].map(n=>{const v=fl[`${key}_${n}`];return `<span class="${v<0?'neg':'pos'}">${signed(v)}</span>`}).join('')}</div>`).join('')}<div class="flow-matrix-row margin-row"><b>融資%</b>${[1,5,20].map(n=>{const v=fl[`margin_${n}_pct`];return `<span class="${v>0?'neg':'pos'}">${v==null?'—':`${v>0?'+':''}${fmt(v,1)}%`}</span>`}).join('')}</div></div>`;
+  return `<div class="flow-matrix"><div class="flow-head"><b>法人</b><b>1日</b><b>5日</b><b>20日</b></div>${rows.map(([label,key])=>`<div class="flow-matrix-row"><b>${label}</b>${[1,5,20].map(n=>{const v=fl[`${key}_${n}`];return `<span class="${v==null?'missing':v<0?'neg':'pos'}">${signed(v)}</span>`}).join('')}</div>`).join('')}<div class="flow-matrix-row margin-row"><b>融資%</b>${[1,5,20].map(n=>{const v=fl[`margin_${n}_pct`];return `<span class="${v==null?'missing':v>0?'neg':'pos'}">${v==null?'—':`${v>0?'+':''}${fmt(v,1)}%`}</span>`}).join('')}</div></div>`;
 }
 function _techLinePoints(series,key,w,h,p,min,max){
   const vals=series.map(x=>x[key]);
@@ -109,7 +109,7 @@ function render(d){
   $('companyName').textContent=d.name; $('tickerLabel').textContent=d.ticker; $('sector').textContent=d.industry; $('marketType').textContent=d.market_type;
   $('stanceTag').textContent=d.stance; $('confidenceScore').textContent=d.confidence?.overall ?? '—'; $('price').textContent=fmt(d.price,1); $('dayChange').textContent=pct(d.change_pct);
   $('thesis').textContent=d.thesis; $('dataPolicy').textContent=d.data_policy; $('overallScore').textContent=d.scores['綜合'];
-  $('kpis').innerHTML=[['預期狀態',d.expectation_gap?.regime||'—','V5.2.15'],['Research Score',`${d.scores['綜合']}/100`,'量化綜合'],['可信度',`${d.confidence?.overall??'—'}/100`,'資料+估值'],['PER',`${fmt(d.per?.per,1)}x`,'最新可得'],['營收 YoY',pct(d.revenue?.revenue_yoy),'最新月'],['外資 1/5/20日',`${fmt0(d.flow?.foreign_1)} / ${fmt0(d.flow?.foreign_5)} / ${fmt0(d.flow?.foreign_20)}`,'淨買賣'],['RSI14',fmt(d.technical?.rsi14,1),'技術動能']].map(x=>`<div class="kpi"><span>${x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`).join('');
+  $('kpis').innerHTML=[['預期狀態',d.expectation_gap?.regime||'—','V5.3.5'],['Research Score',`${d.scores['綜合']}/100`,'量化綜合'],['可信度',`${d.confidence?.overall??'—'}/100`,'資料+估值'],['PER',`${fmt(d.per?.per,1)}x`,'最新可得'],['營收 YoY',pct(d.revenue?.revenue_yoy),'最新月'],['外資 1/5/20日',`${fmt0(d.flow?.foreign_1)} / ${fmt0(d.flow?.foreign_5)} / ${fmt0(d.flow?.foreign_20)}`,'淨買賣'],['RSI14',fmt(d.technical?.rsi14,1),'技術動能']].map(x=>`<div class="kpi"><span>${x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`).join('');
   $('dockPdf').disabled=false; $('dockShare').disabled=false; $('lastFetch').textContent=`資料頁產生 ${new Date(d.generated_at).toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit'})}`;
   // Safari-safe URL update: avoid passing a URL object to history.replaceState.
   try {
@@ -134,6 +134,7 @@ function render(d){
     metric('TTM EPS',fmt(es.ttm_eps,2),`${es.ttm_period||'—'} · ${es.ttm_method_label||''}`), metric('財報來源',f.source||es.source||'—',`${f.period||f.statement_date||''} · ${staleNote}`),
     metric('毛利率',pct(f.gross_margin),f.period||'最新財報期'), metric('營益率',pct(f.operating_margin),f.period||'最新財報期'), metric('PER / PBR',`${fmt(p.per,1)}x / ${fmt(p.pbr,1)}x`,perNote)
   ].join('');
+  document.querySelectorAll('.eps-ledger,.evidence-matrix').forEach(node=>node.remove());
   const ledger=(es.evidence_ledger||[]);
   const ledgerHtml=ledger.length?`<div class="eps-ledger"><h4>EPS Evidence Ledger</h4><div class="ledger-list">${ledger.map(x=>`<div class="ledger-row ${x.status==='usable'?'ok':'missing'}"><b>${x.period}</b><span>${x.quarter_eps_direct!=null?`單季 ${fmt(x.quarter_eps_direct,2)}`:(x.ytd_eps!=null?`YTD ${fmt(x.ytd_eps,2)}`:'缺資料')}</span><small>${x.source||x.missing_reason||'無官方證據'}${x.derived_quarter_eps!=null?` · 推導單季 ${fmt(x.derived_quarter_eps,2)}`:''}</small></div>`).join('')}</div></div>`:'';
   $('fundamentalTable').insertAdjacentHTML('afterend',ledgerHtml);
@@ -145,9 +146,14 @@ function render(d){
 
   const fl=d.flow||{};
   $('flowTable').innerHTML=flowMatrix(fl);
-  const flows={外資:fl.foreign_20||0,投信:fl.trust_20||0,自營商:fl.dealer_20||0}, mx=Math.max(1,...Object.values(flows).map(Math.abs));
-  $('flowBars').innerHTML=Object.entries(flows).map(([k,v])=>`<div class="flow-row"><span>${k} 20日</span><div class="flow-track"><div class="flow-fill ${v<0?'neg':''}" style="width:${Math.abs(v)/mx*100}%"></div></div><b>${v>0?'+':''}${fmt0(v)}</b></div>`).join('');
-  $('flowAnalysis').textContent=`法人籌碼以 1日 / 5日 / 20日三個時間尺度判讀；短線看1日、波段轉折看5日、中期方向看20日。外資20日 ${fl.foreign_20>=0?'偏買超':'偏賣超'}，投信20日 ${fl.trust_20>=0?'偏買超':'偏賣超'}。`;
+  const flows={外資:fl.foreign_20,投信:fl.trust_20,自營商:fl.dealer_20};
+  const availableFlows=Object.values(flows).filter(v=>v!=null&&Number.isFinite(Number(v))).map(Number);
+  const mx=Math.max(1,...availableFlows.map(Math.abs));
+  $('flowBars').innerHTML=Object.entries(flows).map(([k,v])=>v==null
+    ? `<div class="flow-row missing"><span>${k} 20日</span><div class="flow-track"></div><b>—</b></div>`
+    : `<div class="flow-row"><span>${k} 20日</span><div class="flow-track"><div class="flow-fill ${v<0?'neg':''}" style="width:${Math.abs(v)/mx*100}%"></div></div><b>${v>0?'+':''}${fmt0(v)}</b></div>`).join('');
+  const direction=v=>v==null?'資料不足':Number(v)>0?'偏買超':Number(v)<0?'偏賣超':'買賣超相抵';
+  $('flowAnalysis').textContent=`法人籌碼以 1日 / 5日 / 20日三個時間尺度判讀；短線看1日、波段轉折看5日、中期方向看20日。外資20日 ${direction(fl.foreign_20)}，投信20日 ${direction(fl.trust_20)}。`;
 
   const t=d.technical||{}; $('techPill').textContent=t.trend||'資料不足';
   $('priceChart').innerHTML=technicalDashboard(t);
@@ -204,9 +210,9 @@ async function readApiResponse(response){
 async function loadTicker(ticker, force=false){
   ticker=String(ticker||'').trim().toUpperCase();
   $('errorBox').classList.add('hidden');
-  if(!/^[0-9A-Z.-]{2,12}$/.test(ticker)){
+  if(!/^\d{4,6}$/.test(ticker)){
     $('report').classList.add('hidden');
-    $('errorBox').textContent='股票代號格式不正確，請輸入例如 2330、3661。';
+    $('errorBox').textContent='股票代號格式不正確，請輸入 4 至 6 位數的台灣股票代號，例如 2330、3661、6510。';
     $('errorBox').classList.remove('hidden');
     return;
   }
