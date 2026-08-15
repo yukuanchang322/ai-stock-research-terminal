@@ -39,7 +39,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.2.13")
+app = FastAPI(title="AI Stock Research Terminal", version="5.3.0")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -88,6 +88,18 @@ async def finmind(dataset: str, ticker: str | None = None, start: date | None = 
 
 TWSE_OPENAPI = "https://openapi.twse.com.tw/v1"
 TPEX_OPENAPI = "https://www.tpex.org.tw/openapi/v1"
+TWSTOCK_MCP_URL = os.getenv("TWSTOCK_MCP_URL", "https://TW-Stock-MCP-Server.fastmcp.app/mcp").strip()
+TWSTOCK_MCP_ENABLED = os.getenv("TWSTOCK_MCP_ENABLED", "0").strip().lower() in {"1","true","yes","on"}
+
+PROVIDER_REGISTRY = [
+    {"id":"twse","name":"TWSE OpenAPI/Web API","tier":1,"authority":"official","role":"primary","enabled":True},
+    {"id":"tpex","name":"TPEx OpenAPI","tier":1,"authority":"official","role":"primary","enabled":True},
+    {"id":"company_ir","name":"Company IR / Earnings Release","tier":1,"authority":"company_official","role":"primary","enabled":True},
+    {"id":"eps_registry","name":"Official EPS Registry","tier":1,"authority":"verified_registry","role":"historical_backfill","enabled":True},
+    {"id":"twstock_mcp","name":"TWStock MCP compatible adapter","tier":2,"authority":"aggregator","role":"shadow_crosscheck","enabled":TWSTOCK_MCP_ENABLED,"url":TWSTOCK_MCP_URL},
+    {"id":"finmind","name":"FinMind","tier":3,"authority":"third_party","role":"fallback","enabled":True},
+    {"id":"public_web","name":"Public Web Research","tier":4,"authority":"public_web","role":"research_context","enabled":True},
+]
 
 def parse_num_text(v: Any) -> float | None:
     if v is None: return None
@@ -1920,6 +1932,93 @@ def calc_confidence(source_status: list[dict[str, Any]], valuation: dict[str, An
     return {"data_completeness": completeness, "valuation_confidence": valuation.get("confidence", 0), "research_coverage": research.get("count", 0), "overall": min(100, overall)}
 
 
+def _iso_now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def make_evidence(metric: str, value: Any, *, category: str, kind: str="fact", period: str | None=None,
+                  as_of: str | None=None, source: str="", source_type: str="third_party", source_url: str | None=None,
+                  confidence: int=70, status: str="usable", unit: str | None=None, derived_from: list[str] | None=None,
+                  note: str | None=None) -> dict[str, Any]:
+    return {
+        "id": f"{category}:{metric}:{period or as_of or 'na'}:{source_type}",
+        "metric": metric, "category": category, "kind": kind, "value": value, "unit": unit,
+        "period": period, "as_of": as_of, "source": source, "source_type": source_type,
+        "source_url": source_url, "confidence": int(max(0,min(100,confidence))), "status": status,
+        "derived_from": derived_from or [], "note": note,
+    }
+
+
+def _source_type_for_financial(financial: dict[str,Any], eps_stack: dict[str,Any]) -> str:
+    src=str(financial.get("source") or eps_stack.get("source") or "")
+    if "TWSE" in src or "MOPS" in src or "TPEx" in src: return "official_exchange"
+    if "Registry" in src or "registry" in src: return "verified_registry"
+    if any(x in src for x in ("TSMC","Alchip","公司","IR","Press")): return "company_official"
+    return "third_party"
+
+
+def build_evidence_graph(ticker: str, tech: dict[str,Any], revenue: dict[str,Any], flow: dict[str,Any], perdata: dict[str,Any],
+                         financial: dict[str,Any], eps_stack: dict[str,Any], research: dict[str,Any], company_events: dict[str,Any],
+                         integrity: dict[str,Any]) -> dict[str,Any]:
+    ev=[]
+    if tech.get("last") is not None:
+        ev.append(make_evidence("close",tech.get("last"),category="market",period=tech.get("last_date"),as_of=tech.get("last_date"),source="market feed",source_type="market_feed",confidence=82,unit="TWD"))
+    for k,label in (("per","PER"),("pbr","PBR")):
+        if perdata.get(k) is not None:
+            ev.append(make_evidence(label,perdata.get(k),category="valuation",period=perdata.get("last_date"),as_of=perdata.get("last_date"),source="market valuation feed",source_type="market_feed",confidence=80,unit="x"))
+    if revenue.get("latest_revenue") is not None:
+        ev.append(make_evidence("monthly_revenue",revenue.get("latest_revenue"),category="fundamental",period=revenue.get("revenue_period"),as_of=revenue.get("last_date"),source="monthly revenue disclosure",source_type="official_or_structured",confidence=88,unit="TWD"))
+    if revenue.get("revenue_yoy") is not None:
+        ev.append(make_evidence("monthly_revenue_yoy",revenue.get("revenue_yoy"),category="fundamental",kind="derived_fact",period=revenue.get("revenue_period"),source="derived from monthly revenue",source_type="derived",confidence=86,unit="%",derived_from=["monthly_revenue"]))
+    st=_source_type_for_financial(financial,eps_stack); fin_conf=98 if integrity.get("official_verified") else 45
+    for key,metric in (("quarter_eps","quarter_eps"),("ytd_eps","ytd_eps"),("ttm_eps","ttm_eps")):
+        val=eps_stack.get(key)
+        if val is not None:
+            kind="derived_fact" if key in {"quarter_eps","ttm_eps"} else "fact"
+            ev.append(make_evidence(metric,val,category="fundamental",kind=kind,period=eps_stack.get("quarter_period") or financial.get("period"),source=financial.get("source") or eps_stack.get("source") or "financial feed",source_type=st,confidence=fin_conf,unit="TWD/share",note=eps_stack.get("note")))
+    for key in ("gross_margin","operating_margin"):
+        if financial.get(key) is not None:
+            ev.append(make_evidence(key,financial.get(key),category="fundamental",period=financial.get("period"),source=financial.get("source") or "financial statement",source_type=st,confidence=fin_conf,unit="%"))
+    for key,metric in (("foreign_20","foreign_20d"),("trust_20","trust_20d"),("dealer_20","dealer_20d"),("margin_balance","margin_balance")):
+        if flow.get(key) is not None:
+            ev.append(make_evidence(metric,flow.get(key),category="positioning",period=flow.get("last_date") or flow.get("margin_last_date"),source="institutional/margin feed",source_type="official_or_structured",confidence=82))
+    if tech.get("rsi14") is not None:
+        ev.append(make_evidence("RSI14",tech.get("rsi14"),category="technical",kind="derived_fact",period=tech.get("last_date"),source="derived from daily prices",source_type="derived",confidence=90,derived_from=["close_series"]))
+    for n,v in (tech.get("ma") or {}).items():
+        if v is not None: ev.append(make_evidence(f"MA{n}",v,category="technical",kind="derived_fact",period=tech.get("last_date"),source="derived from daily prices",source_type="derived",confidence=90,unit="TWD",derived_from=["close_series"]))
+    for row in (research.get("reports") or [])[:25]:
+        if row.get("target_price") is not None:
+            ev.append(make_evidence("analyst_target_price",safe_num(row.get("target_price")),category="research",period=row.get("report_date"),source=row.get("institution") or row.get("publisher") or "public research",source_type="public_web",source_url=row.get("source_url"),confidence=int(row.get("confidence") or 60),unit="TWD",note=row.get("title")))
+        if row.get("forward_eps") is not None:
+            ev.append(make_evidence("analyst_forward_eps",safe_num(row.get("forward_eps")),category="research",period=str(row.get("forward_eps_year") or row.get("report_date") or ""),source=row.get("institution") or "public research",source_type="public_web",source_url=row.get("source_url"),confidence=int(row.get("confidence") or 60),unit="TWD/share",note=row.get("title")))
+    conflicts=[]; groups={}
+    for x in ev:
+        if x.get("status")!="usable" or not isinstance(x.get("value"),(int,float)): continue
+        groups.setdefault((x["metric"],x.get("period")),[]).append(x)
+    for (metric,period),rows in groups.items():
+        if len(rows)<2: continue
+        vals=[float(x["value"]) for x in rows]; base=max(1e-9,abs(sum(vals)/len(vals))); spread=(max(vals)-min(vals))/base
+        if spread>0.02:
+            conflicts.append({"metric":metric,"period":period,"values":[{"value":x["value"],"source":x["source"],"source_type":x["source_type"]} for x in rows],"spread_pct":round(spread*100,2)})
+    usable=[x for x in ev if x.get("status")=="usable"]; official=[x for x in usable if x.get("source_type") in {"official_exchange","company_official","verified_registry","official_or_structured"}]
+    facts=[x for x in usable if x.get("kind")=="fact"]; derived=[x for x in usable if x.get("kind")=="derived_fact"]
+    score=max(0,round(min(100,(len(usable)*2.2)+(len(official)*2.8)-len(conflicts)*8))) if usable else 0
+    return {"schema_version":"1.0","generated_at":_iso_now(),"ticker":ticker,"records":ev,"conflicts":conflicts,"summary":{"records":len(ev),"usable":len(usable),"official_or_verified":len(official),"facts":len(facts),"derived_facts":len(derived),"analysis":0,"conflicts":len(conflicts),"evidence_score":score},"policy":"Fact → Derived Fact → Analysis. Numeric model inputs retain source, period and provenance; conflicts are surfaced rather than silently averaged."}
+
+
+async def probe_twstock_mcp() -> dict[str,Any]:
+    out={"provider":"TWStock MCP compatible adapter","enabled":TWSTOCK_MCP_ENABLED,"url":TWSTOCK_MCP_URL,"mode":"shadow_crosscheck","status":"disabled"}
+    if not TWSTOCK_MCP_ENABLED: return out
+    payload={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.3.0"}}}
+    try:
+        async with httpx.AsyncClient(timeout=8,follow_redirects=True,headers={"Accept":"application/json, text/event-stream","Content-Type":"application/json"}) as client:
+            r=await client.post(TWSTOCK_MCP_URL,json=payload)
+        out.update({"http_status":r.status_code,"content_type":r.headers.get("content-type"),"status":"reachable" if r.status_code<500 else "error","preview":r.text[:300]})
+    except Exception as e:
+        out.update({"status":"error","error":f"{type(e).__name__}: {e}"})
+    return out
+
+
 def narrative(s: dict[str, int], tech: dict[str, Any], revenue: dict[str, Any], flow: dict[str, Any], valuation: dict[str, Any], research: dict[str, Any]) -> dict[str, Any]:
     base = next((x for x in valuation.get("scenarios", []) if x["name"] == "基準"), None)
     facts=[]
@@ -2009,6 +2108,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     expectation=expectation_gap_analysis(research, company_events, perdata, revenue, sc, lp)
     prev=tech.get("series",[])[-2]["close"] if len(tech.get("series",[]))>=2 else None
     change=((lp/prev-1)*100) if lp and prev else None
+    evidence_graph=build_evidence_graph(ticker,tech,revenue,flow,perdata,financial,eps_stack,research,company_events,financial_integrity)
     source_status=[
         {"name":"股價","dataset":"TaiwanStockPrice","as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日約 17:30"},
         {"name":"三大法人","dataset":"TaiwanStockInstitutionalInvestorsBuySellWide","as_of":flow.get("last_date"),"status":"ok" if flow.get("last_date") else "missing","scheduled_update":"交易日約 20:00"},
@@ -2020,12 +2120,13 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         {"name":"公開法人研究","dataset":"Google News RSS + 公開網路引用","as_of":web_research.get("fetched_at"),"status":"ok" if web_research.get("rows") else "missing","scheduled_update":"每次強制刷新重新搜尋"},
         {"name":"公司事件雷達","dataset":"公開新聞/法說/重大訊息引用","as_of":company_events.get("fetched_at"),"status":"ok" if company_events.get("rows") else "missing","scheduled_update":"每次強制刷新重新搜尋"},
     ]
+    source_status.append({"name":"Evidence Engine","dataset":"Multi-Source Evidence Schema v1","as_of":evidence_graph.get("generated_at"),"status":"ok" if evidence_graph.get("summary",{}).get("usable") else "missing","scheduled_update":f"Fact {evidence_graph.get('summary',{}).get('facts',0)} / Derived {evidence_graph.get('summary',{}).get('derived_facts',0)} / Conflicts {evidence_graph.get('summary',{}).get('conflicts',0)}"})
     conf=calc_confidence(source_status,valuation,research)
     data={"ticker":ticker,"name":info.get("stock_name") or ticker,"industry":info.get("industry_category") or "—","market_type":info.get("type") or "—",
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
-          "source_status":source_status,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,
-          "data_policy":"V5.2.8 Official EPS Resolver：官方財報先映射最新季度，再回查前一季官方累計 EPS 計算真實單季 EPS；TTM 僅由四個實際單季 EPS 加總，不做年化猜值。"}
+          "source_status":source_status,"evidence_graph":evidence_graph,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,
+          "data_policy":"V5.3.0 Multi-Source Evidence Engine：所有資料先正規化為 Evidence Record，依官方性、新鮮度、期間與衝突檢查後才進研究模型；Fact、Derived Fact、Analysis 分層呈現。"}
     _CACHE[ticker]=(time.time(),data)
     return data
 
@@ -2123,7 +2224,7 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.2.15",
+        "ticker":ticker,"version":"5.3.0",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
@@ -2143,8 +2244,22 @@ async def eps_registry_diagnostics(ticker: str):
     reg=_load_official_eps_registry()
     rows=[r for r in reg.get("records",[]) if str(r.get("ticker"))==ticker]
     rows=sorted(rows,key=lambda r:(r.get("year") or 0,r.get("quarter") or 0),reverse=True)
-    return {"ticker":ticker,"version":"5.2.15","registry_schema_version":reg.get("schema_version"),
+    return {"ticker":ticker,"version":"5.3.0","registry_schema_version":reg.get("schema_version"),
             "updated_at":reg.get("updated_at"),"record_count":len(rows),"records":rows}
 
+@app.get("/api/evidence/{ticker}")
+async def evidence_api(ticker: str, refresh: int = 0):
+    ticker=ticker.strip().upper()
+    if not re.fullmatch(r"[0-9A-Z]{2,10}", ticker): raise HTTPException(400,"invalid ticker")
+    d=await build_stock(ticker, bool(refresh))
+    return d.get("evidence_graph") or {}
+
+@app.get("/api/diagnostics/providers/{ticker}")
+async def provider_diagnostics(ticker: str):
+    ticker=ticker.strip().upper()
+    d=await build_stock(ticker, False)
+    mcp=await probe_twstock_mcp()
+    return {"version":"5.3.0","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
+
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.2.15","mode":"cloud-mobile-official-eps-registry","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.3.0","mode":"cloud-mobile-multi-source-evidence","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}

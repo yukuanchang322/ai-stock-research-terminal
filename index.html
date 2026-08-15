@@ -9,7 +9,7 @@
   <meta name="apple-mobile-web-app-title" content="AI Stock" />
   <link rel="manifest" href="/static/manifest.webmanifest" />
   <link rel="apple-touch-icon" href="/static/icons/icon-192.png" />
-  <title>AI Stock Research Terminal V5.2.4aa</title>
+  <title>AI Stock Research Terminal V5.3.0</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -28,7 +28,7 @@
       <div class="search-card">
         <label>股票代號</label>
         <div class="search-row"><input id="tickerInput" value="2330" inputmode="numeric" placeholder="例如 2330 / 3661 / 2454" /><button id="searchBtn">產生研究報告</button><button id="refreshBtn" class="ghost">強制刷新</button></div>
-        <small>資料層：FinMind 公開 API + 公開網路研究引用。法人區保留來源、日期與連結，不重製付費研究全文。</small><div class="cloud-status"><span class="status-dot"></span><span id="cloudStatus">雲端服務連線檢查中</span><span class="status-sep">•</span><span id="lastFetch">尚未更新</span></div>
+        <small>資料層：TWSE/TPEx 官方資料 + 公司 IR + Official EPS Registry + FinMind fallback + 公開網路研究；所有數字先進 Evidence Engine，再進分析模型。</small><div class="cloud-status"><span class="status-dot"></span><span id="cloudStatus">雲端服務連線檢查中</span><span class="status-sep">•</span><span id="lastFetch">尚未更新</span></div>
       </div>
     </section>
 
@@ -75,7 +75,7 @@
         </div>
         <div>
           <div class="section-title"><div><span>05</span><h3>法人研究共識</h3></div><div class="pill positive">Public Web Research</div></div>
-          <div class="panel"><div id="analystTable"></div><div class="consensus-box"><span>公開研究引用數</span><b id="reportCount"></b><small id="consensusText"></small><small id="revisionText"></small></div><div id="consensusStats" class="consensus-stats"></div><p class="analysis">V5.2.4aa 以官方財報優先，並搜尋公開網路法人研究，並追蹤同機構前後 EPS/目標價修正，未能辨識或缺乏來源的數字不納入核心共識。</p></div>
+          <div class="panel"><div id="analystTable"></div><div class="consensus-box"><span>公開研究引用數</span><b id="reportCount"></b><small id="consensusText"></small><small id="revisionText"></small></div><div id="consensusStats" class="consensus-stats"></div><p class="analysis">V5.3.0 以 Multi-Source Evidence Engine 將 Fact、Derived Fact、Analysis 分層；法人研究保留來源與日期，來源衝突會揭露而不靜默平均。</p></div>
         </div>
       </section>
 
@@ -118,7 +118,7 @@
 
   <div class="install-sheet" id="installSheet"><div class="install-card"><button class="close" id="closeInstall">×</button><h3>加入 iPhone 主畫面</h3><p>在 Safari 點下方「分享」按鈕，選擇「加入主畫面」。之後可像 App 一樣開啟 AI Stock Research Terminal。</p><button class="primary" id="installOk">知道了</button></div></div>
 
-  <div class="modal" id="methodModal"><div class="modal-card"><button class="close" id="closeModal">×</button><h3>研究方法</h3><p>研究流程固定為：資料新鮮度檢查 → 指標計算 → 五構面評分 → 公開網路法人研究聚合與去重 → EPS/目標價修正 → 預期差判斷 → 多情境估值 → PDF 固化。</p><ol><li>AI 不補缺失財務數字。</li><li>價格、均線、RSI、法人買賣與估值由程式計算。</li><li>法人研究聚合公開網路標題、摘要與數值，保留原始來源連結，不重製付費全文。</li><li>每份 PDF 固定保存產生時間、資料日期與估值基礎。</li></ol></div></div>
+  <div class="modal" id="methodModal"><div class="modal-card"><button class="close" id="closeModal">×</button><h3>研究方法</h3><p>研究流程固定為：多來源蒐集 → Evidence 正規化 → 官方性/期間/新鮮度/衝突驗證 → Fact/Derived Fact 分層 → 基本面/技術面/籌碼面 → 法人研究 → 預期差 → 多情境估值 → PDF 固化。</p><ol><li>AI 不補缺失財務數字。</li><li>價格、均線、RSI、法人買賣與估值由程式計算。</li><li>法人研究聚合公開網路標題、摘要與數值，保留原始來源連結，不重製付費全文。</li><li>每份 PDF 固定保存產生時間、資料日期與估值基礎。</li></ol></div></div>
   <script src="app.js"></script>
 </body>
 </html>

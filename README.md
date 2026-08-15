@@ -1,3 +1,7 @@
+# AI Stock Research Terminal V5.3.0
+
+Multi-Source Evidence Engine: data is normalized and verified before analysis. Official/verified sources are primary; third-party and public-web sources are fallback/context.
+
 # AI Stock Research Terminal V5.2.12
 
 本版為 EPS 原始資料追蹤版。部署後可用 `/api/diagnostics/eps/2330` 與 `/api/diagnostics/eps-raw/2330?year=2026&quarter=1` 精確檢查 MOPS 歷史 EPS 查詢。
