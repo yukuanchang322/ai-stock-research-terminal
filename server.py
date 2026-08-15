@@ -39,7 +39,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.3.0")
+app = FastAPI(title="AI Stock Research Terminal", version="5.3.1")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -1139,14 +1139,56 @@ def _best_period_snapshot(rows: list[dict[str, Any]], year: int, quarter: int) -
     return best
 
 
+BUILTIN_OFFICIAL_EPS_REGISTRY = {
+    "schema_version": "1.1",
+    "description": "Built-in verified official EPS seed for resilient cloud deployment. File-based registry may extend/override these records.",
+    "updated_at": "2026-08-15",
+    "records": [
+        {"ticker":"2330","year":2025,"quarter":2,"quarter_eps":15.36,"source":"TSMC Press Center","source_url":"https://pr.tsmc.com/chinese/news/3249","evidence_kind":"company_official_quarter_eps","verified":True},
+        {"ticker":"2330","year":2025,"quarter":3,"quarter_eps":17.44,"source":"TSMC Press Center","source_url":"https://pr.tsmc.com/chinese/news/3264","evidence_kind":"company_official_quarter_eps","verified":True},
+        {"ticker":"2330","year":2025,"quarter":4,"quarter_eps":19.50,"source":"TSMC Press Center","source_url":"https://pr.tsmc.com/chinese/news/3281","evidence_kind":"company_official_quarter_eps","verified":True},
+        {"ticker":"2330","year":2026,"quarter":1,"quarter_eps":22.08,"source":"TSMC Press Center","source_url":"https://pr.tsmc.com/chinese/news/3297","evidence_kind":"company_official_quarter_eps","verified":True},
+        {"ticker":"2330","year":2026,"quarter":2,"quarter_eps":27.25,"source":"TSMC Press Center","source_url":"https://pr.tsmc.com/chinese/news/3326","evidence_kind":"company_official_quarter_eps","verified":True},
+        {"ticker":"3661","year":2025,"quarter":2,"quarter_eps":16.37,"ytd_eps":34.49,"source":"Alchip reviewed financial report","source_url":"https://www.alchip.com/upload/2025_08_18/3_20250818101142i3cka8jyk0.pdf","evidence_kind":"company_official_financial_pdf","verified":True},
+        {"ticker":"3661","year":2025,"quarter":3,"quarter_eps":16.40,"ytd_eps":50.89,"source":"Alchip reviewed financial report","source_url":"https://www.alchip.com/upload/2025_11_12/3_20251112141146lr7eqkVGQ0.pdf","evidence_kind":"company_official_financial_pdf","verified":True},
+        {"ticker":"3661","year":2025,"quarter":4,"quarter_eps":18.30,"fy_eps":69.18,"source":"Alchip official FY2025 results","source_url":"https://www.alchip.com/en/Newsroom/Alchip_2025_Q4_financial_results","evidence_kind":"company_official_quarter_eps","verified":True},
+        {"ticker":"3661","year":2026,"quarter":1,"quarter_eps":17.55,"ytd_eps":17.55,"source":"Alchip reviewed financial report","source_url":"https://www.alchip.com/upload/2026_05_11/3_20260511103038sgoopzYTC0.pdf","evidence_kind":"company_official_financial_pdf","verified":True}
+    ]
+}
+
 OFFICIAL_EPS_REGISTRY_PATH = Path(__file__).resolve().parent / "data" / "official_eps_registry.json"
 
 def _load_official_eps_registry() -> dict[str, Any]:
+    """Load the verified EPS registry with a built-in cloud-safe seed.
+
+    GitHub/mobile uploads can accidentally omit nested data files. V5.3.1 therefore ships a
+    minimal verified registry inside server.py and merges any file-based registry on top.
+    File rows override built-ins for the same (ticker, year, quarter).
+    """
+    merged={"schema_version":"1.1","description":"Merged built-in + file official EPS registry","updated_at":"2026-08-15","records":[]}
+    by_key={}
+    for row in BUILTIN_OFFICIAL_EPS_REGISTRY.get("records",[]):
+        if row.get("verified") is True:
+            by_key[(str(row.get("ticker")),int(row.get("year")),int(row.get("quarter")))]=dict(row)
     try:
         raw=json.loads(OFFICIAL_EPS_REGISTRY_PATH.read_text(encoding="utf-8"))
-        return raw if isinstance(raw,dict) else {"records":[]}
-    except Exception:
-        return {"records":[]}
+        if isinstance(raw,dict):
+            for row in raw.get("records",[]):
+                try:
+                    if row.get("verified") is True:
+                        key=(str(row.get("ticker")),int(row.get("year")),int(row.get("quarter")))
+                        by_key[key]=dict(row)
+                except Exception:
+                    continue
+            merged["file_schema_version"]=raw.get("schema_version")
+            merged["file_updated_at"]=raw.get("updated_at")
+    except Exception as exc:
+        merged["file_load_error"]=type(exc).__name__
+    merged["records"]=list(by_key.values())
+    merged["records"].sort(key=lambda r:(str(r.get("ticker")),int(r.get("year",0)),int(r.get("quarter",0))))
+    merged["record_count"]=len(merged["records"])
+    merged["builtin_count"]=len(BUILTIN_OFFICIAL_EPS_REGISTRY.get("records",[]))
+    return merged
 
 def registry_eps_for_period(ticker: str, year: int, quarter: int) -> dict[str, Any] | None:
     """Return a verified company-official EPS registry record for one fiscal quarter.
@@ -1413,9 +1455,9 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             "missing_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")!="usable"],
             "policy":"official_registry_then_company_ir_then_official_disclosure; no third-party EPS for official derivation",
         },
-        "evidence_ledger_version":"5.2.15",
+        "evidence_ledger_version":"5.3.1",
         "blocked_mops_html_removed":True,
-        "note":"V5.2.15 Official EPS Registry：歷史季度優先讀取可稽核的公司官方 Registry，再以公司 IR/官方揭露補抓。Registry 每筆保留官方來源 URL；缺資料才留白，第三方 EPS 不參與官方推導。"
+        "note":"V5.3.1 Evidence Engine EPS takeover：歷史季度優先讀取可稽核的公司官方 Registry，再以公司 IR/官方揭露補抓。Registry 每筆保留官方來源 URL；缺資料才留白，第三方 EPS 不參與官方推導。"
     }
 
 
@@ -2009,7 +2051,7 @@ def build_evidence_graph(ticker: str, tech: dict[str,Any], revenue: dict[str,Any
 async def probe_twstock_mcp() -> dict[str,Any]:
     out={"provider":"TWStock MCP compatible adapter","enabled":TWSTOCK_MCP_ENABLED,"url":TWSTOCK_MCP_URL,"mode":"shadow_crosscheck","status":"disabled"}
     if not TWSTOCK_MCP_ENABLED: return out
-    payload={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.3.0"}}}
+    payload={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.3.1"}}}
     try:
         async with httpx.AsyncClient(timeout=8,follow_redirects=True,headers={"Accept":"application/json, text/event-stream","Content-Type":"application/json"}) as client:
             r=await client.post(TWSTOCK_MCP_URL,json=payload)
@@ -2126,7 +2168,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
           "source_status":source_status,"evidence_graph":evidence_graph,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,
-          "data_policy":"V5.3.0 Multi-Source Evidence Engine：所有資料先正規化為 Evidence Record，依官方性、新鮮度、期間與衝突檢查後才進研究模型；Fact、Derived Fact、Analysis 分層呈現。"}
+          "data_policy":"V5.3.1 Evidence Engine EPS Takeover：所有資料先正規化為 Evidence Record，依官方性、新鮮度、期間與衝突檢查後才進研究模型；Fact、Derived Fact、Analysis 分層呈現。"}
     _CACHE[ticker]=(time.time(),data)
     return data
 
@@ -2224,7 +2266,7 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.3.0",
+        "ticker":ticker,"version":"5.3.1",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
@@ -2244,7 +2286,7 @@ async def eps_registry_diagnostics(ticker: str):
     reg=_load_official_eps_registry()
     rows=[r for r in reg.get("records",[]) if str(r.get("ticker"))==ticker]
     rows=sorted(rows,key=lambda r:(r.get("year") or 0,r.get("quarter") or 0),reverse=True)
-    return {"ticker":ticker,"version":"5.3.0","registry_schema_version":reg.get("schema_version"),
+    return {"ticker":ticker,"version":"5.3.1","registry_schema_version":reg.get("schema_version"),
             "updated_at":reg.get("updated_at"),"record_count":len(rows),"records":rows}
 
 @app.get("/api/evidence/{ticker}")
@@ -2259,7 +2301,7 @@ async def provider_diagnostics(ticker: str):
     ticker=ticker.strip().upper()
     d=await build_stock(ticker, False)
     mcp=await probe_twstock_mcp()
-    return {"version":"5.3.0","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
+    return {"version":"5.3.1","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.3.0","mode":"cloud-mobile-multi-source-evidence","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.3.1","mode":"cloud-mobile-evidence-eps-takeover","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
