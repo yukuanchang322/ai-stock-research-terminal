@@ -38,7 +38,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.2.8")
+app = FastAPI(title="AI Stock Research Terminal", version="5.2.9")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -111,7 +111,7 @@ def _row_value(row: dict[str, Any], includes: list[str], excludes: list[str] | N
     return None
 
 async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.8"}) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.9"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
 
@@ -125,7 +125,7 @@ IR_FINANCIAL_PAGES = {
 async def mops_csv_rows(filename: str) -> list[dict[str, Any]]:
     """Official MOPS CSV fallback. Some foreign/KY issuers can appear here even when JSON feeds lag."""
     url=f"{MOPS_CSV_BASE}/{filename}"
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.8"}) as client:
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.9"}) as client:
         r=await client.get(url); r.raise_for_status()
     raw=r.content
     text=None
@@ -223,7 +223,7 @@ async def fetch_company_ir_financial(ticker: str, expected_year: int, expected_q
     page=IR_FINANCIAL_PAGES.get(ticker)
     if not page: return None
     try:
-        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.8"}) as client:
+        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.9"}) as client:
             r=await client.get(page); r.raise_for_status(); page_html=r.text
             hrefs=re.findall(r'href=["\']([^"\']+)["\']',page_html,re.I)
             embedded=re.findall(r'["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']',page_html,re.I)
@@ -343,7 +343,7 @@ async def fetch_mops_material_financial(ticker: str, expected_year: int | None=N
     historical-search endpoint so a disclosure from one or two days ago is still discoverable.
     """
     out=[]
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.8"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.9"}
     async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers=ua) as client:
         # A. Daily official material-information feed.
         try:
@@ -483,6 +483,87 @@ def _extract_mops_ifrs_tables(html_text: str, ticker: str, year: int, quarter: i
     }
 
 
+
+
+def _safe_preview_text(text: str, limit: int = 5000) -> str:
+    """Small diagnostic preview; enough to debug MOPS parsing without returning huge pages."""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    return text[:limit]
+
+def _df_preview(df: pd.DataFrame, max_rows: int = 14, max_cols: int = 8) -> dict[str, Any]:
+    try:
+        slim=df.iloc[:max_rows,:max_cols].copy()
+        return {
+            "shape":[int(df.shape[0]),int(df.shape[1])],
+            "columns":[str(x) for x in _flatten_cols(df.columns)[:max_cols]],
+            "rows":[[str(v)[:180] for v in row] for row in slim.astype(str).values.tolist()]
+        }
+    except Exception as e:
+        return {"error":f"{type(e).__name__}: {e}"}
+
+def _eps_candidates_from_tables(tables: list[pd.DataFrame]) -> list[dict[str, Any]]:
+    out=[]
+    aliases=["基本每股盈餘合計","基本每股盈餘","每股盈餘","Basic earnings per share","Earnings per share"]
+    for ti,df in enumerate(tables):
+        try:
+            cols=_flatten_cols(df.columns)
+            for i,row in df.iterrows():
+                first=[str(x) for x in row.iloc[:3].tolist()]
+                label=" | ".join(first)
+                if any(_norm_label(a) in _norm_label(label) for a in aliases):
+                    vals=[]
+                    for ci,v in enumerate(row.tolist()):
+                        n=parse_num_text(v)
+                        if n is not None:
+                            vals.append({"column_index":ci,"column":cols[ci] if ci<len(cols) else str(ci),"raw":str(v),"number":n})
+                    out.append({"table_index":ti,"row_index":str(i),"label":label[:500],"values":vals[:12]})
+        except Exception:
+            continue
+    return out
+
+async def trace_mops_company_ifrs(ticker: str, year: int, quarter: int) -> dict[str, Any]:
+    """Raw trace of company-specific MOPS historical IFRS lookup. No silent catches."""
+    base="https://mops.twse.com.tw/server-java/t164sb01"
+    headers={"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1",
+             "Referer":"https://mops.twse.com.tw/mops/"}
+    mops_year = year - 1911 if year >= 1912 else year
+    trace={"ticker":ticker,"gregorian_year":year,"mops_syear":mops_year,"quarter":quarter,"requests":[]}
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as client:
+        for report_id in ("C","B","A"):
+            params={"step":"1","CO_ID":ticker,"SYEAR":str(mops_year),"SSEASON":str(quarter),"REPORT_ID":report_id}
+            item={"report_id":report_id,"request_url":base,"request_params":params}
+            try:
+                r=await client.get(base,params=params)
+                item.update({
+                    "http_status":r.status_code,"final_url":str(r.url),"content_type":r.headers.get("content-type"),
+                    "content_length":len(r.content),"encoding_hint":r.encoding
+                })
+                text=_decode_mops_html(r.content,r.encoding)
+                item["decoded_preview"]=_safe_preview_text(text,3500)
+                item["has_no_data_marker"]=("查無資料" in text or "無符合條件" in text)
+                try:
+                    tables=pd.read_html(io.StringIO(text))
+                    item["table_count"]=len(tables)
+                    item["eps_candidates"]=_eps_candidates_from_tables(tables)
+                    # Preview only tables likely to contain EPS or revenue.
+                    previews=[]
+                    for ti,df in enumerate(tables):
+                        flat=" ".join(str(x) for x in df.astype(str).fillna("").values.ravel()[:800])
+                        if ("每股盈餘" in flat or "Earnings per share" in flat or "營業收入" in flat or "Operating revenue" in flat):
+                            previews.append({"table_index":ti,**_df_preview(df)})
+                    item["relevant_table_previews"]=previews[:4]
+                except Exception as e:
+                    item["read_html_error"]=f"{type(e).__name__}: {e}"
+                snap=_extract_mops_ifrs_tables(text,ticker,year,quarter,report_id,str(r.url))
+                item["parser_snapshot"]=snap
+                if snap:
+                    item["parser_selected_column"]=snap.get("selected_column")
+                    item["parser_ytd_eps"]=snap.get("ytd_eps")
+            except Exception as e:
+                item["request_error"]=f"{type(e).__name__}: {e}"
+            trace["requests"].append(item)
+    return trace
+
 async def fetch_mops_company_ifrs(ticker: str, year: int, quarter: int) -> list[dict[str, Any]]:
     """Company-specific official MOPS report, avoiding incomplete aggregate feeds.
 
@@ -515,7 +596,7 @@ async def fetch_tsmc_quarterly_release(year: int, quarter: int) -> dict[str, Any
     """TSMC official IR fallback. Gives a verified quarter even before MOPS aggregate refresh."""
     if quarter not in (1,2,3,4): return None
     url=f"https://investor.tsmc.com/english/quarterly-results/{year}/q{quarter}"
-    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.8"}
+    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.9"}
     try:
         async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers=headers) as client:
             r=await client.get(url); r.raise_for_status(); text=html.unescape(re.sub(r"<[^>]+>"," ",r.text))
@@ -661,7 +742,7 @@ async def diagnose_official_financial_sources(ticker: str) -> dict[str, Any]:
     """
     now=datetime.now().astimezone()
     ey,eq,expected=expected_latest_financial_period(now.date())
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.8 diagnostics"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.9 diagnostics"}
     out={
         "ticker":ticker, "generated_at":now.isoformat(timespec="seconds"),
         "expected_period":expected, "expected_year":ey, "expected_quarter":eq,
@@ -1751,19 +1832,41 @@ async def eps_diagnostics(ticker: str):
     ticker=ticker.strip().upper()
     official=await fetch_official_income_statement(ticker)
     official=await reconcile_official_financial_snapshot(ticker, official)
-    # FinMind history is optional here; diagnostics must still work without a token.
     fin_rows=[]
+    finmind_error=None
     try:
         start=(date.today()-timedelta(days=900)).isoformat()
         fin_rows=await fm("TaiwanStockFinancialStatements", ticker, start)
-    except Exception:
+    except Exception as e:
+        finmind_error=f"{type(e).__name__}: {e}"
         fin_rows=[]
     stack=await build_eps_stack(ticker,fin_rows,official,{})
+    raw_periods=[]
+    fy=official.get("fiscal_year"); fq=official.get("fiscal_quarter")
+    if fy and fq:
+        periods=[]; y,q=int(fy),int(fq)
+        for _ in range(5):
+            periods.append((y,q)); q-=1
+            if q==0: y-=1; q=4
+        for y,q in periods:
+            raw_periods.append({
+                "period":f"{y} Q{q}",
+                "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
+            })
     return {
-        "ticker":ticker,"version":"5.2.8",
+        "ticker":ticker,"version":"5.2.9",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
-        "eps_stack":stack
+        "finmind_error":finmind_error,
+        "eps_stack":stack,
+        "raw_period_trace_links":raw_periods,
+        "note":"V5.2.9 exposes exact historical MOPS request parameters, HTTP status, decoded response preview, table/column labels, EPS candidate numbers, and parser-selected value."
     }
 
+@app.get("/api/diagnostics/eps-raw/{ticker}")
+async def eps_raw_diagnostics(ticker: str, year: int = Query(..., ge=1990, le=2100), quarter: int = Query(..., ge=1, le=4)):
+    ticker=ticker.strip().upper()
+    if not ticker.isdigit(): raise HTTPException(400,"ticker must be numeric")
+    return await trace_mops_company_ifrs(ticker,year,quarter)
+
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.2.8","mode":"cloud-mobile-official-eps-resolver","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.2.9","mode":"cloud-mobile-eps-raw-trace","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
