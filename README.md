@@ -111,3 +111,8 @@ Production EPS resolution uses official structured data and company IR. Blocked 
 - 2330 會從台積電官方季度結果/官方新聞中心解析歷史季度單季 EPS。
 - Q2/Q3 使用官方 YTD 差額，Q4 使用全年減 Q3 YTD。
 - 不把第三方歷史 EPS 混入官方差額計算。
+
+
+## V5.2.15 Official EPS Registry
+
+歷史 EPS 先讀取 `data/official_eps_registry.json` 的公司官方證據，再 fallback 到公司 IR/官方揭露。每筆 registry 均保留官方來源 URL 與 verified 狀態。新增 `/api/diagnostics/eps-registry/{ticker}`。

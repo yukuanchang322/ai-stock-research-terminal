@@ -112,7 +112,7 @@ def _row_value(row: dict[str, Any], includes: list[str], excludes: list[str] | N
     return None
 
 async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.14"}) as client:
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.15"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
 
@@ -126,7 +126,7 @@ IR_FINANCIAL_PAGES = {
 async def mops_csv_rows(filename: str) -> list[dict[str, Any]]:
     """Official MOPS CSV fallback. Some foreign/KY issuers can appear here even when JSON feeds lag."""
     url=f"{MOPS_CSV_BASE}/{filename}"
-    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.14"}) as client:
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.15"}) as client:
         r=await client.get(url); r.raise_for_status()
     raw=r.content
     text=None
@@ -224,7 +224,7 @@ async def fetch_company_ir_financial(ticker: str, expected_year: int, expected_q
     page=IR_FINANCIAL_PAGES.get(ticker)
     if not page: return None
     try:
-        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.14"}) as client:
+        async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.15"}) as client:
             r=await client.get(page); r.raise_for_status(); page_html=r.text
             hrefs=re.findall(r'href=["\']([^"\']+)["\']',page_html,re.I)
             embedded=re.findall(r'["\']([^"\']+\.pdf(?:\?[^"\']*)?)["\']',page_html,re.I)
@@ -344,7 +344,7 @@ async def fetch_mops_material_financial(ticker: str, expected_year: int | None=N
     historical-search endpoint so a disclosure from one or two days ago is still discoverable.
     """
     out=[]
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.14"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.15"}
     async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers=ua) as client:
         # A. Daily official material-information feed.
         try:
@@ -612,7 +612,7 @@ async def fetch_tsmc_quarterly_release(year: int, quarter: int) -> dict[str, Any
     """
     if quarter not in (1,2,3,4): return None
     landing=f"https://investor.tsmc.com/english/quarterly-results/{year}/q{quarter}"
-    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.14"}
+    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.15"}
     # Evidence-ledger seed URLs: official TSMC press releases are stable evidence pages.
     # Values are never hard-coded; the page itself is fetched and parsed.
     # Stable company-official evidence pages. Values are NEVER embedded here; each URL is
@@ -728,7 +728,7 @@ async def fetch_tsmc_quarterly_release(year: int, quarter: int) -> dict[str, Any
                     "feed_kind":"company_ir_quarter_bridge","company_code":"2330","quarter_eps_direct":qeps,
                     "gross_margin_direct":gm,"operating_margin_direct":om,
                     "eps_provenance":"company_official_direct","eps_confidence":100,
-                    "bridge_version":"5.2.14",
+                    "bridge_version":"5.2.15",
                     "completeness":sum(v is not None for v in (qeps,gm,om))}
     except Exception:
         return None
@@ -860,7 +860,7 @@ async def diagnose_official_financial_sources(ticker: str) -> dict[str, Any]:
     """
     now=datetime.now().astimezone()
     ey,eq,expected=expected_latest_financial_period(now.date())
-    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.14 diagnostics"}
+    ua={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.2.15 diagnostics"}
     out={
         "ticker":ticker, "generated_at":now.isoformat(timespec="seconds"),
         "expected_period":expected, "expected_year":ey, "expected_quarter":eq,
@@ -1126,6 +1126,41 @@ def _best_period_snapshot(rows: list[dict[str, Any]], year: int, quarter: int) -
             if best.get(k) is None and r.get(k) is not None: best[k]=r[k]
     return best
 
+
+OFFICIAL_EPS_REGISTRY_PATH = Path(__file__).resolve().parent / "data" / "official_eps_registry.json"
+
+def _load_official_eps_registry() -> dict[str, Any]:
+    try:
+        raw=json.loads(OFFICIAL_EPS_REGISTRY_PATH.read_text(encoding="utf-8"))
+        return raw if isinstance(raw,dict) else {"records":[]}
+    except Exception:
+        return {"records":[]}
+
+def registry_eps_for_period(ticker: str, year: int, quarter: int) -> dict[str, Any] | None:
+    """Return a verified company-official EPS registry record for one fiscal quarter.
+
+    Registry entries are intentionally small, auditable evidence records. They are used before
+    network historical backfill because Render->legacy MOPS history can be blocked. Missing periods
+    still fall through to live official resolvers; third-party values are never promoted into this
+    registry automatically.
+    """
+    reg=_load_official_eps_registry()
+    for row in reg.get("records",[]):
+        if str(row.get("ticker"))==str(ticker) and row.get("year")==year and row.get("quarter")==quarter and row.get("verified") is True:
+            qeps=safe_num(row.get("quarter_eps")); ytd=safe_num(row.get("ytd_eps"))
+            if quarter==1 and ytd is None and qeps is not None: ytd=qeps
+            return {
+                "source":row.get("source") or "Official EPS Registry",
+                "market":"Company Official Registry","endpoint":row.get("source_url"),"official":True,
+                "period":f"{year} Q{quarter}","fiscal_year":year,"fiscal_quarter":quarter,
+                "statement_date":row.get("verified_date"),"feed_kind":"official_eps_registry",
+                "company_code":str(ticker),"quarter_eps_direct":qeps,"ytd_eps":ytd,
+                "eps_provenance":"official_registry_verified","eps_confidence":100,
+                "registry_verified":True,"registry_schema_version":reg.get("schema_version"),
+                "evidence_kind":row.get("evidence_kind"),"completeness":sum(v is not None for v in (qeps,ytd))
+            }
+    return None
+
 async def fetch_official_eps_for_period(ticker: str, year: int, quarter: int) -> dict[str, Any] | None:
     """V5.2.13 multi-source official EPS resolver for an exact fiscal period.
 
@@ -1136,6 +1171,11 @@ async def fetch_official_eps_for_period(ticker: str, year: int, quarter: int) ->
       4) return None.  The blocked MOPS historical HTML endpoint is intentionally *not* in the
          production EPS path. Third-party/FinMind values never fill an official predecessor quarter.
     """
+    # Layer 0: verified company-official registry. This avoids re-scraping historical pages on every request
+    # and makes evidence auditable/stable. Registry rows always carry their original official URL.
+    reg=registry_eps_for_period(ticker,year,quarter)
+    if reg: return reg
+
     # Layer 1: official structured CSV/OpenData. These feeds often expose only the latest quarter,
     # but if it exactly matches the requested period it is the preferred cumulative source.
     try:
@@ -1209,6 +1249,15 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             direct_quarter[cur_key]=float(official.get("quarter_eps_direct"))
             provenance[cur_key]={"method":"official_direct","source":official.get("source"),"endpoint":official.get("endpoint"),"confidence":100}
 
+        # Registry/current-company evidence wins for direct quarter EPS when the selected accounting feed has only YTD.
+        if cur_key not in direct_quarter:
+            reg_cur=registry_eps_for_period(ticker,fy,fq)
+            if reg_cur and reg_cur.get("quarter_eps_direct") is not None:
+                direct_quarter[cur_key]=float(reg_cur.get("quarter_eps_direct"))
+                provenance[cur_key]={"method":"official_registry_verified","source":reg_cur.get("source"),"endpoint":reg_cur.get("endpoint"),"confidence":100}
+                if fq==1 and cur_key not in official_ytd:
+                    official_ytd[cur_key]=float(reg_cur.get("quarter_eps_direct"))
+
         # Re-check company IR for the current quarter when the selected accounting feed has only YTD.
         if cur_key not in direct_quarter:
             try:
@@ -1241,7 +1290,8 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             if yq[1]==1 and row.get("ytd_eps") is None and row.get("quarter_eps_direct") is not None:
                 official_ytd[yq]=float(row.get("quarter_eps_direct"))
             if row.get("quarter_eps_direct") is not None: direct_quarter[yq]=float(row.get("quarter_eps_direct"))
-            provenance[yq]={"method":"official_direct" if row.get("quarter_eps_direct") is not None else "official_ytd",
+            row_method="official_registry_verified" if row.get("eps_provenance")=="official_registry_verified" else ("official_direct" if row.get("quarter_eps_direct") is not None else "official_ytd")
+            provenance[yq]={"method":row_method,
                             "source":row.get("source"),"endpoint":row.get("endpoint"),"confidence":row.get("eps_confidence",98)}
             lookup_diagnostics.append({"period":f"{yq[0]} Q{yq[1]}","status":"ok",
                 "source":row.get("source"),"endpoint":row.get("endpoint"),"ytd_eps":row.get("ytd_eps"),
@@ -1255,7 +1305,8 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
         key=(year,quarter)
         if key in direct_quarter:
             p=provenance.get(key,{})
-            return direct_quarter[key], "official_direct", p
+            method="official_registry_verified" if p.get("method")=="official_registry_verified" else "official_direct"
+            return direct_quarter[key], method, p
         cur=official_ytd.get(key)
         if cur is None: return None,None,None
         if quarter==1:
@@ -1292,7 +1343,7 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
     official_key=(fy,fq) if fy and fq and official.get("official") else (None,None)
     stale_api=bool(official_key[0] and api_latest[0] and official_key>api_latest)
     prev_key=(fy,fq-1) if fy and fq and fq>1 else ((fy-1,4) if fy and fq else None)
-    # V5.2.14 Historical EPS Backfill: every period carries a source/evidence state.
+    # V5.2.15 Historical EPS Backfill: every period carries a source/evidence state.
     # The calculation engine consumes only evidence marked official; missing evidence is explicit.
     evidence_ledger=[]
     if fy and fq:
@@ -1322,10 +1373,12 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
                 "source_url":p.get("endpoint") or diag.get("endpoint"),
                 "confidence":p.get("confidence") or diag.get("confidence"),
                 "lookup_status":diag.get("status") or ("current" if key==(fy,fq) else "unknown"),
-                "missing_reason":None if status=="usable" else (diag.get("error") or diag.get("status") or "no_official_evidence")
+                "missing_reason":None if status=="usable" else (diag.get("error") or diag.get("status") or "no_official_evidence"),
+                "registry_verified": bool(p.get("method")=="official_registry_verified"),
+                "evidence_url": p.get("endpoint") or diag.get("endpoint")
             })
 
-    q_label={"official_direct":"✅ 公司/官方單季值","official_ytd_q1":"✅ 官方 Q1 累計=單季","official_ytd_difference":"🧮 官方累計值差額推導",
+    q_label={"official_direct":"✅ 公司/官方單季值","official_registry_verified":"✅ 官方 EPS Registry","official_ytd_q1":"✅ 官方 Q1 累計=單季","official_ytd_difference":"🧮 官方累計值差額推導",
              "structured_api_q1":"△ 結構化 API","structured_api_difference":"△ 結構化 API 差額"}.get(quarter_method,"資料不足")
     return {
         "quarter_eps":quarter_eps,"quarter_period":latest_period,"quarter_method":quarter_method,"quarter_method_label":q_label,
@@ -1346,11 +1399,11 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             "attempted_periods":[x.get("period") for x in evidence_ledger[1:]],
             "resolved_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")=="usable"],
             "missing_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")!="usable"],
-            "policy":"company_official_ir_then_official_disclosure; no third-party EPS for official derivation",
+            "policy":"official_registry_then_company_ir_then_official_disclosure; no third-party EPS for official derivation",
         },
-        "evidence_ledger_version":"5.2.14",
+        "evidence_ledger_version":"5.2.15",
         "blocked_mops_html_removed":True,
-        "note":"V5.2.14 Historical EPS Backfill：每一季先建立官方證據帳本，再由可用證據推導單季與 TTM；缺少哪一季、哪個來源會明確標示。MOPS 被安全機制阻擋的歷史 HTML 不再是生產 EPS 來源。"
+        "note":"V5.2.15 Official EPS Registry：歷史季度優先讀取可稽核的公司官方 Registry，再以公司 IR/官方揭露補抓。Registry 每筆保留官方來源 URL；缺資料才留白，第三方 EPS 不參與官方推導。"
     }
 
 
@@ -2070,7 +2123,7 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.2.14",
+        "ticker":ticker,"version":"5.2.15",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
@@ -2084,5 +2137,14 @@ async def eps_raw_diagnostics(ticker: str, year: int = Query(..., ge=1990, le=21
     if not ticker.isdigit(): raise HTTPException(400,"ticker must be numeric")
     return await trace_mops_company_ifrs(ticker,year,quarter)
 
+@app.get("/api/diagnostics/eps-registry/{ticker}")
+async def eps_registry_diagnostics(ticker: str):
+    ticker=normalize_ticker(ticker)
+    reg=_load_official_eps_registry()
+    rows=[r for r in reg.get("records",[]) if str(r.get("ticker"))==ticker]
+    rows=sorted(rows,key=lambda r:(r.get("year") or 0,r.get("quarter") or 0),reverse=True)
+    return {"ticker":ticker,"version":"5.2.15","registry_schema_version":reg.get("schema_version"),
+            "updated_at":reg.get("updated_at"),"record_count":len(rows),"records":rows}
+
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.2.14","mode":"cloud-mobile-historical-eps-backfill","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.2.15","mode":"cloud-mobile-official-eps-registry","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}

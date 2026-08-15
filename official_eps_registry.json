@@ -1,0 +1,101 @@
+{
+  "schema_version": "1.0",
+  "description": "Verified company-official quarterly EPS evidence used by V5.2.15 before live historical backfill. Each row must have a company-official source URL.",
+  "updated_at": "2026-08-15",
+  "records": [
+    {
+      "ticker": "2330",
+      "year": 2025,
+      "quarter": 2,
+      "quarter_eps": 15.36,
+      "source": "TSMC Press Center",
+      "source_url": "https://pr.tsmc.com/chinese/news/3249",
+      "evidence_kind": "company_official_quarter_eps",
+      "verified": true
+    },
+    {
+      "ticker": "2330",
+      "year": 2025,
+      "quarter": 3,
+      "quarter_eps": 17.44,
+      "source": "TSMC Press Center",
+      "source_url": "https://pr.tsmc.com/chinese/news/3264",
+      "evidence_kind": "company_official_quarter_eps",
+      "verified": true
+    },
+    {
+      "ticker": "2330",
+      "year": 2025,
+      "quarter": 4,
+      "quarter_eps": 19.5,
+      "source": "TSMC Press Center",
+      "source_url": "https://pr.tsmc.com/chinese/news/3281",
+      "evidence_kind": "company_official_quarter_eps",
+      "verified": true
+    },
+    {
+      "ticker": "2330",
+      "year": 2026,
+      "quarter": 1,
+      "quarter_eps": 22.08,
+      "source": "TSMC Press Center",
+      "source_url": "https://pr.tsmc.com/chinese/news/3297",
+      "evidence_kind": "company_official_quarter_eps",
+      "verified": true
+    },
+    {
+      "ticker": "2330",
+      "year": 2026,
+      "quarter": 2,
+      "quarter_eps": 27.25,
+      "source": "TSMC Press Center",
+      "source_url": "https://pr.tsmc.com/chinese/news/3326",
+      "evidence_kind": "company_official_quarter_eps",
+      "verified": true
+    },
+    {
+      "ticker": "3661",
+      "year": 2025,
+      "quarter": 2,
+      "quarter_eps": 16.37,
+      "ytd_eps": 34.49,
+      "source": "Alchip reviewed financial report",
+      "source_url": "https://www.alchip.com/upload/2025_08_18/3_20250818101142i3cka8jyk0.pdf",
+      "evidence_kind": "company_official_financial_pdf",
+      "verified": true
+    },
+    {
+      "ticker": "3661",
+      "year": 2025,
+      "quarter": 3,
+      "quarter_eps": 16.4,
+      "ytd_eps": 50.89,
+      "source": "Alchip reviewed financial report",
+      "source_url": "https://www.alchip.com/upload/2025_11_12/3_20251112141146lr7eqkVGQ0.pdf",
+      "evidence_kind": "company_official_financial_pdf",
+      "verified": true
+    },
+    {
+      "ticker": "3661",
+      "year": 2025,
+      "quarter": 4,
+      "quarter_eps": 18.3,
+      "fy_eps": 69.18,
+      "source": "Alchip official FY2025 results",
+      "source_url": "https://www.alchip.com/en/Newsroom/Alchip_2025_Q4_financial_results",
+      "evidence_kind": "company_official_quarter_eps",
+      "verified": true
+    },
+    {
+      "ticker": "3661",
+      "year": 2026,
+      "quarter": 1,
+      "quarter_eps": 17.55,
+      "ytd_eps": 17.55,
+      "source": "Alchip reviewed financial report",
+      "source_url": "https://www.alchip.com/upload/2026_05_11/3_20260511103038sgoopzYTC0.pdf",
+      "evidence_kind": "company_official_financial_pdf",
+      "verified": true
+    }
+  ]
+}
