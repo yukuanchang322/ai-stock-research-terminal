@@ -39,7 +39,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.4.3")
+app = FastAPI(title="AI Stock Research Terminal", version="5.4.4")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -80,6 +80,50 @@ def _clean_provider_error(name: str, exc: Exception) -> str:
     msg=str(exc).replace("\n"," ").strip()
     if len(msg)>220: msg=msg[:220]+"…"
     return f"{name}: {type(exc).__name__}: {msg}"
+
+
+async def _safe_http_json(client: httpx.AsyncClient, method: str, url: str, *, provider: str,
+                          params: dict[str,Any] | None=None, json_body: Any=None,
+                          data: Any=None, timeout: float | None=None) -> tuple[Any,dict[str,Any]]:
+    """Hard-isolation HTTP wrapper.
+    Any upstream HTML/CSS/font/error body becomes a compact provider error, never raw response text.
+    """
+    meta={"provider":provider,"url":url}
+    try:
+        kwargs={}
+        if params is not None: kwargs["params"]=params
+        if json_body is not None: kwargs["json"]=json_body
+        if data is not None: kwargs["data"]=data
+        if timeout is not None: kwargs["timeout"]=timeout
+        r=await client.request(method,url,**kwargs)
+        meta["http_status"]=r.status_code
+        meta["content_type"]=(r.headers.get("content-type") or "").split(";")[0]
+        raw=r.text or ""
+        if r.status_code>=400:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        ctype=(r.headers.get("content-type") or "").lower()
+        if "text/html" in ctype or "text/css" in ctype or "font/" in ctype or _looks_like_html_or_css(raw):
+            raise RuntimeError(f"unexpected upstream content-type {ctype or 'unknown'}")
+        try:
+            return r.json(),meta
+        except Exception:
+            raise RuntimeError("upstream response is not valid JSON")
+    except Exception as e:
+        meta["status"]="error"
+        meta["error"]=_clean_provider_error(provider,e)
+        return None,meta
+
+def _compact_error_payload(errors: list[Any] | None, limit: int=8) -> list[str]:
+    out=[]
+    for e in errors or []:
+        x=str(e).replace("\n"," ").strip()
+        # Kill accidental HTML/CSS/font/base64 leakage.
+        if "@font-face" in x or "base64," in x or "<html" in x.lower() or "<!doctype" in x.lower():
+            x="上游服務回傳非 JSON 錯誤頁，內容已隱藏"
+        if len(x)>180: x=x[:180]+"…"
+        if x and x not in out: out.append(x)
+        if len(out)>=limit: break
+    return out
 
 async def finmind(dataset: str, ticker: str | None = None, start: date | None = None, end: date | None = None) -> list[dict[str, Any]]:
     params: dict[str, Any] = {"dataset": dataset}
@@ -1472,7 +1516,7 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             "missing_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")!="usable"],
             "policy":"official_registry_then_company_ir_then_official_disclosure; no third-party EPS for official derivation",
         },
-        "evidence_ledger_version":"5.4.3",
+        "evidence_ledger_version":"5.4.4",
         "blocked_mops_html_removed":True,
         "note":"V5.3.1 Evidence Engine EPS takeover：歷史季度優先讀取可稽核的公司官方 Registry，再以公司 IR/官方揭露補抓。Registry 每筆保留官方來源 URL；缺資料才留白，第三方 EPS 不參與官方推導。"
     }
@@ -2430,7 +2474,7 @@ async def fetch_twstock_mcp_snapshot(ticker:str) -> dict[str,Any]:
     headers={"Accept":"application/json, text/event-stream","Content-Type":"application/json"}
     try:
         async with httpx.AsyncClient(timeout=12,follow_redirects=True,headers=headers) as client:
-            init={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.4.3"}}}
+            init={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.4.4"}}}
             ir=await client.post(TWSTOCK_MCP_URL,json=init)
             out["initialize_status"]=ir.status_code
             if ir.status_code>=500:
@@ -2641,9 +2685,14 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         except Exception as e: errors.append(f"TaiwanStockInfo: {type(e).__name__}"); return {}
 
     info, prices, inst, margin, rev, pers, fin = await asyncio.gather(
-        info_grab(), grab("TaiwanStockPrice", 460), grab("TaiwanStockInstitutionalInvestorsBuySellWide", 120),
-        grab("TaiwanStockMarginPurchaseShortSale", 120), grab("TaiwanStockMonthRevenue", 900),
-        grab("TaiwanStockPER", 1100), grab("TaiwanStockFinancialStatements", 1100)
+        info_grab(),
+        grab("TaiwanStockPrice",460),
+        grab("TaiwanStockInstitutionalInvestorsBuySellWide",120),
+        grab("TaiwanStockMarginPurchaseShortSale",120),
+        grab("TaiwanStockMonthRevenue",900),
+        grab("TaiwanStockPER",1100),
+        grab("TaiwanStockFinancialStatements",1100),
+        return_exceptions=False
     )
     price_source="FinMind TaiwanStockPrice"
     if not prices:
@@ -2742,6 +2791,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     source_status.append({"name":"Evidence Engine","dataset":"Multi-Source Evidence Schema v1","as_of":evidence_graph.get("generated_at"),"status":"ok" if evidence_graph.get("summary",{}).get("usable") else "missing","scheduled_update":f"Fact {evidence_graph.get('summary',{}).get('facts',0)} / Derived {evidence_graph.get('summary',{}).get('derived_facts',0)} / Conflicts {evidence_graph.get('summary',{}).get('conflicts',0)}"})
     conf=calc_confidence(source_status,valuation,research)
     research_pipeline=build_research_pipeline(ticker,sc,nar,evidence_graph,financial_integrity,expectation,valuation,source_status,tech,flow,revenue,research)
+    errors=_compact_error_payload(errors)
     data={"ticker":ticker,"name":info.get("stock_name") or ticker,"industry":info.get("industry_category") or "—","market_type":info.get("type") or "—",
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
@@ -2801,25 +2851,25 @@ async def financial_diagnostics(ticker: str):
 async def stock_api(ticker: str, refresh: bool = Query(False)):
     ticker=ticker.strip()
     if not ticker.isdigit() or len(ticker) not in (4,5,6):
-        raise HTTPException(400,"請輸入有效台股代號")
+        return JSONResponse({"status":"error","message":"請輸入有效台股代號","ticker":ticker},status_code=400,headers={"Cache-Control":"no-store"})
     try:
-        d=await build_stock(ticker, force_refresh=refresh)
-    except HTTPException:
-        raise
+        d=await build_stock(ticker,force_refresh=refresh)
     except Exception as e:
-        msg=_clean_provider_error("build_stock",e)
         return JSONResponse(
-            {"status":"degraded","ticker":ticker,"message":"部分資料來源異常，研究報告暫時無法完整產生","errors":[msg]},
-            status_code=503,
-            headers={"Cache-Control":"no-store"}
+            {"status":"degraded","ticker":ticker,"message":"研究報告暫時無法完整產生","errors":_compact_error_payload([_clean_provider_error("build_stock",e)])},
+            status_code=503,headers={"Cache-Control":"no-store"}
         )
+    if not isinstance(d,dict):
+        return JSONResponse({"status":"degraded","ticker":ticker,"message":"後端回傳格式異常","errors":[]},status_code=503,headers={"Cache-Control":"no-store"})
+    d["errors"]=_compact_error_payload(d.get("errors"))
     if d.get("price") is None:
         return JSONResponse(
-            {"status":"degraded","ticker":ticker,"message":"股票代號可能有效，但目前價格來源暫時無法取得","errors":d.get("errors",[])},
-            status_code=503,
-            headers={"Cache-Control":"no-store"}
+            {"status":"degraded","ticker":ticker,"name":d.get("name") or ticker,
+             "message":"目前無法取得有效價格資料；其他資料來源若可用仍保留診斷結果",
+             "errors":d.get("errors",[]),"provider_status":d.get("source_status",[])},
+            status_code=503,headers={"Cache-Control":"no-store"}
         )
-    return JSONResponse(d, headers={"Cache-Control":"no-store"})
+    return JSONResponse(d,headers={"Cache-Control":"no-store"})
 
 @app.get("/api/stock/{ticker}/pdf")
 async def stock_pdf(ticker: str, refresh: bool = Query(True)):
@@ -2861,7 +2911,7 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.4.3",
+        "ticker":ticker,"version":"5.4.4",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
@@ -2881,7 +2931,7 @@ async def eps_registry_diagnostics(ticker: str):
     reg=_load_official_eps_registry()
     rows=[r for r in reg.get("records",[]) if str(r.get("ticker"))==ticker]
     rows=sorted(rows,key=lambda r:(r.get("year") or 0,r.get("quarter") or 0),reverse=True)
-    return {"ticker":ticker,"version":"5.4.3","registry_schema_version":reg.get("schema_version"),
+    return {"ticker":ticker,"version":"5.4.4","registry_schema_version":reg.get("schema_version"),
             "updated_at":reg.get("updated_at"),"record_count":len(rows),"records":rows}
 
 @app.get("/api/evidence/{ticker}")
@@ -2896,7 +2946,7 @@ async def provider_diagnostics(ticker: str):
     ticker=ticker.strip().upper()
     d=await build_stock(ticker, False)
     mcp=await probe_twstock_mcp()
-    return {"version":"5.4.3","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
+    return {"version":"5.4.4","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
 
 
 @app.get("/api/diagnostics/mcp/{ticker}")
@@ -2910,22 +2960,29 @@ async def mcp_diagnostics(ticker: str):
 async def provider_health(ticker: str):
     ticker=ticker.strip()
     if not ticker.isdigit() or len(ticker) not in (4,5,6):
-        raise HTTPException(400,"請輸入有效台股代號")
-    result={"ticker":ticker,"version":"5.4.3","providers":{}}
+        return JSONResponse({"status":"error","message":"invalid ticker"},status_code=400)
+    result={"ticker":ticker,"version":"5.4.4","providers":{},"summary":{"ok":0,"degraded":0,"error":0}}
     checks=[
-        ("finmind_price", finmind("TaiwanStockPrice", ticker, date.today()-timedelta(days=10), date.today())),
-        ("twse_stock_day", fetch_twse_stock_day_history(ticker,1)),
-        ("mcp", fetch_twstock_mcp_snapshot(ticker)),
+        ("FinMind 股價", finmind("TaiwanStockPrice",ticker,date.today()-timedelta(days=10),date.today())),
+        ("FinMind 法人", finmind("TaiwanStockInstitutionalInvestorsBuySellWide",ticker,date.today()-timedelta(days=30),date.today())),
+        ("FinMind 融資融券", finmind("TaiwanStockMarginPurchaseShortSale",ticker,date.today()-timedelta(days=30),date.today())),
+        ("FinMind 月營收", finmind("TaiwanStockMonthRevenue",ticker,date.today()-timedelta(days=400),date.today())),
+        ("TWSE STOCK_DAY", fetch_twse_stock_day_history(ticker,1)),
+        ("TWStock MCP", fetch_twstock_mcp_snapshot(ticker)),
     ]
     async def run(name,coro):
         try:
             v=await coro
-            return name,{"status":"ok","records":len(v) if isinstance(v,list) else len((v or {}).get("records") or []),"preview":str(v)[:180]}
+            n=len(v) if isinstance(v,list) else len((v or {}).get("records") or [])
+            status="ok" if n>0 else "degraded"
+            return name,{"status":status,"records":n}
         except Exception as e:
-            return name,{"status":"error","error":_clean_provider_error(name,e)}
+            return name,{"status":"error","records":0,"error":_compact_error_payload([_clean_provider_error(name,e)])[0]}
     pairs=await asyncio.gather(*(run(n,c) for n,c in checks))
-    result["providers"]={k:v for k,v in pairs}
+    for k,v in pairs:
+        result["providers"][k]=v
+        result["summary"][v["status"]]=result["summary"].get(v["status"],0)+1
     return JSONResponse(result,headers={"Cache-Control":"no-store"})
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.4.3","mode":"cloud-mobile-provider-isolation","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.4.4","mode":"cloud-mobile-hard-provider-isolation","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}

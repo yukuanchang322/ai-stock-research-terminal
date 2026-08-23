@@ -111,6 +111,35 @@ function earningsCallCard(x,index){
 function materialInfoCard(x){
   return `<article class="material-info-item"><div><time>${x.date||'—'}</time>${eventTags(x.tags)}</div><div><a href="${x.source_url||'#'}" target="_blank" rel="noopener noreferrer">${x.title||'—'}</a>${x.official_source?'<span class="official-badge small">官方來源</span>':''}<p>${x.summary||''}</p><small>${x.publisher||'公開來源'}</small></div></article>`;
 }
+
+async function safeJsonFetch(url, options={}){
+  const res=await fetch(url,{...options,cache:'no-store',headers:{...(options.headers||{}),'Accept':'application/json'}});
+  const ctype=(res.headers.get('content-type')||'').toLowerCase();
+  let payload=null;
+  if(ctype.includes('application/json')){
+    try{ payload=await res.json(); }catch(e){ payload=null; }
+  }else{
+    // Never display upstream HTML/CSS/font bodies to the user.
+    payload={status:'degraded',message:`HTTP ${res.status}：資料來源暫時異常`,errors:['伺服器回傳非 JSON 錯誤內容，已隱藏']};
+  }
+  if(!res.ok){
+    const msg=(payload&&payload.message) || `HTTP ${res.status}`;
+    const err=new Error(msg);
+    err.payload=payload||{};
+    err.status=res.status;
+    throw err;
+  }
+  return payload||{};
+}
+function cleanUiError(err){
+  const p=err?.payload||{};
+  const msg=p.message||err?.message||'資料來源暫時無法連線';
+  if(String(msg).includes('@font-face')||String(msg).includes('base64,')||String(msg).includes('<html')){
+    return '資料來源暫時異常，錯誤內容已隱藏。';
+  }
+  return String(msg).slice(0,180);
+}
+
 function render(d){
   currentTicker=d.ticker;
   $('report').classList.remove('hidden'); $('pdfBtn').disabled=false;
