@@ -1,5 +1,5 @@
-const CACHE="ai-stock-v5.4.4";
-const SHELL = ['/', '/styles.css', '/app.js', '/static/manifest.webmanifest', '/static/icons/icon-192.png', '/static/icons/icon-512.png'];
+const CACHE="ai-stock-v5.4.5";
+const SHELL = ['/', '/styles.css', '/app.js', '/recovery.js', '/static/manifest.webmanifest', '/static/icons/icon-192.png', '/static/icons/icon-512.png'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
 });
@@ -13,6 +13,13 @@ self.addEventListener('fetch', event => {
     event.respondWith(fetch(event.request).catch(() => caches.match('/')));
     return;
   }
+  // Versioned shell: prefer network for code, retain cached copy for offline startup.
+  if (['/app.js','/recovery.js','/styles.css','/sw.js'].includes(url.pathname)) {
+    event.respondWith(fetch(event.request).then(resp => {
+      const copy=resp.clone(); caches.open(CACHE).then(cache=>cache.put(event.request,copy)); return resp;
+    }).catch(()=>caches.match(event.request)));
+    return;
+  }
   event.respondWith(caches.match(event.request).then(cached => cached || fetch(event.request).then(resp => {
     const copy = resp.clone();
     caches.open(CACHE).then(cache => cache.put(event.request, copy));
@@ -20,7 +27,6 @@ self.addEventListener('fetch', event => {
   })));
 });
 
-// V5.4.4 cache policy note:
-// /api/, /app.js, /styles.css should always prefer network so stale V5.4.1 UI cannot mask backend changes.
-
-// V5.4.4 hard provider isolation
+// V5.4.5 Data Recovery
+// API responses are never stored in Service Worker Cache. recovery.js stores only
+// successful research payloads on-device and restores them with an explicit stale banner.
