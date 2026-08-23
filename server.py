@@ -39,7 +39,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.4.1")
+app = FastAPI(title="AI Stock Research Terminal", version="5.4.2")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -1455,7 +1455,7 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             "missing_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")!="usable"],
             "policy":"official_registry_then_company_ir_then_official_disclosure; no third-party EPS for official derivation",
         },
-        "evidence_ledger_version":"5.4.1",
+        "evidence_ledger_version":"5.4.2",
         "blocked_mops_html_removed":True,
         "note":"V5.3.1 Evidence Engine EPS takeover：歷史季度優先讀取可稽核的公司官方 Registry，再以公司 IR/官方揭露補抓。Registry 每筆保留官方來源 URL；缺資料才留白，第三方 EPS 不參與官方推導。"
     }
@@ -2413,7 +2413,7 @@ async def fetch_twstock_mcp_snapshot(ticker:str) -> dict[str,Any]:
     headers={"Accept":"application/json, text/event-stream","Content-Type":"application/json"}
     try:
         async with httpx.AsyncClient(timeout=12,follow_redirects=True,headers=headers) as client:
-            init={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.4.1"}}}
+            init={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.4.2"}}}
             ir=await client.post(TWSTOCK_MCP_URL,json=init)
             out["initialize_status"]=ir.status_code
             if ir.status_code>=500:
@@ -2557,6 +2557,59 @@ def narrative(s: dict[str, int], tech: dict[str, Any], revenue: dict[str, Any], 
     return {"stance": stance, "thesis": "；".join(facts)+"。" if facts else "目前公開結構化資料不足，系統不產生強結論。", "catalysts": catalysts[:4] or ["等待下一次營收、財報或法人預估出現明確上修訊號"], "risks": risks[:4] or ["模型假設與市場估值可能快速變動，需持續追蹤資料更新"]}
 
 
+
+async def fetch_twse_stock_day_history(ticker: str, months: int = 13) -> list[dict[str,Any]]:
+    """Official TWSE STOCK_DAY fallback for OHLC when FinMind price is unavailable.
+    Fetches up to ~13 calendar months and normalizes into the existing price schema.
+    """
+    today=date.today()
+    ym=[]
+    y,m=today.year,today.month
+    for _ in range(months):
+        ym.append((y,m))
+        m-=1
+        if m==0:
+            y-=1; m=12
+
+    async def one_month(year:int, month:int):
+        url="https://www.twse.com.tw/exchangeReport/STOCK_DAY"
+        params={"response":"json","date":f"{year:04d}{month:02d}01","stockNo":ticker}
+        try:
+            async with httpx.AsyncClient(timeout=10,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0"}) as client:
+                r=await client.get(url,params=params)
+                if r.status_code!=200: return []
+                j=r.json()
+                if str(j.get("stat","")).upper()!="OK": return []
+                out=[]
+                for row in j.get("data") or []:
+                    if len(row)<9: continue
+                    # ROC date yyyy/mm/dd
+                    dm=re.match(r"(\d{3})/(\d{2})/(\d{2})",str(row[0]))
+                    if not dm: continue
+                    gy=int(dm.group(1))+1911
+                    d=f"{gy:04d}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}"
+                    def n(v):
+                        try: return float(str(v).replace(",",""))
+                        except Exception: return None
+                    out.append({
+                        "date":d,"stock_id":ticker,
+                        "Trading_Volume":n(row[1]),
+                        "open":n(row[3]),"max":n(row[4]),"min":n(row[5]),"close":n(row[6]),
+                        "spread":n(str(row[7]).replace("+","")),
+                        "Trading_turnover":n(row[8]),
+                        "_source":"TWSE STOCK_DAY"
+                    })
+                return out
+        except Exception:
+            return []
+
+    batches=await asyncio.gather(*(one_month(y,m) for y,m in ym))
+    rows=[x for batch in batches for x in batch]
+    dedup={}
+    for x in rows:
+        dedup[x["date"]]=x
+    return [dedup[k] for k in sorted(dedup)]
+
 async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any]:
     if not force_refresh and ticker in _CACHE and time.time() - _CACHE[ticker][0] < CACHE_TTL:
         cached = dict(_CACHE[ticker][1]); cached["cache"] = {"hit": True, "ttl_seconds": CACHE_TTL}; return cached
@@ -2575,6 +2628,15 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         grab("TaiwanStockMarginPurchaseShortSale", 120), grab("TaiwanStockMonthRevenue", 900),
         grab("TaiwanStockPER", 1100), grab("TaiwanStockFinancialStatements", 1100)
     )
+    price_source="FinMind TaiwanStockPrice"
+    if not prices:
+        try:
+            prices=await fetch_twse_stock_day_history(ticker,13)
+            if prices:
+                price_source="TWSE STOCK_DAY fallback"
+                errors.append("TaiwanStockPrice: FinMind unavailable; TWSE fallback active")
+        except Exception as e:
+            errors.append(f"TWSEStockDayFallback: {type(e).__name__}")
     tech=calc_technical(prices); flow=calc_flow(inst,margin); revenue=calc_revenue(rev); perdata=calc_per(pers); financial=calc_financials(fin)
     try:
         official_financial=await fetch_official_income_statement(ticker)
@@ -2619,6 +2681,17 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         )
     except Exception as e:
         errors.append(f"PublicWebResearch: {type(e).__name__}"); web_research={"rows":[],"errors":[type(e).__name__],"fetched_at":datetime.now().astimezone().isoformat(timespec="seconds")}; company_events={"rows":[],"errors":[type(e).__name__],"fetched_at":datetime.now().astimezone().isoformat(timespec="seconds")}; mcp_snapshot={"provider":"TWStock MCP","status":"error","records":[],"error":type(e).__name__}
+    # Final price rescue from MCP cross-check when both FinMind and TWSE history are unavailable.
+    if not tech:
+        mcp_close=next((r for r in (mcp_snapshot.get("records") or []) if r.get("metric")=="close" and r.get("value") is not None),None)
+        if mcp_close:
+            px=float(mcp_close["value"])
+            tech={"last":px,"last_date":mcp_close.get("period") or date.today().isoformat(),"ma":{},
+                  "trend":"資料不足","series":[],"series_days":0,"chart_period":"即時價格 fallback",
+                  "rsi14":None,"k":None,"d":None,"macd":None,"macd_signal":None,"macd_hist":None,
+                  "support1":None,"support2":None,"resistance":None,"volume_ratio_20":None,"return_20d":None,"return_60d":None}
+            price_source="TWStock MCP last-price fallback"
+            errors.append("Price history unavailable; MCP last-price fallback active")
     research=merge_research(load_research(ticker), web_research.get("rows", []))
     lp=tech.get("last")
     valuation=model_valuation(lp,perdata,eps_stack,research,financial_integrity)
@@ -2629,7 +2702,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     change=((lp/prev-1)*100) if lp and prev else None
     evidence_graph=build_evidence_graph(ticker,tech,revenue,flow,perdata,financial,eps_stack,research,company_events,financial_integrity,mcp_snapshot)
     source_status=[
-        {"name":"股價","dataset":"TaiwanStockPrice","as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日約 17:30"},
+        {"name":"股價","dataset":price_source,"as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日約 17:30"},
         {"name":"三大法人","dataset":"TaiwanStockInstitutionalInvestorsBuySellWide","as_of":flow.get("last_date"),"status":"ok" if flow.get("last_date") else "missing","scheduled_update":"交易日約 20:00"},
         {"name":"融資融券","dataset":"TaiwanStockMarginPurchaseShortSale","as_of":flow.get("margin_last_date"),"status":"ok" if flow.get("margin_last_date") else "missing","scheduled_update":"交易日約 21:00"},
         {"name":"月營收","dataset":"TaiwanStockMonthRevenue","as_of":revenue.get("last_date") or revenue.get("revenue_period"),"status":"ok" if revenue else "missing","scheduled_update":"依公司公告"},
@@ -2705,7 +2778,8 @@ async def stock_api(ticker: str, refresh: bool = Query(False)):
     ticker=ticker.strip()
     if not ticker.isdigit() or len(ticker) not in (4,5,6): raise HTTPException(400,"請輸入有效台股代號")
     d=await build_stock(ticker, force_refresh=refresh)
-    if d["price"] is None and d["name"] == ticker: raise HTTPException(404,"查無股票或資料來源暫時無法連線")
+    if d["price"] is None:
+        raise HTTPException(503,detail={"message":"股票代號可能有效，但目前主要價格來源暫時無法取得資料","ticker":ticker,"errors":d.get("errors",[])})
     return JSONResponse(d, headers={"Cache-Control":"no-store"})
 
 @app.get("/api/stock/{ticker}/pdf")
@@ -2713,9 +2787,9 @@ async def stock_pdf(ticker: str, refresh: bool = Query(True)):
     d=await build_stock(ticker.strip(), force_refresh=refresh)
     if d["price"] is None: raise HTTPException(503,"目前無法取得股價資料，為避免輸出錯誤報告，PDF 未產生。")
     stamp=datetime.now().strftime("%Y%m%d_%H%M")
-    out=REPORT_DIR/f"{ticker}_{stamp}_research_v5_4_0.pdf"
+    out=REPORT_DIR/f"{ticker}_{stamp}_research_v5_4_2.pdf"
     HTML(string=report_html(d),base_url=str(ROOT)).write_pdf(out)
-    return FileResponse(out,media_type="application/pdf",filename=f"{ticker}_AI_research_V5_4_0_{stamp}.pdf")
+    return FileResponse(out,media_type="application/pdf",filename=f"{ticker}_AI_research_V5_4_2_{stamp}.pdf")
 
 @app.post("/api/cache/clear")
 async def cache_clear():
@@ -2748,7 +2822,7 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.4.1",
+        "ticker":ticker,"version":"5.4.2",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
@@ -2768,7 +2842,7 @@ async def eps_registry_diagnostics(ticker: str):
     reg=_load_official_eps_registry()
     rows=[r for r in reg.get("records",[]) if str(r.get("ticker"))==ticker]
     rows=sorted(rows,key=lambda r:(r.get("year") or 0,r.get("quarter") or 0),reverse=True)
-    return {"ticker":ticker,"version":"5.4.1","registry_schema_version":reg.get("schema_version"),
+    return {"ticker":ticker,"version":"5.4.2","registry_schema_version":reg.get("schema_version"),
             "updated_at":reg.get("updated_at"),"record_count":len(rows),"records":rows}
 
 @app.get("/api/evidence/{ticker}")
@@ -2783,7 +2857,7 @@ async def provider_diagnostics(ticker: str):
     ticker=ticker.strip().upper()
     d=await build_stock(ticker, False)
     mcp=await probe_twstock_mcp()
-    return {"version":"5.4.1","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
+    return {"version":"5.4.2","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
 
 
 @app.get("/api/diagnostics/mcp/{ticker}")
@@ -2793,4 +2867,4 @@ async def mcp_diagnostics(ticker: str):
     return snap
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.4.1","mode":"cloud-mobile-mcp-cross-validation","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.4.2","mode":"cloud-mobile-data-fallback-hotfix","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
