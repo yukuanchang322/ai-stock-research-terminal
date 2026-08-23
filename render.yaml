@@ -1,4 +1,4 @@
-# redeploy-trigger: V5.10.0
+# redeploy-trigger: V5.10.0-force-20260824-0731
 services:
   - type: web
     name: ai-stock-research-terminal
