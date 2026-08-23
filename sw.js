@@ -1,5 +1,5 @@
-const CACHE="ai-stock-v5.9.2";
-const SHELL = ['/', '/styles.css?v=5.9.2', '/app.js?v=5.9.2', '/recovery.js?v=5.9.2', '/v547_hotfix.js?v=5.9.2', '/static/manifest.webmanifest'];
+const CACHE="ai-stock-v5.9.5";
+const SHELL = ['/', '/styles.css?v=5.9.5', '/app.js?v=5.9.5', '/recovery.js?v=5.9.5', '/v547_hotfix.js?v=5.9.5', '/static/manifest.webmanifest'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
 });
@@ -20,11 +20,7 @@ self.addEventListener('fetch', event => {
     return;
   }
   event.respondWith(caches.match(event.request).then(cached => cached || fetch(event.request).then(resp => {
-    const copy = resp.clone();
-    caches.open(CACHE).then(cache => cache.put(event.request, copy));
+    const copy = resp.clone(); caches.open(CACHE).then(cache => cache.put(event.request, copy));
     return resp;
   })));
 });
-
-// V5.9.2 Version Sync Fix.
-// API is never cached; navigation and core JS/CSS are network-first/no-store.
