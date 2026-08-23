@@ -1,4 +1,4 @@
-const CACHE="ai-stock-v5.4.5";
+const CACHE="ai-stock-v5.4.6";
 const SHELL = ['/', '/styles.css', '/app.js', '/recovery.js', '/static/manifest.webmanifest', '/static/icons/icon-192.png', '/static/icons/icon-512.png'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -13,7 +13,6 @@ self.addEventListener('fetch', event => {
     event.respondWith(fetch(event.request).catch(() => caches.match('/')));
     return;
   }
-  // Versioned shell: prefer network for code, retain cached copy for offline startup.
   if (['/app.js','/recovery.js','/styles.css','/sw.js'].includes(url.pathname)) {
     event.respondWith(fetch(event.request).then(resp => {
       const copy=resp.clone(); caches.open(CACHE).then(cache=>cache.put(event.request,copy)); return resp;
@@ -27,6 +26,6 @@ self.addEventListener('fetch', event => {
   })));
 });
 
-// V5.4.5 Data Recovery
-// API responses are never stored in Service Worker Cache. recovery.js stores only
-// successful research payloads on-device and restores them with an explicit stale banner.
+// V5.4.6 Data Completeness Repair + V5.4.5 Data Recovery
+// /api/ is never cached by the service worker. Market data stays network-authoritative;
+// recovery.js restores only a clearly labelled device backup after live API failure.
