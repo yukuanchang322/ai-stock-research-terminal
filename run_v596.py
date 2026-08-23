@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
@@ -98,6 +99,13 @@ async def api_v596(ticker: str, refresh: int = 0):
 @app.get("/", response_class=HTMLResponse)
 async def root_v596():
     text = (server.ROOT / "index.html").read_text(encoding="utf-8")
+    # Single version source: checkCloud() reads /health and renders the runtime version.
+    text = re.sub(r'<span class="status-sep">•</span>\s*<span data-app-version>.*?</span>', '', text, flags=re.S)
+    text = re.sub(r'<span data-app-version>.*?</span>\s*<span class="status-sep">•</span>', '', text, flags=re.S)
+    text = re.sub(r'AI Stock Research Terminal V5\.\d+(?:\.\d+)?', f'AI Stock Research Terminal V{VERSION}', text)
+    for asset in ("styles.css", "app.js", "recovery.js", "v547_hotfix.js"):
+        text = re.sub(rf'{re.escape(asset)}(?:\?v=[^\"\']+)?', f'{asset}?v={VERSION}', text)
+    text = re.sub(r'/sw\.js(?:\?v=[^\"\']+)?', f'/sw.js?v={VERSION}', text)
     return HTMLResponse(text, headers={
         "Cache-Control":"no-store, no-cache, must-revalidate, max-age=0",
         "Pragma":"no-cache", "Expires":"0", "X-App-Version":VERSION,
