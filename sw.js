@@ -1,4 +1,4 @@
-const CACHE="ai-stock-v5.4.8";
+const CACHE="ai-stock-v5.5.0";
 const SHELL = ['/', '/styles.css', '/app.js', '/recovery.js', '/v547_hotfix.js', '/static/manifest.webmanifest'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -10,11 +10,11 @@ self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
   if (event.request.method !== 'GET' || url.pathname.startsWith('/api/')) return;
   if (event.request.mode === 'navigate') {
-    event.respondWith(fetch(event.request).catch(() => caches.match('/')));
+    event.respondWith(fetch(event.request,{cache:'no-store'}).catch(() => caches.match('/')));
     return;
   }
   if (['/app.js','/recovery.js','/v547_hotfix.js','/styles.css','/sw.js'].includes(url.pathname)) {
-    event.respondWith(fetch(event.request).then(resp => {
+    event.respondWith(fetch(event.request,{cache:'no-store'}).then(resp => {
       const copy=resp.clone(); caches.open(CACHE).then(cache=>cache.put(event.request,copy)); return resp;
     }).catch(()=>caches.match(event.request)));
     return;
@@ -26,6 +26,6 @@ self.addEventListener('fetch', event => {
   })));
 });
 
-// V5.4.8 Valuation Recovery, retaining official data fallback and Data Recovery.
-// API responses are never stored in Service Worker Cache. Missing optional icons are
-// intentionally excluded from the atomic shell install so a 404 cannot break SW activation.
+// V5.5.0 Price Integrity + UI hardening.
+// API responses are never cached. Core JS/CSS use network-first + no-store so iPhone PWA
+// cannot stay pinned to an older chart/layout implementation after a deployment.
