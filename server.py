@@ -39,7 +39,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.4.2")
+app = FastAPI(title="AI Stock Research Terminal", version="5.4.3")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -68,6 +68,19 @@ def nfmt(v: float | int | None, digits: int = 1) -> str:
     return f"{v:,.{digits}f}"
 
 
+
+def _looks_like_html_or_css(text: str) -> bool:
+    t=(text or "").lstrip().lower()
+    return (
+        t.startswith("<!doctype html") or t.startswith("<html") or t.startswith("<style")
+        or "@font-face" in t[:500] or "font-family:" in t[:500]
+    )
+
+def _clean_provider_error(name: str, exc: Exception) -> str:
+    msg=str(exc).replace("\n"," ").strip()
+    if len(msg)>220: msg=msg[:220]+"…"
+    return f"{name}: {type(exc).__name__}: {msg}"
+
 async def finmind(dataset: str, ticker: str | None = None, start: date | None = None, end: date | None = None) -> list[dict[str, Any]]:
     params: dict[str, Any] = {"dataset": dataset}
     if ticker:
@@ -79,7 +92,11 @@ async def finmind(dataset: str, ticker: str | None = None, start: date | None = 
     headers = {"Authorization": f"Bearer {FINMIND_TOKEN}"} if FINMIND_TOKEN else {}
     async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
         r = await client.get(FINMIND_BASE, params=params, headers=headers)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        ctype=(r.headers.get("content-type") or "").lower()
+        if "text/html" in ctype or "text/css" in ctype or _looks_like_html_or_css(r.text):
+            raise RuntimeError(f"unexpected content-type/body: {ctype or 'unknown'}")
         payload = r.json()
     if payload.get("status") not in (200, None):
         raise RuntimeError(payload.get("msg") or f"FinMind {dataset} failed")
@@ -1455,7 +1472,7 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             "missing_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")!="usable"],
             "policy":"official_registry_then_company_ir_then_official_disclosure; no third-party EPS for official derivation",
         },
-        "evidence_ledger_version":"5.4.2",
+        "evidence_ledger_version":"5.4.3",
         "blocked_mops_html_removed":True,
         "note":"V5.3.1 Evidence Engine EPS takeover：歷史季度優先讀取可稽核的公司官方 Registry，再以公司 IR/官方揭露補抓。Registry 每筆保留官方來源 URL；缺資料才留白，第三方 EPS 不參與官方推導。"
     }
@@ -2413,7 +2430,7 @@ async def fetch_twstock_mcp_snapshot(ticker:str) -> dict[str,Any]:
     headers={"Accept":"application/json, text/event-stream","Content-Type":"application/json"}
     try:
         async with httpx.AsyncClient(timeout=12,follow_redirects=True,headers=headers) as client:
-            init={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.4.2"}}}
+            init={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.4.3"}}}
             ir=await client.post(TWSTOCK_MCP_URL,json=init)
             out["initialize_status"]=ir.status_code
             if ir.status_code>=500:
@@ -2673,14 +2690,21 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         financial["source"]=(financial.get("source") or "FinMind") + "（未通過官方最新季度驗證）"
         financial["integrity_warning"]=financial_integrity.get("message")
     company_name=info.get("stock_name") or ticker
-    try:
-        web_research, company_events, mcp_snapshot = await asyncio.gather(
-            fetch_public_research(ticker, company_name),
-            fetch_company_events(ticker, company_name),
-            fetch_twstock_mcp_snapshot(ticker)
-        )
-    except Exception as e:
-        errors.append(f"PublicWebResearch: {type(e).__name__}"); web_research={"rows":[],"errors":[type(e).__name__],"fetched_at":datetime.now().astimezone().isoformat(timespec="seconds")}; company_events={"rows":[],"errors":[type(e).__name__],"fetched_at":datetime.now().astimezone().isoformat(timespec="seconds")}; mcp_snapshot={"provider":"TWStock MCP","status":"error","records":[],"error":type(e).__name__}
+    async def _safe_provider(label, coro, fallback):
+        try:
+            return await coro
+        except Exception as e:
+            errors.append(_clean_provider_error(label,e))
+            fb=dict(fallback)
+            fb["error"]=_clean_provider_error(label,e)
+            fb["fetched_at"]=datetime.now().astimezone().isoformat(timespec="seconds")
+            return fb
+
+    web_research, company_events, mcp_snapshot = await asyncio.gather(
+        _safe_provider("PublicWebResearch", fetch_public_research(ticker, company_name), {"rows":[],"errors":[]}),
+        _safe_provider("CompanyEvents", fetch_company_events(ticker, company_name), {"rows":[],"earnings_calls":[],"material_info":[],"errors":[]}),
+        _safe_provider("TWStockMCP", fetch_twstock_mcp_snapshot(ticker), {"provider":"TWStock MCP","status":"error","records":[]})
+    )
     # Final price rescue from MCP cross-check when both FinMind and TWSE history are unavailable.
     if not tech:
         mcp_close=next((r for r in (mcp_snapshot.get("records") or []) if r.get("metric")=="close" and r.get("value") is not None),None)
@@ -2776,10 +2800,25 @@ async def financial_diagnostics(ticker: str):
 @app.get("/api/stock/{ticker}")
 async def stock_api(ticker: str, refresh: bool = Query(False)):
     ticker=ticker.strip()
-    if not ticker.isdigit() or len(ticker) not in (4,5,6): raise HTTPException(400,"請輸入有效台股代號")
-    d=await build_stock(ticker, force_refresh=refresh)
-    if d["price"] is None:
-        raise HTTPException(503,detail={"message":"股票代號可能有效，但目前主要價格來源暫時無法取得資料","ticker":ticker,"errors":d.get("errors",[])})
+    if not ticker.isdigit() or len(ticker) not in (4,5,6):
+        raise HTTPException(400,"請輸入有效台股代號")
+    try:
+        d=await build_stock(ticker, force_refresh=refresh)
+    except HTTPException:
+        raise
+    except Exception as e:
+        msg=_clean_provider_error("build_stock",e)
+        return JSONResponse(
+            {"status":"degraded","ticker":ticker,"message":"部分資料來源異常，研究報告暫時無法完整產生","errors":[msg]},
+            status_code=503,
+            headers={"Cache-Control":"no-store"}
+        )
+    if d.get("price") is None:
+        return JSONResponse(
+            {"status":"degraded","ticker":ticker,"message":"股票代號可能有效，但目前價格來源暫時無法取得","errors":d.get("errors",[])},
+            status_code=503,
+            headers={"Cache-Control":"no-store"}
+        )
     return JSONResponse(d, headers={"Cache-Control":"no-store"})
 
 @app.get("/api/stock/{ticker}/pdf")
@@ -2822,7 +2861,7 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.4.2",
+        "ticker":ticker,"version":"5.4.3",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
@@ -2842,7 +2881,7 @@ async def eps_registry_diagnostics(ticker: str):
     reg=_load_official_eps_registry()
     rows=[r for r in reg.get("records",[]) if str(r.get("ticker"))==ticker]
     rows=sorted(rows,key=lambda r:(r.get("year") or 0,r.get("quarter") or 0),reverse=True)
-    return {"ticker":ticker,"version":"5.4.2","registry_schema_version":reg.get("schema_version"),
+    return {"ticker":ticker,"version":"5.4.3","registry_schema_version":reg.get("schema_version"),
             "updated_at":reg.get("updated_at"),"record_count":len(rows),"records":rows}
 
 @app.get("/api/evidence/{ticker}")
@@ -2857,7 +2896,7 @@ async def provider_diagnostics(ticker: str):
     ticker=ticker.strip().upper()
     d=await build_stock(ticker, False)
     mcp=await probe_twstock_mcp()
-    return {"version":"5.4.2","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
+    return {"version":"5.4.3","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
 
 
 @app.get("/api/diagnostics/mcp/{ticker}")
@@ -2866,5 +2905,27 @@ async def mcp_diagnostics(ticker: str):
     snap=await fetch_twstock_mcp_snapshot(ticker)
     return snap
 
+
+@app.get("/api/diagnostics/provider-health/{ticker}")
+async def provider_health(ticker: str):
+    ticker=ticker.strip()
+    if not ticker.isdigit() or len(ticker) not in (4,5,6):
+        raise HTTPException(400,"請輸入有效台股代號")
+    result={"ticker":ticker,"version":"5.4.3","providers":{}}
+    checks=[
+        ("finmind_price", finmind("TaiwanStockPrice", ticker, date.today()-timedelta(days=10), date.today())),
+        ("twse_stock_day", fetch_twse_stock_day_history(ticker,1)),
+        ("mcp", fetch_twstock_mcp_snapshot(ticker)),
+    ]
+    async def run(name,coro):
+        try:
+            v=await coro
+            return name,{"status":"ok","records":len(v) if isinstance(v,list) else len((v or {}).get("records") or []),"preview":str(v)[:180]}
+        except Exception as e:
+            return name,{"status":"error","error":_clean_provider_error(name,e)}
+    pairs=await asyncio.gather(*(run(n,c) for n,c in checks))
+    result["providers"]={k:v for k,v in pairs}
+    return JSONResponse(result,headers={"Cache-Control":"no-store"})
+
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.4.2","mode":"cloud-mobile-data-fallback-hotfix","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.4.3","mode":"cloud-mobile-provider-isolation","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}

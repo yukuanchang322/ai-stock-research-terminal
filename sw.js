@@ -1,4 +1,4 @@
-const CACHE = 'ai-stock-v5-1-shell-1';
+const CACHE="ai-stock-v5.4.3";
 const SHELL = ['/', '/styles.css', '/app.js', '/static/manifest.webmanifest', '/static/icons/icon-192.png', '/static/icons/icon-512.png'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -19,3 +19,6 @@ self.addEventListener('fetch', event => {
     return resp;
   })));
 });
+
+// V5.4.3 cache policy note:
+// /api/, /app.js, /styles.css should always prefer network so stale V5.4.1 UI cannot mask backend changes.
