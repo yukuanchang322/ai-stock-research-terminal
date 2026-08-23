@@ -1,5 +1,5 @@
-const CACHE="ai-stock-v5.9.7";
-const SHELL = ['/', '/styles.css?v=5.9.7', '/app.js?v=5.9.7', '/recovery.js?v=5.9.7', '/v547_hotfix.js?v=5.9.7', '/static/manifest.webmanifest'];
+const CACHE="ai-stock-v5.9.8";
+const SHELL = ['/styles.css?v=5.9.8', '/app.js?v=5.9.8', '/recovery.js?v=5.9.8', '/v547_hotfix.js?v=5.9.8', '/static/manifest.webmanifest'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
 });
@@ -8,9 +8,9 @@ self.addEventListener('activate', event => {
 });
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
-  if (event.request.method !== 'GET' || url.pathname.startsWith('/api/')) return;
+  if (event.request.method !== 'GET' || url.pathname.startsWith('/api/') || url.pathname === '/health') return;
   if (event.request.mode === 'navigate') {
-    event.respondWith(fetch(event.request,{cache:'no-store'}).catch(() => caches.match('/')));
+    event.respondWith(fetch(event.request,{cache:'no-store'}));
     return;
   }
   if (['/app.js','/recovery.js','/v547_hotfix.js','/styles.css','/sw.js'].includes(url.pathname)) {
@@ -20,7 +20,6 @@ self.addEventListener('fetch', event => {
     return;
   }
   event.respondWith(caches.match(event.request).then(cached => cached || fetch(event.request).then(resp => {
-    const copy = resp.clone(); caches.open(CACHE).then(cache => cache.put(event.request, copy));
-    return resp;
+    const copy = resp.clone(); caches.open(CACHE).then(cache => cache.put(event.request, copy)); return resp;
   })));
 });
