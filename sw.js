@@ -1,5 +1,5 @@
-const CACHE="ai-stock-v5.9.6";
-const SHELL = ['/', '/styles.css?v=5.9.6', '/app.js?v=5.9.6', '/recovery.js?v=5.9.6', '/v547_hotfix.js?v=5.9.6', '/static/manifest.webmanifest'];
+const CACHE="ai-stock-v5.9.7";
+const SHELL = ['/', '/styles.css?v=5.9.7', '/app.js?v=5.9.7', '/recovery.js?v=5.9.7', '/v547_hotfix.js?v=5.9.7', '/static/manifest.webmanifest'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
 });
