@@ -1,7 +1,8 @@
-// V5.4.7 UI cleanup: keep visible module/version badges aligned with deployed runtime.
+// V5.4.8 UI cleanup: keep visible module/version badges aligned with deployed runtime.
 (() => {
-  const VERSION='5.4.7';
+  const VERSION='5.4.8';
   function patch(){
+    document.title=`AI Stock Research Terminal V${VERSION}`;
     const kpis=document.getElementById('kpis');
     if(kpis){
       kpis.querySelectorAll('small').forEach(el=>{
