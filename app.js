@@ -3,8 +3,6 @@ const fmt=(v,d=1)=>v==null?'—':Number(v).toLocaleString('zh-TW',{maximumFracti
 const fmt0=v=>v==null?'—':Number(v).toLocaleString('zh-TW',{maximumFractionDigits:0});
 const pct=(v,d=1)=>v==null?'—':`${v>=0?'+':''}${Number(v).toFixed(d)}%`;
 let currentTicker='';
-let loadSequence=0;
-const normalizeTicker=value=>String(value||'').replace(/[０-９]/g,ch=>String.fromCharCode(ch.charCodeAt(0)-0xFEE0)).trim().toUpperCase();
 
 function lineSvg(values){
   if(!values.length)return '<div class="empty">資料不足</div>';
@@ -16,13 +14,7 @@ function lineSvg(values){
 function flowMatrix(fl){
   const rows=[['外資','foreign'],['投信','trust'],['自營商','dealer']];
   const signed=v=>v==null?'—':`${Number(v)>0?'+':''}${fmt0(v)}`;
-  const pctRow=(label,key)=>`<div class="flow-matrix-row margin-row"><b>${label}</b>${[1,5,20].map(n=>{const v=fl[`${key}_${n}_pct`];return `<span class="${v==null?'missing':v>0?'neg':'pos'}">${v==null?'—':`${v>0?'+':''}${fmt(v,1)}%`}</span>`}).join('')}</div>`;
-  const cards=[
-    ['融資餘額',fl.margin_balance,'張'],['融券餘額',fl.short_balance,'張'],['券資比',fl.short_margin_ratio_pct,'%'],
-    ['借券餘額',fl.sbl_balance,'張'],['借券賣出餘額',fl.sbl_short_balance,'張'],['當日借券賣出',fl.sbl_short_sell,'張'],
-    ['當日還券',fl.sbl_return,'張'],['借券餘額變化',fl.sbl_balance_change,'張'],['借券賣出餘額變化',fl.sbl_short_change,'張']
-  ];
-  return `<div class="flow-matrix"><div class="flow-head"><b>法人</b><b>1日</b><b>5日</b><b>20日</b></div>${rows.map(([label,key])=>`<div class="flow-matrix-row"><b>${label}</b>${[1,5,20].map(n=>{const v=fl[`${key}_${n}`];return `<span class="${v==null?'missing':v<0?'neg':'pos'}">${signed(v)}</span>`}).join('')}</div>`).join('')}${pctRow('融資%','margin')}${pctRow('融券%','short')}</div><div class="credit-grid">${cards.map(([label,value,unit])=>`<div><span>${label}</span><b>${value==null?'—':`${fmt(value,label==='券資比'?1:0)}${unit}`}</b></div>`).join('')}</div>`;
+  return `<div class="flow-matrix"><div class="flow-head"><b>法人</b><b>1日</b><b>5日</b><b>20日</b></div>${rows.map(([label,key])=>`<div class="flow-matrix-row"><b>${label}</b>${[1,5,20].map(n=>{const v=fl[`${key}_${n}`];return `<span class="${v<0?'neg':'pos'}">${signed(v)}</span>`}).join('')}</div>`).join('')}<div class="flow-matrix-row margin-row"><b>融資%</b>${[1,5,20].map(n=>{const v=fl[`margin_${n}_pct`];return `<span class="${v>0?'neg':'pos'}">${v==null?'—':`${v>0?'+':''}${fmt(v,1)}%`}</span>`}).join('')}</div></div>`;
 }
 function _techLinePoints(series,key,w,h,p,min,max){
   const vals=series.map(x=>x[key]);
@@ -97,21 +89,27 @@ function renderSnapshotCompare(d){
 
 
 function eventTags(tags){return `<div class="event-tags">${(tags||[]).map(t=>`<span>${t}</span>`).join('')}</div>`}
-function eventBelongsToTicker(x,ticker){
-  return Boolean(x&&x.identity_verified&&String(x.ticker||'')===String(ticker||''));
+function _bulletBlock(title,items,cls=''){
+  const list=(items||[]).slice(0,3);
+  if(!list.length)return '';
+  return `<div class="call-bucket ${cls}"><b>${title}</b><ul>${list.map(b=>`<li>${b}</li>`).join('')}</ul></div>`;
 }
 function earningsCallCard(x,index){
-  const bullets=(x.summary_bullets||[]).slice(0,4);
-  const outlook=(x.management_outlook||[]).slice(0,2);
+  const official=x.official_source?'<span class="official-badge">官方優先來源</span>':'';
   return `<article class="earnings-call-card">
-    <div class="earnings-call-head"><div><small>第 ${index+1} 筆 · ${x.date||'—'}</small><a href="${x.source_url||'#'}" target="_blank" rel="noopener noreferrer">${x.title||'法人說明會'}</a></div>${eventTags(x.tags)}</div>
-    <div class="call-summary"><b>內容摘要</b>${bullets.length?`<ul>${bullets.map(b=>`<li>${b}</li>`).join('')}</ul>`:'<p>公開摘要不足，請開啟原始來源。</p>'}</div>
-    ${outlook.length?`<div class="call-outlook"><b>管理層展望 / 市場重點</b><ul>${outlook.map(b=>`<li>${b}</li>`).join('')}</ul></div>`:''}
-    <div class="call-source"><span>${x.publisher||'公開來源'}</span><small>公開標題/摘要整理</small></div>
+    <div class="earnings-call-head"><div><small>最近第 ${index+1} 次 · ${x.date||'—'} ${x.quarter_hint?`· ${x.quarter_hint}`:''}</small><a href="${x.source_url||'#'}" target="_blank" rel="noopener noreferrer">${x.title||'法人說明會'}</a>${official}</div>${eventTags(x.tags)}</div>
+    <div class="call-buckets">
+      ${_bulletBlock('財務重點',x.financial_highlights,'financial')}
+      ${_bulletBlock('營運重點',x.operating_highlights,'operations')}
+      ${_bulletBlock('管理層展望',x.management_outlook,'outlook')}
+      ${_bulletBlock('風險 / 變數',x.risk_highlights,'risk')}
+    </div>
+    ${(!(x.financial_highlights||[]).length&&!(x.operating_highlights||[]).length&&!(x.management_outlook||[]).length)?`<div class="call-summary"><b>公開摘要</b><ul>${(x.summary_bullets||[]).slice(0,4).map(b=>`<li>${b}</li>`).join('')}</ul></div>`:''}
+    <div class="call-source"><span>${x.publisher||'公開來源'}</span><small>${x.official_source?'Official-first':'公開資訊交叉來源'} · 原文數字以來源頁為準</small></div>
   </article>`;
 }
 function materialInfoCard(x){
-  return `<article class="material-info-item"><div><time>${x.date||'—'}</time>${eventTags(x.tags)}</div><div><a href="${x.source_url||'#'}" target="_blank" rel="noopener noreferrer">${x.title||'—'}</a><p>${x.summary||''}</p><small>${x.publisher||'公開來源'}</small></div></article>`;
+  return `<article class="material-info-item"><div><time>${x.date||'—'}</time>${eventTags(x.tags)}</div><div><a href="${x.source_url||'#'}" target="_blank" rel="noopener noreferrer">${x.title||'—'}</a>${x.official_source?'<span class="official-badge small">官方來源</span>':''}<p>${x.summary||''}</p><small>${x.publisher||'公開來源'}</small></div></article>`;
 }
 function render(d){
   currentTicker=d.ticker;
@@ -120,7 +118,7 @@ function render(d){
   $('companyName').textContent=d.name; $('tickerLabel').textContent=d.ticker; $('sector').textContent=d.industry; $('marketType').textContent=d.market_type;
   $('stanceTag').textContent=d.stance; $('confidenceScore').textContent=d.confidence?.overall ?? '—'; $('price').textContent=fmt(d.price,1); $('dayChange').textContent=pct(d.change_pct);
   $('thesis').textContent=d.thesis; $('dataPolicy').textContent=d.data_policy; $('overallScore').textContent=d.scores['綜合'];
-  $('kpis').innerHTML=[['預期狀態',d.expectation_gap?.regime||'—','V5.3.5'],['Research Score',`${d.scores['綜合']}/100`,'量化綜合'],['可信度',`${d.confidence?.overall??'—'}/100`,'資料+估值'],['PER',`${fmt(d.per?.per,1)}x`,'最新可得'],['營收 YoY',pct(d.revenue?.revenue_yoy),'最新月'],['外資 1/5/20日',`${fmt0(d.flow?.foreign_1)} / ${fmt0(d.flow?.foreign_5)} / ${fmt0(d.flow?.foreign_20)}`,'淨買賣'],['RSI14',fmt(d.technical?.rsi14,1),'技術動能']].map(x=>`<div class="kpi"><span>${x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`).join('');
+  $('kpis').innerHTML=[['預期狀態',d.expectation_gap?.regime||'—','V5.2.15'],['Research Score',`${d.scores['綜合']}/100`,'量化綜合'],['可信度',`${d.confidence?.overall??'—'}/100`,'資料+估值'],['PER',`${fmt(d.per?.per,1)}x`,'最新可得'],['營收 YoY',pct(d.revenue?.revenue_yoy),'最新月'],['外資 1/5/20日',`${fmt0(d.flow?.foreign_1)} / ${fmt0(d.flow?.foreign_5)} / ${fmt0(d.flow?.foreign_20)}`,'淨買賣'],['RSI14',fmt(d.technical?.rsi14,1),'技術動能']].map(x=>`<div class="kpi"><span>${x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`).join('');
   $('dockPdf').disabled=false; $('dockShare').disabled=false; $('lastFetch').textContent=`資料頁產生 ${new Date(d.generated_at).toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit'})}`;
   // Safari-safe URL update: avoid passing a URL object to history.replaceState.
   try {
@@ -136,8 +134,6 @@ function render(d){
   $('epsBasis').textContent=`EPS 基礎：${d.valuation.eps_basis||'資料不足'}`;
 
   const f=d.financial||{}, r=d.revenue||{}, p=d.per||{}, es=d.eps_stack||{}, fi=d.financial_integrity||{};
-  const marginViews=f.margin_views||{}, qm=marginViews.quarter||{}, ym=marginViews.ytd||{};
-  const quarterMarginNote=qm.note||marginViews.warning||'缺少同口徑官方累計資料，不推測單季比率';
   const diagLink=`<a class="diagnostic-link" href="/api/diagnostics/financial/${encodeURIComponent(d.ticker)}" target="_blank" rel="noopener noreferrer">查看官方資料診斷</a>`;
   const staleNote=fi.official_verified ? `✅ ${fi.message||'官方最新財報期已驗證'}` : `⚠ ${fi.message||'財報最新季度尚未通過官方驗證'} · ${diagLink}`;
   const perNote=fi.core_financials_allowed ? (p.last_date||'市場資料') : `${p.last_date||''} · 市場 PER 可顯示，但不代表財報已驗證`;
@@ -145,11 +141,8 @@ function render(d){
     metric('最新月營收',fmt0(r.latest_revenue),r.revenue_period||''), metric('營收 YoY',pct(r.revenue_yoy),'年增率'),
     metric('單季 EPS',fmt(es.quarter_eps,2),`${es.quarter_period||'—'} · ${es.quarter_method_label||'資料不足'}`), metric('YTD EPS',fmt(es.ytd_eps,2),`${es.ytd_period||'—'} · ${es.ytd_method_label||''}`),
     metric('TTM EPS',fmt(es.ttm_eps,2),`${es.ttm_period||'—'} · ${es.ttm_method_label||''}`), metric('財報來源',f.source||es.source||'—',`${f.period||f.statement_date||''} · ${staleNote}`),
-    metric('單季毛利率',pct(qm.gross_margin),`${qm.period||'—'} · ${quarterMarginNote}`), metric('單季營益率',pct(qm.operating_margin),`${qm.period||'—'} · ${quarterMarginNote}`), metric('單季淨利率',pct(qm.net_margin),`${qm.period||'—'} · ${quarterMarginNote}`),
-    metric('累計毛利率',pct(ym.gross_margin),`${ym.period||f.margin_period||'—'} · ${ym.note||'官方累計財報'}`), metric('累計營益率',pct(ym.operating_margin),`${ym.period||f.margin_period||'—'} · ${ym.note||'官方累計財報'}`), metric('累計淨利率',pct(ym.net_margin),`${ym.period||f.margin_period||'—'} · ${ym.note||'官方累計財報'}`),
-    metric('PER / PBR',`${fmt(p.per,1)}x / ${fmt(p.pbr,1)}x`,perNote)
+    metric('毛利率',pct(f.gross_margin),f.period||'最新財報期'), metric('營益率',pct(f.operating_margin),f.period||'最新財報期'), metric('PER / PBR',`${fmt(p.per,1)}x / ${fmt(p.pbr,1)}x`,perNote)
   ].join('');
-  document.querySelectorAll('.eps-ledger,.evidence-matrix').forEach(node=>node.remove());
   const ledger=(es.evidence_ledger||[]);
   const ledgerHtml=ledger.length?`<div class="eps-ledger"><h4>EPS Evidence Ledger</h4><div class="ledger-list">${ledger.map(x=>`<div class="ledger-row ${x.status==='usable'?'ok':'missing'}"><b>${x.period}</b><span>${x.quarter_eps_direct!=null?`單季 ${fmt(x.quarter_eps_direct,2)}`:(x.ytd_eps!=null?`YTD ${fmt(x.ytd_eps,2)}`:'缺資料')}</span><small>${x.source||x.missing_reason||'無官方證據'}${x.derived_quarter_eps!=null?` · 推導單季 ${fmt(x.derived_quarter_eps,2)}`:''}</small></div>`).join('')}</div></div>`:'';
   $('fundamentalTable').insertAdjacentHTML('afterend',ledgerHtml);
@@ -161,28 +154,24 @@ function render(d){
 
   const fl=d.flow||{};
   $('flowTable').innerHTML=flowMatrix(fl);
-  const flows={外資:fl.foreign_20,投信:fl.trust_20,自營商:fl.dealer_20};
-  const availableFlows=Object.values(flows).filter(v=>v!=null&&Number.isFinite(Number(v))).map(Number);
-  const mx=Math.max(1,...availableFlows.map(Math.abs));
-  $('flowBars').innerHTML=Object.entries(flows).map(([k,v])=>v==null
-    ? `<div class="flow-row missing"><span>${k} 20日</span><div class="flow-track"></div><b>—</b></div>`
-    : `<div class="flow-row"><span>${k} 20日</span><div class="flow-track"><div class="flow-fill ${v<0?'neg':''}" style="width:${Math.abs(v)/mx*100}%"></div></div><b>${v>0?'+':''}${fmt0(v)}</b></div>`).join('');
-  const direction=v=>v==null?'資料不足':Number(v)>0?'偏買超':Number(v)<0?'偏賣超':'買賣超相抵';
-  $('flowAnalysis').textContent=`法人籌碼以 1日 / 5日 / 20日判讀；外資20日 ${direction(fl.foreign_20)}，投信20日 ${direction(fl.trust_20)}。融資與融券反映信用交易，借券餘額不等於放空；借券賣出餘額才較接近尚未回補的借券放空壓力。資料日 ${fl.lending_last_date||fl.margin_last_date||'—'}。`;
+  const flows={外資:fl.foreign_20||0,投信:fl.trust_20||0,自營商:fl.dealer_20||0}, mx=Math.max(1,...Object.values(flows).map(Math.abs));
+  $('flowBars').innerHTML=Object.entries(flows).map(([k,v])=>`<div class="flow-row"><span>${k} 20日</span><div class="flow-track"><div class="flow-fill ${v<0?'neg':''}" style="width:${Math.abs(v)/mx*100}%"></div></div><b>${v>0?'+':''}${fmt0(v)}</b></div>`).join('');
+  $('flowAnalysis').textContent=`法人籌碼以 1日 / 5日 / 20日三個時間尺度判讀；短線看1日、波段轉折看5日、中期方向看20日。外資20日 ${fl.foreign_20>=0?'偏買超':'偏賣超'}，投信20日 ${fl.trust_20>=0?'偏買超':'偏賣超'}。`;
 
   const t=d.technical||{}; $('techPill').textContent=t.trend||'資料不足';
   $('priceChart').innerHTML=technicalDashboard(t);
   $('levels').innerHTML=[['MA20',t.ma?.['20']],['MA60',t.ma?.['60']],['第一支撐',t.support1],['60日壓力',t.resistance],['KD K',t.k],['KD D',t.d],['RSI14',t.rsi14],['MACD Hist',t.macd_hist]].map(x=>`<div class="level"><span>${x[0]}</span><b>${fmt(x[1],x[0].includes('MACD')?2:1)}</b></div>`).join('');
   $('techAnalysis').textContent=`近一年日K；MA60 為中期趨勢核心。趨勢：${t.trend||'—'}；K/D ${fmt(t.k,1)}/${fmt(t.d,1)}；MACD Hist ${fmt(t.macd_hist,2)}；RSI14 ${fmt(t.rsi14,1)}。KD >80 / <20、RSI >70 / <30 僅代表動能極端，需搭配均線與量價確認。`;
 
-  const rr=d.research||{}; $('reportCount').textContent=rr.count||0; $('consensusText').textContent=rr.median_target?`合格法人目標價中位數 ${fmt0(rr.median_target)} · ${rr.target_coverage||0} 筆去重報告`:'目前沒有符合機構身分、期限與可信度門檻的法人目標價共識'; $('revisionText').textContent=rr.forward_eps_year?`${rr.forward_eps_year}E EPS 中位數 ${fmt(rr.median_forward_eps,2)}（${rr.eps_coverage||0} 筆明確年度預估）`:`Forward EPS：缺少至少2筆可辨識機構且明確年度的預估；${rr.market_mention_count||0} 筆媒體目標價引用不納入共識`;
+  const rr=d.research||{}; $('reportCount').textContent=rr.count||0; $('consensusText').textContent=rr.median_target?`目標價中位數 ${fmt0(rr.median_target)} · 平均 ${fmt0(rr.average_target)}`:'目前尚無可解析的法人目標價共識'; $('revisionText').textContent=rr.forward_eps_year?`${rr.forward_eps_year}E EPS 中位數 ${fmt(rr.median_forward_eps,2)}（${rr.eps_coverage||0} 筆明確年度預估）`:(rr.target_revision_pct!=null?`同機構目標價修正中位數 ${pct(rr.target_revision_pct)}`:'Forward EPS：缺乏可比年度標註，不納入估值');
   if($('consensusStats')) $('consensusStats').innerHTML=[['法人機構',rr.institution_count||0],['最高目標',fmt0(rr.high_target)],['最低目標',fmt0(rr.low_target)],['買進/正向',rr.ratings?.['買進']||0],['中立',rr.ratings?.['中立']||0],['公開網路',rr.public_web_count||0]].map(x=>`<div><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
   $('analystTable').innerHTML=(rr.reports||[]).length?`<table class="clean-table analyst-web-table"><thead><tr><th>法人/券商</th><th>日期</th><th>評等</th><th>目標價</th><th>來源/標題</th><th>可信度</th></tr></thead><tbody>${rr.reports.map(x=>`<tr><td>${x.institution||'—'}</td><td>${x.report_date||'—'}</td><td>${x.rating||'—'}</td><td>${fmt0(x.target_price)}</td><td>${x.source_url?`<a href="${x.source_url}" target="_blank" rel="noopener noreferrer">${x.title||x.publisher||'查看來源'}</a>`:(x.title||x.publisher||'自行匯入')}</td><td>${x.confidence!=null?`${x.confidence}/100`:'—'}</td></tr>`).join('')}</tbody></table>`:'<div class="empty bordered">目前尚未搜尋到可解析的公開法人研究引用。可按「強制刷新」重新搜尋最新網路資料。</div>';
 
   const ce=d.company_events||{};
-  const calls=(ce.earnings_calls||[]).filter(x=>eventBelongsToTicker(x,d.ticker)).slice(0,3);
-  const material=(ce.material_info||[]).filter(x=>eventBelongsToTicker(x,d.ticker));
+  const calls=(ce.earnings_calls||[]).slice(0,3);
+  const material=(ce.material_info||[]);
   if($('earningsCallCount')) $('earningsCallCount').textContent=calls.length;
+  if($('officialCallCount')) $('officialCallCount').textContent=`官方 ${ce.official_call_count||0}`;
   if($('materialInfoCount')) $('materialInfoCount').textContent=material.length;
   if($('earningsCallList')) $('earningsCallList').innerHTML=calls.length?calls.map(earningsCallCard).join(''):'<div class="empty bordered">目前尚未取得最近法說會的公開摘要。</div>';
   if($('materialInfoList')) $('materialInfoList').innerHTML=material.length?material.map(materialInfoCard).join(''):'<div class="empty bordered">目前沒有可辨識的近期重大訊息。</div>';
@@ -196,9 +185,19 @@ const ex=d.expectation_gap||{};
   if($('revisionTable')) $('revisionTable').innerHTML=(ex.institution_revisions||[]).length?`<table class="clean-table"><thead><tr><th>法人</th><th>前次 → 最新</th><th>EPS 修正</th><th>目標價修正</th><th>最新目標</th></tr></thead><tbody>${ex.institution_revisions.map(x=>`<tr><td>${x.institution||'—'}</td><td>${x.previous_date||'—'} → ${x.latest_date||'—'}</td><td>${pct(x.eps_revision_pct)}</td><td>${pct(x.target_revision_pct)}</td><td>${fmt0(x.latest_target)}</td></tr>`).join('')}</tbody></table>`:'<div class="empty bordered">目前沒有足夠的同機構前後研究資料可比較。</div>';
   renderSnapshotCompare(d);
 
+
+  const rp=d.research_pipeline||{}, db=rp.data_boundary||{};
+  if($('pipelineView')) $('pipelineView').innerHTML=`<div class="pipeline-stance"><b>${rp.stance||'—'}</b><span>Research Score ${rp.research_score??'—'}</span></div><p>${rp.investment_view||'目前資料不足以形成完整研究結論。'}</p><div class="evidence-mini"><span>Fact ${rp.evidence_counts?.facts??0}</span><span>Derived ${rp.evidence_counts?.derived_facts??0}</span><span>Estimate ${rp.evidence_counts?.estimates??0}</span></div>`;
+  if($('dataBoundary')) $('dataBoundary').innerHTML=`<div class="boundary-grade grade-${db.grade||'D'}"><b>${db.grade||'—'}</b><span>Data Boundary Grade</span></div><p>${db.message||'—'}</p>`;
+  if($('actionConditions')) $('actionConditions').innerHTML=(rp.action_conditions||[]).map(x=>`<div class="condition-row"><b>${x.condition}</b><small>${x.meaning||''}</small></div>`).join('')||'<div class="empty">目前沒有足夠條件資料。</div>';
+  const mcp=d.twstock_mcp||{};
+  if($('mcpCrosscheck')) {
+    const mrecs=mcp.records||[];
+    $('mcpCrosscheck').innerHTML=`<div class="mcp-crosscheck ${mcp.status||'missing'}"><div><b>TWStock MCP 二次驗證</b><span>${mcp.status||'missing'}</span></div><small>工具 ${mcp.tool_count??0} · 成功 ${mcp.successful_calls??0} · Evidence ${mrecs.length}</small>${mrecs.length?`<div class="mcp-evidence-mini">${mrecs.slice(0,6).map(x=>`<span>${x.metric}: ${fmt(x.value,2)}</span>`).join('')}</div>`:''}<a href="/api/diagnostics/mcp/${encodeURIComponent(d.ticker)}" target="_blank" rel="noopener noreferrer">查看 MCP 診斷</a></div>`;
+  }
+  if($('invalidationConditions')) $('invalidationConditions').innerHTML=(rp.invalidation_conditions||[]).map(x=>`<div class="condition-row invalid"><b>${x}</b></div>`).join('');
   $('valuationBody').innerHTML=scenarios.length?scenarios.map(x=>`<tr><td>${x.name}</td><td>${fmt(x.eps,2)}</td><td>${fmt(x.pe,1)}x</td><td><b>${fmt0(x.target)}</b></td><td>${pct(x.upside_pct)}</td></tr>`).join(''):'<tr><td colspan="5">估值資料不足</td></tr>';
-  const ac=d.valuation.analyst_consensus||{};
-  $('assumptions').innerHTML=`<div class="assumption-row"><b>目前採用</b><span>${d.valuation.selected_model==='forward_consensus'?'Forward 共識模型':'TTM／已驗證財報模型'}</span></div><div class="assumption-row"><b>TTM Basis</b><span>${d.valuation.trailing_eps_basis||'—'}</span></div><div class="assumption-row"><b>Forward Basis</b><span>${d.valuation.forward_eps_basis||'—'}</span></div><div class="assumption-row"><b>法人共識</b><span>${ac.median_target==null?'資料不足':`${fmt0(ac.median_target)} 元（${ac.coverage||0} 筆）`}</span></div><div class="assumption-row"><b>法人 vs 模型</b><span>${ac.gap_vs_model_pct==null?'無法比較':pct(ac.gap_vs_model_pct)} · ${ac.interpretation||''}</span></div><div class="assumption-row"><b>PE Basis</b><span>${d.valuation.pe_basis||'—'}</span></div><div class="assumption-row"><b>估值信心</b><span>${d.valuation.confidence||0}/100</span></div>`; $('peBand').innerHTML=`歷史 PER：P25 <b>${fmt(d.per?.pe_p25,1)}x</b> · Median <b>${fmt(d.per?.pe_median,1)}x</b> · P75 <b>${fmt(d.per?.pe_p75,1)}x</b>`;
+  $('assumptions').innerHTML=`<div class="assumption-row"><b>EPS Basis</b><span>${d.valuation.eps_basis||'—'}</span></div><div class="assumption-row"><b>PE Basis</b><span>${d.valuation.pe_basis||'—'}</span></div><div class="assumption-row"><b>估值信心</b><span>${d.valuation.confidence||0}/100</span></div><div class="assumption-row"><b>模型原則</b><span>Bear/Base/Bull 對 EPS 與 PE 同時做情境化，而非單點預測。</span></div>`; $('peBand').innerHTML=`歷史 PER：P25 <b>${fmt(d.per?.pe_p25,1)}x</b> · Median <b>${fmt(d.per?.pe_median,1)}x</b> · P75 <b>${fmt(d.per?.pe_p75,1)}x</b>`;
 
   const base=scenarios.find(x=>x.name==='基準');
   $('strategyGrid').innerHTML=[
@@ -224,13 +223,11 @@ async function readApiResponse(response){
 }
 
 async function loadTicker(ticker, force=false){
-  const requestId=++loadSequence;
-  ticker=normalizeTicker(ticker);
-  if($('tickerInput')) $('tickerInput').value=ticker;
+  ticker=String(ticker||'').trim().toUpperCase();
   $('errorBox').classList.add('hidden');
-  if(!/^\d{4,6}$/.test(ticker)){
+  if(!/^[0-9A-Z.-]{2,12}$/.test(ticker)){
     $('report').classList.add('hidden');
-    $('errorBox').textContent='股票代號格式不正確，請輸入 4 至 6 位數的台灣股票代號，例如 2330、3661、6510。';
+    $('errorBox').textContent='股票代號格式不正確，請輸入例如 2330、3661。';
     $('errorBox').classList.remove('hidden');
     return;
   }
@@ -239,19 +236,17 @@ async function loadTicker(ticker, force=false){
     const path=`/api/stock/${encodeURIComponent(ticker)}${force?'?refresh=true':''}`;
     const r=await fetch(path,{method:'GET',headers:{'Accept':'application/json'},cache:force?'no-store':'default'});
     const j=await readApiResponse(r);
-    if(requestId!==loadSequence) return;
     if(!r.ok) throw new Error(j.detail||j.message||`資料取得失敗（HTTP ${r.status}）`);
     try{render(j);}catch(renderError){
       console.error('render failed',renderError);
       throw new Error(`畫面產生失敗：${renderError?.message||'未知錯誤'}`);
     }
   }catch(e){
-    if(requestId!==loadSequence) return;
     console.error('loadTicker failed',e);
     $('report').classList.add('hidden');
     $('errorBox').textContent=e?.message||'資料取得失敗，請稍後再試。';
     $('errorBox').classList.remove('hidden');
-  } finally {if(requestId===loadSequence){$('loading').classList.add('hidden'); $('searchBtn').disabled=false;}}
+  } finally {$('loading').classList.add('hidden'); $('searchBtn').disabled=false;}
 }
 $('searchBtn').onclick=()=>loadTicker($('tickerInput').value.trim()); $('refreshBtn').onclick=()=>loadTicker($('tickerInput').value.trim(), true);
 $('tickerInput').addEventListener('keydown',e=>{if(e.key==='Enter')loadTicker(e.target.value.trim())});
@@ -298,22 +293,6 @@ $('dockShare').onclick=async()=>{
   const shareData={title:`${$('companyName').textContent} ${currentTicker} AI 研究報告`,text:'AI Stock Research Terminal 個股研究',url:shareUrl};
   try{if(navigator.share) await navigator.share(shareData); else {await navigator.clipboard.writeText(shareUrl); alert('研究連結已複製');}}catch(e){}
 };
-if('serviceWorker' in navigator){
-  window.addEventListener('load',async()=>{
-    try{
-      const registration=await navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'});
-      await registration.update();
-      document.addEventListener('visibilitychange',()=>{
-        if(document.visibilityState==='visible') registration.update().catch(()=>{});
-      });
-    }catch(e){}
-  });
-  let refreshing=false;
-  navigator.serviceWorker.addEventListener('controllerchange',()=>{
-    if(refreshing)return;
-    refreshing=true;
-    window.location.reload();
-  });
-}
+if('serviceWorker' in navigator){window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js').catch(()=>{}));}
 window.addEventListener('online',checkCloud); window.addEventListener('offline',checkCloud);
 checkCloud();

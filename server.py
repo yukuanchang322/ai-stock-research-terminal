@@ -25,6 +25,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
+from weasyprint import HTML
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
@@ -38,21 +39,9 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.3.5")
+app = FastAPI(title="AI Stock Research Terminal", version="5.4.1")
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
-
-
-@app.middleware("http")
-async def prevent_stale_pwa_shell(request, call_next):
-    response = await call_next(request)
-    path = request.url.path
-    if path in {"/", "/index.html", "/app.js", "/styles.css", "/sw.js", "/static/manifest.webmanifest"}:
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        response.headers["Pragma"] = "no-cache"
-    if path == "/sw.js":
-        response.headers["Service-Worker-Allowed"] = "/"
-    return response
 
 
 def safe_num(v: Any, default: float | None = None) -> float | None:
@@ -65,21 +54,6 @@ def safe_num(v: Any, default: float | None = None) -> float | None:
         return x
     except Exception:
         return default
-
-
-FULLWIDTH_TICKER_TRANSLATION=str.maketrans("０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ", "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-
-
-def normalize_ticker(value: Any) -> str:
-    """Normalize iPhone/Chinese-IME full-width ticker input to the API's canonical form."""
-    return str(value or "").translate(FULLWIDTH_TICKER_TRANSLATION).strip().upper()
-
-
-def require_numeric_taiwan_ticker(value: Any) -> str:
-    ticker=normalize_ticker(value)
-    if not re.fullmatch(r"\d{4,6}",ticker):
-        raise HTTPException(400,"請輸入有效台股代號")
-    return ticker
 
 
 def pct(v: float | None, digits: int = 1) -> str:
@@ -115,14 +89,14 @@ async def finmind(dataset: str, ticker: str | None = None, start: date | None = 
 TWSE_OPENAPI = "https://openapi.twse.com.tw/v1"
 TPEX_OPENAPI = "https://www.tpex.org.tw/openapi/v1"
 TWSTOCK_MCP_URL = os.getenv("TWSTOCK_MCP_URL", "https://TW-Stock-MCP-Server.fastmcp.app/mcp").strip()
-TWSTOCK_MCP_ENABLED = os.getenv("TWSTOCK_MCP_ENABLED", "0").strip().lower() in {"1","true","yes","on"}
+TWSTOCK_MCP_ENABLED = os.getenv("TWSTOCK_MCP_ENABLED", "1").strip().lower() in {"1","true","yes","on"}
 
 PROVIDER_REGISTRY = [
     {"id":"twse","name":"TWSE OpenAPI/Web API","tier":1,"authority":"official","role":"primary","enabled":True},
     {"id":"tpex","name":"TPEx OpenAPI","tier":1,"authority":"official","role":"primary","enabled":True},
     {"id":"company_ir","name":"Company IR / Earnings Release","tier":1,"authority":"company_official","role":"primary","enabled":True},
     {"id":"eps_registry","name":"Official EPS Registry","tier":1,"authority":"verified_registry","role":"historical_backfill","enabled":True},
-    {"id":"twstock_mcp","name":"TWStock MCP compatible adapter","tier":2,"authority":"aggregator","role":"shadow_crosscheck","enabled":TWSTOCK_MCP_ENABLED,"url":TWSTOCK_MCP_URL},
+    {"id":"twstock_mcp","name":"TWStock MCP compatible adapter","tier":2,"authority":"aggregator","role":"secondary_crosscheck","enabled":TWSTOCK_MCP_ENABLED,"url":TWSTOCK_MCP_URL},
     {"id":"finmind","name":"FinMind","tier":3,"authority":"third_party","role":"fallback","enabled":True},
     {"id":"public_web","name":"Public Web Research","tier":4,"authority":"public_web","role":"research_context","enabled":True},
 ]
@@ -130,7 +104,7 @@ PROVIDER_REGISTRY = [
 def parse_num_text(v: Any) -> float | None:
     if v is None: return None
     s=str(v).strip().replace(",", "").replace("％", "").replace("%", "")
-    if not s or re.fullmatch(r"[-—－]+", s): return None
+    if s in ("", "-", "--", "—", "－"): return None
     try: return float(s)
     except Exception: return None
 
@@ -155,339 +129,8 @@ async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
     return data if isinstance(data,list) else []
 
 
-def _month_starts(end_date: date, count: int = 13) -> list[date]:
-    months=[]
-    year,month=end_date.year,end_date.month
-    for _ in range(count):
-        months.append(date(year,month,1))
-        month-=1
-        if month==0:
-            year-=1; month=12
-    return list(reversed(months))
-
-
-async def fetch_twse_stock_day(ticker: str, months: int = 13) -> tuple[list[dict[str, Any]], list[str]]:
-    """Fetch official TWSE monthly OHLC without failing the full series on one bad month."""
-    url="https://www.twse.com.tw/exchangeReport/STOCK_DAY"
-    errors=[]
-    async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.5"}) as client:
-        async def fetch_month(month_start: date):
-            month_key=month_start.strftime("%Y%m")
-            try:
-                response=await client.get(url,params={"response":"json","date":month_start.strftime("%Y%m%d"),"stockNo":ticker})
-                response.raise_for_status()
-                payload=response.json()
-                if payload.get("stat") != "OK":
-                    raise RuntimeError(str(payload.get("stat") or "TWSE response not OK"))
-                rows=[]
-                for raw in payload.get("data") or []:
-                    if len(raw)<7:
-                        continue
-                    open_,high,low,close,volume=(parse_num_text(raw[3]),parse_num_text(raw[4]),parse_num_text(raw[5]),parse_num_text(raw[6]),parse_num_text(raw[1]))
-                    if None in (open_,high,low,close):
-                        continue
-                    rows.append({"date":roc_date_to_iso(raw[0]),"open":open_,"max":high,"min":low,"close":close,"Trading_Volume":volume})
-                return rows
-            except Exception as exc:
-                errors.append(f"TWSE_STOCK_DAY {month_key}: {type(exc).__name__}: {exc}")
-                return []
-        monthly=await asyncio.gather(*(fetch_month(month) for month in _month_starts(date.today(),months)))
-    rows=[row for group in monthly for row in group]
-    unique={row["date"]:row for row in rows if row.get("date")}
-    return [unique[key] for key in sorted(unique)],errors
-
-
-async def fetch_twse_stock_info(ticker: str) -> tuple[dict[str, Any], list[str]]:
-    """Resolve listed-company identity from the official TWSE company OpenAPI."""
-    try:
-        rows=await openapi_json(TWSE_OPENAPI,"/opendata/t187ap03_L")
-        row=next((item for item in rows if str(item.get("公司代號") or "").strip()==ticker),None)
-        if not row:
-            return {},[]
-        return {
-            "stock_id":ticker,
-            "stock_name":str(row.get("公司簡稱") or row.get("公司名稱") or ticker).strip(),
-            "industry_category":_industry_label(row.get("產業別")),
-            "type":"上市",
-            "source":"TWSE OpenAPI t187ap03_L",
-        },[]
-    except Exception as exc:
-        return {},[f"TWSE_INFO: {type(exc).__name__}: {exc}"]
-
-
-def _industry_label(value: Any) -> str:
-    text=str(value or "").strip()
-    if not text:
-        return "—"
-    return f"產業代碼 {text}" if re.fullmatch(r"\d{2}",text) else text
-
-
-def _normalize_market_type(value: Any) -> str:
-    text=str(value or "").strip()
-    lowered=text.lower()
-    if lowered in {"twse","sii","上市"}:
-        return "上市"
-    if lowered in {"tpex","otc","上櫃"}:
-        return "上櫃"
-    return text or "—"
-
-
-def normalize_stock_info(info: dict[str, Any], ticker: str) -> dict[str, Any]:
-    if not info:
-        return {}
-    normalized=dict(info)
-    normalized["stock_id"]=str(normalized.get("stock_id") or ticker).strip()
-    normalized["stock_name"]=str(normalized.get("stock_name") or ticker).strip()
-    normalized["industry_category"]=_industry_label(normalized.get("industry_category"))
-    normalized["type"]=_normalize_market_type(normalized.get("type"))
-    return normalized
-
-
-async def fetch_tpex_stock_info(ticker: str) -> tuple[dict[str, Any], list[str]]:
-    """Resolve OTC-company identity from the official TPEx company OpenAPI."""
-    try:
-        rows=await openapi_json(TPEX_OPENAPI,"/mopsfin_t187ap03_O")
-        row=next((item for item in rows if str(item.get("SecuritiesCompanyCode") or "").strip()==ticker),None)
-        if not row:
-            return {},[]
-        return {
-            "stock_id":ticker,
-            "stock_name":str(row.get("CompanyAbbreviation") or row.get("CompanyName") or ticker).strip(),
-            "industry_category":_industry_label(row.get("SecuritiesIndustryCode")),
-            "type":"上櫃",
-            "source":"TPEx OpenAPI mopsfin_t187ap03_O",
-        },[]
-    except Exception as exc:
-        return {},[f"TPEX_INFO: {type(exc).__name__}: {exc}"]
-
-
-async def fetch_official_stock_info(ticker: str) -> tuple[dict[str, Any], list[str]]:
-    """Resolve listed or OTC identity without treating the other market as an error."""
-    twse_result,tpex_result=await asyncio.gather(fetch_twse_stock_info(ticker),fetch_tpex_stock_info(ticker))
-    twse_info,twse_errors=twse_result
-    tpex_info,tpex_errors=tpex_result
-    if twse_info:
-        return twse_info,[*twse_errors,*tpex_errors]
-    if tpex_info:
-        return tpex_info,[*twse_errors,*tpex_errors]
-    return {},[*twse_errors,*tpex_errors,"OFFICIAL_INFO: ticker not found in listed or OTC company data"]
-
-
-def parse_tpex_stock_day_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """Normalize one official TPEx monthly response to calc_technical() columns."""
-    if str(payload.get("stat") or "").lower() != "ok":
-        raise RuntimeError(str(payload.get("stat") or "TPEx response not OK"))
-    tables=payload.get("tables") or []
-    if not tables:
-        return []
-    table=tables[0] or {}
-    fields=[re.sub(r"\s+", "", str(field or "")) for field in (table.get("fields") or [])]
-
-    def column(*names: str) -> int | None:
-        for name in names:
-            if name in fields:
-                return fields.index(name)
-        return None
-
-    indices={
-        "date":column("日期"),
-        "volume":column("成交張數","成交股數"),
-        "open":column("開盤","開盤價"),
-        "high":column("最高","最高價"),
-        "low":column("最低","最低價"),
-        "close":column("收盤","收盤價"),
-    }
-    if any(index is None for index in indices.values()):
-        raise RuntimeError(f"TPEx fields missing: {fields}")
-    volume_is_lots=fields[indices["volume"]] == "成交張數"
-    rows=[]
-    for raw in table.get("data") or []:
-        if not isinstance(raw,list) or max(indices.values()) >= len(raw):
-            continue
-        open_=parse_num_text(raw[indices["open"]])
-        high=parse_num_text(raw[indices["high"]])
-        low=parse_num_text(raw[indices["low"]])
-        close=parse_num_text(raw[indices["close"]])
-        volume=parse_num_text(raw[indices["volume"]])
-        if None in (open_,high,low,close):
-            continue
-        if volume is not None and volume_is_lots:
-            volume*=1000
-        rows.append({"date":roc_date_to_iso(raw[indices["date"]]),"open":open_,"max":high,"min":low,"close":close,"Trading_Volume":volume})
-    return rows
-
-
-async def fetch_tpex_stock_day(ticker: str, months: int = 13) -> tuple[list[dict[str, Any]], list[str]]:
-    """Fetch official TPEx monthly OHLC; one failed month never aborts the series."""
-    url="https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock"
-    errors=[]
-    async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.5"}) as client:
-        async def fetch_month(month_start: date):
-            month_key=month_start.strftime("%Y%m")
-            try:
-                response=await client.post(url,data={"code":ticker,"date":month_start.strftime("%Y/%m/01"),"id":"","response":"json"})
-                response.raise_for_status()
-                return parse_tpex_stock_day_payload(response.json())
-            except Exception as exc:
-                errors.append(f"TPEX_TRADING_STOCK {month_key}: {type(exc).__name__}: {exc}")
-                return []
-        monthly=await asyncio.gather(*(fetch_month(month) for month in _month_starts(date.today(),months)))
-    rows=[row for group in monthly for row in group]
-    unique={row["date"]:row for row in rows if row.get("date")}
-    return [unique[key] for key in sorted(unique)],errors
-
-
-async def fetch_official_stock_day(ticker: str, market_type: str = "") -> tuple[list[dict[str, Any]], str | None, list[str]]:
-    """Choose the official listed/OTC history provider, with a cross-market fallback."""
-    market=_normalize_market_type(market_type)
-    providers=[("TPEx afterTrading/tradingStock",fetch_tpex_stock_day),("TWSE STOCK_DAY",fetch_twse_stock_day)] if market=="上櫃" else [("TWSE STOCK_DAY",fetch_twse_stock_day),("TPEx afterTrading/tradingStock",fetch_tpex_stock_day)]
-    errors=[]
-    for provider,fetcher in providers:
-        rows,provider_errors=await fetcher(ticker,13)
-        errors.extend(provider_errors)
-        if rows:
-            return rows,provider,errors
-    return [],None,errors
-
-
-def parse_twse_institutional_payload(payload: dict[str, Any], ticker: str, trading_date: str) -> list[dict[str, Any]]:
-    fields=payload.get("fields") or []
-    for raw in payload.get("data") or []:
-        if not raw or str(raw[0]).strip()!=ticker: continue
-        row=dict(zip(fields,raw))
-        return [{
-            "date":trading_date,"stock_id":ticker,
-            "Foreign_Investor_buy":parse_num_text(row.get("外陸資買進股數(不含外資自營商)")),
-            "Foreign_Investor_sell":parse_num_text(row.get("外陸資賣出股數(不含外資自營商)")),
-            "Foreign_Dealer_Self_buy":parse_num_text(row.get("外資自營商買進股數")),
-            "Foreign_Dealer_Self_sell":parse_num_text(row.get("外資自營商賣出股數")),
-            "Investment_Trust_buy":parse_num_text(row.get("投信買進股數")),
-            "Investment_Trust_sell":parse_num_text(row.get("投信賣出股數")),
-            "Dealer_self_buy":parse_num_text(row.get("自營商買進股數(自行買賣)")),
-            "Dealer_self_sell":parse_num_text(row.get("自營商賣出股數(自行買賣)")),
-            "Dealer_Hedging_buy":parse_num_text(row.get("自營商買進股數(避險)")),
-            "Dealer_Hedging_sell":parse_num_text(row.get("自營商賣出股數(避險)")),
-        }]
-    return []
-
-
-def parse_twse_margin_payload(payload: dict[str, Any], ticker: str, trading_date: str) -> list[dict[str, Any]]:
-    for table in payload.get("tables") or []:
-        fields=table.get("fields") or []
-        if not fields or fields[0] != "代號": continue
-        for raw in table.get("data") or []:
-            if not raw or str(raw[0]).strip()!=ticker or len(raw)<16: continue
-            return [{
-                "date":trading_date,"stock_id":ticker,
-                "MarginPurchaseBuy":parse_num_text(raw[2]),"MarginPurchaseSell":parse_num_text(raw[3]),
-                "MarginPurchaseCashRepayment":parse_num_text(raw[4]),
-                "MarginPurchaseYesterdayBalance":parse_num_text(raw[5]),"MarginPurchaseTodayBalance":parse_num_text(raw[6]),
-                "MarginPurchaseLimit":parse_num_text(raw[7]),"ShortSaleBuy":parse_num_text(raw[8]),
-                "ShortSaleSell":parse_num_text(raw[9]),"ShortSaleCashRepayment":parse_num_text(raw[10]),
-                "ShortSaleYesterdayBalance":parse_num_text(raw[11]),"ShortSaleTodayBalance":parse_num_text(raw[12]),
-                "ShortSaleLimit":parse_num_text(raw[13]),"OffsetLoanAndShort":parse_num_text(raw[14]),"Note":raw[15],
-            }]
-    return []
-
-
-def parse_twse_revenue_rows(payload: list[dict[str, Any]], ticker: str) -> list[dict[str, Any]]:
-    item=next((row for row in payload if str(row.get("公司代號") or "").strip()==ticker),None)
-    if not item: return []
-    ym=re.sub(r"\D","",str(item.get("資料年月") or ""))
-    if len(ym)!=5: return []
-    year=int(ym[:3])+1911; month=int(ym[3:])
-    current=parse_num_text(item.get("營業收入-當月營收"))
-    prior=parse_num_text(item.get("營業收入-去年當月營收"))
-    rows=[]
-    if prior is not None:
-        rows.append({"date":f"{year-1:04d}-{month:02d}-01","stock_id":ticker,"revenue_year":year-1,"revenue_month":month,"revenue":prior*1000})
-    if current is not None:
-        rows.append({"date":f"{year:04d}-{month:02d}-01","stock_id":ticker,"revenue_year":year,"revenue_month":month,"revenue":current*1000})
-    return rows
-
-
-async def fetch_twse_flow_fallback(ticker: str, trading_dates: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
-    """Fetch exact-code TWSE flow data for recent known trading dates."""
-    errors=[]; institutional=[]; margin=[]
-    dates=sorted({str(d)[:10] for d in trading_dates if d},reverse=True)[:24]
-    async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.5"}) as client:
-        async def one(day: str):
-            compact=day.replace("-","")
-            try:
-                inst_r,margin_r=await asyncio.gather(
-                    client.get("https://www.twse.com.tw/rwd/zh/fund/T86",params={"date":compact,"selectType":"ALLBUT0999","response":"json"}),
-                    client.get("https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN",params={"date":compact,"selectType":"ALL","response":"json"}),
-                )
-                inst_r.raise_for_status(); margin_r.raise_for_status()
-                return parse_twse_institutional_payload(inst_r.json(),ticker,day),parse_twse_margin_payload(margin_r.json(),ticker,day)
-            except Exception as exc:
-                errors.append(f"TWSE_FLOW {day}: {type(exc).__name__}"); return [],[]
-        groups=await asyncio.gather(*(one(day) for day in dates))
-    for inst_rows,margin_rows in groups:
-        institutional.extend(inst_rows); margin.extend(margin_rows)
-    return sorted(institutional,key=lambda x:x["date"]),sorted(margin,key=lambda x:x["date"]),errors
-
-
-async def fetch_twse_revenue_fallback(ticker: str) -> tuple[list[dict[str, Any]], list[str]]:
-    try:
-        payload=await openapi_json(TWSE_OPENAPI,"/opendata/t187ap05_L")
-        return parse_twse_revenue_rows(payload,ticker),[]
-    except Exception as exc:
-        return [],[f"TWSE_REVENUE: {type(exc).__name__}: {exc}"]
-
-
-def parse_twse_lending_snapshots(short_payload: dict[str, Any], borrow_payload: dict[str, Any], ticker: str, trading_date: str) -> dict[str, Any]:
-    """Normalize official share counts to lots for the dashboard."""
-    out={"lending_last_date":trading_date}
-    short_row=next((raw for raw in short_payload.get("data") or [] if raw and str(raw[0]).strip()==ticker),None)
-    if short_row and len(short_row)>=14:
-        values=[parse_num_text(v) for v in short_row]
-        out.update({
-            "sbl_short_previous":values[8]/1000 if values[8] is not None else None,
-            "sbl_short_sell":values[9]/1000 if values[9] is not None else None,
-            "sbl_short_return":values[10]/1000 if values[10] is not None else None,
-            "sbl_short_adjustment":values[11]/1000 if values[11] is not None else None,
-            "sbl_short_balance":values[12]/1000 if values[12] is not None else None,
-            "sbl_short_limit":values[13]/1000 if values[13] is not None else None,
-        })
-    borrow_row=next((raw for raw in borrow_payload.get("data") or [] if raw and str(raw[0]).strip()==ticker),None)
-    if borrow_row and len(borrow_row)>=8:
-        values=[parse_num_text(v) for v in borrow_row]
-        out.update({
-            "sbl_borrow_previous":values[2]/1000 if values[2] is not None else None,
-            "sbl_borrow":values[3]/1000 if values[3] is not None else None,
-            "sbl_return":values[4]/1000 if values[4] is not None else None,
-            "sbl_balance":values[5]/1000 if values[5] is not None else None,
-            "sbl_market_value":values[7],
-        })
-    for current,previous,key in [
-        (out.get("sbl_short_balance"),out.get("sbl_short_previous"),"sbl_short_change"),
-        (out.get("sbl_balance"),out.get("sbl_borrow_previous"),"sbl_balance_change"),
-    ]:
-        out[key]=(current-previous) if current is not None and previous is not None else None
-    return out if len(out)>1 else {}
-
-
-async def fetch_twse_lending_snapshot(ticker: str, trading_date: str) -> tuple[dict[str, Any], list[str]]:
-    compact=str(trading_date or "").replace("-","")[:8]
-    if len(compact)!=8: return {},["TWSE_LENDING: missing trading date"]
-    try:
-        async with httpx.AsyncClient(timeout=20,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.5"}) as client:
-            short_r,borrow_r=await asyncio.gather(
-                client.get("https://www.twse.com.tw/rwd/zh/marginTrading/TWT93U",params={"date":compact,"selectType":"ALL","response":"json"}),
-                client.get("https://www.twse.com.tw/rwd/zh/lending/TWT72U",params={"date":compact,"response":"json"}),
-            )
-            short_r.raise_for_status(); borrow_r.raise_for_status()
-        return parse_twse_lending_snapshots(short_r.json(),borrow_r.json(),ticker,trading_date),[]
-    except Exception as exc:
-        return {},[f"TWSE_LENDING: {type(exc).__name__}: {exc}"]
-
-
 
 MOPS_CSV_BASE = "https://mopsfin.twse.com.tw/opendata"
-MOPS_HISTORY_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t163sb04"
-MOPS_HISTORY_CACHE_TTL = max(CACHE_TTL, 21600)
-_MOPS_HISTORY_CACHE: dict[tuple[str, int, int], tuple[float, dict[str, dict[str, Any]]]] = {}
 IR_FINANCIAL_PAGES = {
     "3661": "https://www.alchip.com/en/Investors/financials/report",
 }
@@ -832,86 +475,6 @@ def _mops_lxml_rows(html_text: str) -> list[dict[str, Any]]:
         if rows: out.append({"table_index":ti,"rows":rows})
     return out
 
-
-def _parse_mops_historical_eps(html_text: str, year: int, quarter: int, market_type: str) -> dict[str, dict[str, Any]]:
-    """Parse the official MOPS historical income-statement summary into ticker snapshots.
-
-    MOPS renders several industry-specific tables in one response. Each table has a slightly
-    different shape, so columns are resolved from the header instead of a fixed index. Reported
-    EPS is cumulative/YTD for Q2-Q4 and equals standalone EPS for Q1.
-    """
-    snapshots: dict[str, dict[str, Any]] = {}
-    for table in _mops_lxml_rows(html_text):
-        rows=table.get("rows") or []
-        header_index=None; code_index=None; name_index=None; eps_index=None
-        for ri,row in enumerate(rows):
-            normalized=[_norm_label(cell) for cell in row]
-            for ci,label in enumerate(normalized):
-                if code_index is None and ("公司代號" in label or label in {"代號","公司代碼"}): code_index=ci
-                if name_index is None and ("公司名稱" in label or label in {"名稱","公司簡稱"}): name_index=ci
-                if eps_index is None and ("基本每股盈餘" in label or "basicearningspershare" in label): eps_index=ci
-            if code_index is not None and eps_index is not None:
-                header_index=ri; break
-        if header_index is None or code_index is None or eps_index is None: continue
-        for row in rows[header_index+1:]:
-            if max(code_index,eps_index)>=len(row): continue
-            ticker=re.sub(r"\D","",str(row[code_index] or ""))
-            if not re.fullmatch(r"\d{4,6}",ticker): continue
-            eps=parse_num_text(row[eps_index])
-            if eps is None: continue
-            company_name=str(row[name_index]).strip() if name_index is not None and name_index<len(row) else ticker
-            endpoint=f"{MOPS_HISTORY_URL}?TYPEK={market_type}&year={year-1911}&season={quarter:02d}"
-            snapshots[ticker]={
-                "source":"MOPS historical income statement summary","market":"上市" if market_type=="sii" else "上櫃",
-                "endpoint":endpoint,"request_method":"POST",
-                "request_params":{"TYPEK":market_type,"year":year-1911,"season":f"{quarter:02d}"},
-                "official":True,"period":f"{year} Q{quarter}",
-                "fiscal_year":year,"fiscal_quarter":quarter,"statement_date":None,
-                "feed_kind":"mops_historical_summary","company_code":ticker,"company_name":company_name,
-                "ytd_eps":float(eps),"quarter_eps_direct":float(eps) if quarter==1 else None,
-                "eps_provenance":"official_mops_historical","eps_confidence":100,
-                "report_id":"t163sb04","table_index":table.get("table_index"),"completeness":1,
-            }
-    return snapshots
-
-
-async def _fetch_mops_historical_market(year: int, quarter: int, market_type: str) -> dict[str, dict[str, Any]]:
-    key=(market_type,year,quarter)
-    cached=_MOPS_HISTORY_CACHE.get(key)
-    if cached and time.time()-cached[0] < MOPS_HISTORY_CACHE_TTL:
-        return cached[1]
-    form={
-        # MOPS currently requires this literal historical form spelling; changing it to the
-        # grammatically correct "true" can return an empty/security response.
-        "encodeURIComponent":"1","step":"1","firstin":"ture","off":"1",
-        "TYPEK":market_type,"year":str(year-1911 if year>=1912 else year),"season":f"{quarter:02d}",
-    }
-    headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.5","Referer":"https://mopsov.twse.com.tw/mops/"}
-    async with httpx.AsyncClient(timeout=35,follow_redirects=True,headers=headers) as client:
-        response=await client.post(MOPS_HISTORY_URL,data=form)
-        response.raise_for_status()
-    text=_decode_mops_html(response.content,response.encoding)
-    if "因為安全性考量" in text or len(text)<500:
-        raise RuntimeError("MOPS historical response was blocked or empty")
-    rows=_parse_mops_historical_eps(text,year,quarter,market_type)
-    _MOPS_HISTORY_CACHE[key]=(time.time(),rows)
-    return rows
-
-
-async def fetch_mops_historical_eps(ticker: str, year: int, quarter: int) -> dict[str, Any] | None:
-    """Resolve exact-period cumulative EPS from the official MOPS historical summary."""
-    errors=[]; successful=False
-    for market_type in ("sii","otc"):
-        try:
-            rows=await _fetch_mops_historical_market(year,quarter,market_type)
-            successful=True
-            if ticker in rows: return dict(rows[ticker])
-        except Exception as exc:
-            errors.append(f"{market_type}:{type(exc).__name__}:{exc}")
-    if not successful and errors:
-        raise RuntimeError("; ".join(errors))
-    return None
-
 def _eps_from_lxml_rows(tables: list[dict[str, Any]], quarter: int) -> tuple[float|None, dict[str, Any]|None]:
     aliases=("基本每股盈餘","每股盈餘","basic earnings per share","earnings per share")
     for table in tables:
@@ -932,48 +495,20 @@ def _eps_from_lxml_rows(tables: list[dict[str, Any]], quarter: int) -> tuple[flo
             return val,{"table_index":table.get("table_index"),"row_index":ri,"row":row[:10],"numeric_candidates":[{"column_index":x[0],"raw":x[1],"number":x[2]} for x in nums[:8]],"selected_numeric_index":pick_idx,"selected_column_index":ci}
     return None,None
 
-def _income_amounts_from_lxml_rows(tables: list[dict[str, Any]], quarter: int) -> dict[str, float|None]:
-    """Extract current-period YTD income-statement amounts from MOPS company tables.
-
-    Q2/Q3 rows normally contain current quarter, prior-year quarter, current YTD and
-    prior-year YTD.  We select the third numeric amount, matching the EPS parser. Q1
-    is already both standalone and YTD. Missing/ambiguous rows remain None.
-    """
-    aliases={
-        "revenue_ytd":("營業收入合計","營業收入","operating revenue"),
-        "gross_profit_ytd":("營業毛利（毛損）淨額","營業毛利（毛損）","營業毛利","gross profit"),
-        "operating_income_ytd":("營業利益（損失）","營業利益","profit from operations","operating income"),
-        "net_income_ytd":("本期淨利（淨損）","本期淨利","本期稅後淨利","net profit for the period","net income"),
-    }
-    found={key:None for key in aliases}
-    for table in tables:
-        for row in table.get("rows") or []:
-            label=" | ".join(row[:3]).lower()
-            target=next((key for key,names in aliases.items() if found[key] is None and any(_norm_label(name) in _norm_label(label) for name in names)),None)
-            if target is None: continue
-            nums=[]
-            for value in row[1:]:
-                number=parse_num_text(value)
-                if number is not None: nums.append(float(number))
-            if not nums: continue
-            pick=0 if quarter==1 else (2 if quarter in (2,3) and len(nums)>=3 else 0)
-            found[target]=nums[pick]
-    return found
-
 def _extract_mops_ifrs_tables(html_text: str, ticker: str, year: int, quarter: int, report_id: str, url: str) -> dict[str, Any] | None:
     """Parse a company-specific MOPS IFRS page using lxml, without html5lib."""
     if "查無資料" in html_text or "無符合條件" in html_text or "HTTP Status 404" in html_text: return None
     tables=_mops_lxml_rows(html_text)
     if not tables: return None
     eps,meta=_eps_from_lxml_rows(tables,quarter)
-    amounts=_income_amounts_from_lxml_rows(tables,quarter)
-    if eps is None and not any(value is not None for value in amounts.values()): return None
+    # Historical resolver only needs EPS. Current-period financial metrics come from official CSV/OpenAPI.
+    if eps is None: return None
     return {
         "source":"MOPS company IFRS report","market":"MOPS","endpoint":url,"official":True,
         "period":f"{year} Q{quarter}","fiscal_year":year,"fiscal_quarter":quarter,
         "statement_date":None,"feed_kind":f"mops_company_{report_id}","company_code":ticker,
-        "ytd_eps":eps,**amounts,
-        "completeness":sum(value is not None for value in (eps,*amounts.values())),
+        "ytd_eps":eps,"revenue_ytd":None,"gross_profit_ytd":None,
+        "operating_income_ytd":None,"net_income_ytd":None,"completeness":1,
         "report_id":report_id,"table_count":len(tables),"selected_column":str((meta or {}).get("selected_column_index")),
         "eps_parser":"lxml","eps_parser_meta":meta,
     }
@@ -1229,14 +764,13 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
         candidates.append((TPEX_OPENAPI, f"/mopsfin_t187ap06_O_{suffix}", "TPEx/MOPS Income Statement", "上櫃", "detail"))
     errors=[]; found=[]
 
-    # Layer 0: official MOPS historical summary for the expected quarter. Unlike the legacy
-    # company HTML route, this aggregate endpoint remains accessible and also covers KY issuers.
+    # Layer 0: company-specific MOPS IFRS report for the expected quarter.
+    # Aggregate OpenAPI feeds can be incomplete/staggered; direct company report is authoritative.
     try:
         ey,eq,_=expected_latest_financial_period(date.today())
-        historical_current=await fetch_mops_historical_eps(ticker,ey,eq)
-        if historical_current: found.append(historical_current)
+        found.extend(await fetch_mops_company_ifrs(ticker,ey,eq))
     except Exception as e:
-        errors.append(f"mops_history_current:{type(e).__name__}")
+        errors.append(f"mops_company:{type(e).__name__}")
 
     # TSMC publishes quarterly results earlier than some MOPS aggregate refreshes.
     if ticker=="2330":
@@ -1303,24 +837,6 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
         if ir: found.append(ir)
     except Exception as e:
         errors.append(f"company_ir:{type(e).__name__}")
-
-    # If the expected quarter has not been filed yet, retain the newest official prior quarter
-    # instead of falling through to a third-party snapshot. The integrity gate still marks it stale.
-    if not found:
-        ey,eq,_=expected_latest_financial_period(date.today())
-        y,q=ey,eq
-        for _ in range(3):
-            q-=1
-            if q==0: y-=1; q=4
-            try:
-                prior=await fetch_mops_historical_eps(ticker,y,q)
-                if prior:
-                    prior["latest_expected_period"]=f"{ey} Q{eq}"
-                    prior["current_period_status"]="not_published_or_unavailable"
-                    found.append(prior)
-                    break
-            except Exception as e:
-                errors.append(f"mops_history_{y}q{q}:{type(e).__name__}")
     if found:
         # Latest fiscal period always wins. Within the same period prefer the detailed row with more parsed fields.
         found.sort(key=lambda x: (x.get("fiscal_year") or 0, x.get("fiscal_quarter") or 0,
@@ -1534,16 +1050,6 @@ async def reconcile_official_financial_snapshot(ticker: str, selected: dict[str,
         candidates.extend(await fetch_mops_csv_official(ticker))
     except Exception:
         pass
-    # Re-probe the exact expected quarter through the generic official resolver. This gives a
-    # transiently failed MOPS/OpenAPI request a second independent chance and prevents a valid
-    # Q2 filing from being hidden merely because an older structured snapshot was also available.
-    try:
-        expected_year,expected_quarter,_=expected_latest_financial_period(date.today())
-        expected=await fetch_official_eps_for_period(ticker,expected_year,expected_quarter)
-        if expected:
-            candidates.append(expected)
-    except Exception:
-        pass
     if not candidates:
         return selected or {"official": False, "candidate_hits": 0, "errors": ["reconcile:no_official_candidate"]}
 
@@ -1563,87 +1069,6 @@ async def reconcile_official_financial_snapshot(ticker: str, selected: dict[str,
     merged["mapping_reconciled"]=True
     merged["mapping_sources"]=[{"source":x.get("source"),"endpoint":x.get("endpoint"),"period":x.get("period"),"completeness":x.get("completeness")} for x in latest]
     return merged
-
-FINANCIAL_AMOUNT_FIELDS=("revenue_ytd","gross_profit_ytd","operating_income_ytd","net_income_ytd")
-
-def _margin_block(snapshot: dict[str, Any], period: str, basis: str, method: str, note: str) -> dict[str, Any]:
-    revenue=safe_num(snapshot.get("revenue_ytd"))
-    gross=safe_num(snapshot.get("gross_profit_ytd"))
-    operating=safe_num(snapshot.get("operating_income_ytd"))
-    net=safe_num(snapshot.get("net_income_ytd"))
-    return {
-        "period":period,"basis":basis,"method":method,"note":note,
-        "source":snapshot.get("source"),"endpoint":snapshot.get("endpoint"),
-        "revenue":revenue,"gross_profit":gross,"operating_income":operating,"net_income":net,
-        "gross_margin":gross/revenue*100 if revenue not in (None,0) and gross is not None else None,
-        "operating_margin":operating/revenue*100 if revenue not in (None,0) and operating is not None else None,
-        "net_margin":net/revenue*100 if revenue not in (None,0) and net is not None else None,
-    }
-
-async def fetch_official_financial_amounts_for_period(ticker: str, year: int, quarter: int) -> dict[str, Any] | None:
-    """Resolve exact-period official YTD amounts without accepting EPS-only evidence."""
-    candidates=[]
-    try:
-        candidates.extend(await fetch_mops_company_ifrs(ticker,year,quarter))
-    except Exception:
-        pass
-    try:
-        ir=await fetch_company_ir_financial(ticker,year,quarter)
-        if ir: candidates.append(ir)
-    except Exception:
-        pass
-    try:
-        candidates.extend(await fetch_mops_material_financial(ticker,year,quarter))
-    except Exception:
-        pass
-    exact=[row for row in candidates if row.get("official") and row.get("fiscal_year")==year and row.get("fiscal_quarter")==quarter]
-    if not exact: return None
-    exact.sort(key=lambda row:sum(row.get(field) is not None for field in FINANCIAL_AMOUNT_FIELDS),reverse=True)
-    merged=dict(exact[0])
-    for row in exact[1:]:
-        for field in FINANCIAL_AMOUNT_FIELDS:
-            if merged.get(field) is None and row.get(field) is not None: merged[field]=row[field]
-    return merged if merged.get("revenue_ytd") is not None else None
-
-async def build_financial_margin_views(ticker: str, current: dict[str, Any]) -> dict[str, Any]:
-    """Keep cumulative and standalone-quarter profitability definitions separate."""
-    try:
-        year=int(current.get("fiscal_year")); quarter=int(current.get("fiscal_quarter"))
-    except (TypeError,ValueError):
-        year=quarter=None
-    if not current.get("official") or not year or not quarter:
-        return {"ytd":None,"quarter":None,"warning":"缺少可驗證的官方財報期間，獲利率不進行期間轉換。"}
-    if safe_num(current.get("revenue_ytd")) is None:
-        same_period=await fetch_official_financial_amounts_for_period(ticker,year,quarter)
-        if same_period:
-            current=dict(current)
-            for field in (*FINANCIAL_AMOUNT_FIELDS,"source","endpoint"):
-                if field in FINANCIAL_AMOUNT_FIELDS or current.get(field) is None:
-                    if same_period.get(field) is not None: current[field]=same_period[field]
-    ytd_period=f"{year} Q{quarter} YTD" if quarter<4 else f"{year} FY"
-    ytd=_margin_block(current,ytd_period,"cumulative_ytd","official_ytd","官方累計財報數字計算")
-    quarter_block=None
-    if quarter==1:
-        quarter_block=dict(ytd,period=f"{year} Q1 單季",basis="standalone_quarter",method="q1_equals_ytd",note="Q1 單季等於 Q1 累計")
-    else:
-        prior=await fetch_official_financial_amounts_for_period(ticker,year,quarter-1)
-        if prior and safe_num(current.get("revenue_ytd")) is not None and safe_num(prior.get("revenue_ytd")) is not None:
-            delta={field:(safe_num(current.get(field))-safe_num(prior.get(field)) if safe_num(current.get(field)) is not None and safe_num(prior.get(field)) is not None else None) for field in FINANCIAL_AMOUNT_FIELDS}
-            if delta["revenue_ytd"] and delta["revenue_ytd"]>0:
-                derived={**current,**delta}
-                quarter_block=_margin_block(derived,f"{year} Q{quarter} 單季","standalone_quarter","official_ytd_difference","依本期累計減前期累計回推，非公司單季公告")
-                quarter_block["derivation"]={
-                    "current_period":current.get("period"),"current_source":current.get("source"),"current_endpoint":current.get("endpoint"),
-                    "prior_period":prior.get("period"),"prior_source":prior.get("source"),"prior_endpoint":prior.get("endpoint"),
-                }
-        # Some issuers publish official standalone margins directly, even when amount subtraction is unavailable.
-        if quarter_block is None and (current.get("gross_margin_direct") is not None or current.get("operating_margin_direct") is not None):
-            quarter_block={"period":f"{year} Q{quarter} 單季","basis":"standalone_quarter","method":"company_official_direct",
-                           "note":"公司官方單季公告比率","source":current.get("source"),"endpoint":current.get("endpoint"),
-                           "revenue":None,"gross_profit":None,"operating_income":None,"net_income":None,
-                           "gross_margin":safe_num(current.get("gross_margin_direct")),"operating_margin":safe_num(current.get("operating_margin_direct")),"net_margin":None}
-    warning=None if quarter_block else f"缺少 {year} Q{quarter-1} 同口徑官方累計金額；只顯示 {ytd_period}，不推測單季獲利率。"
-    return {"ytd":ytd,"quarter":quarter_block,"warning":warning}
 
 def expected_latest_financial_period(as_of: date | None=None) -> tuple[int,int,str]:
     """Conservative Taiwan quarterly filing calendar used only as a freshness gate.
@@ -1731,10 +1156,7 @@ BUILTIN_OFFICIAL_EPS_REGISTRY = {
     ]
 }
 
-OFFICIAL_EPS_REGISTRY_PATHS = [
-    Path(__file__).resolve().parent / "data" / "official_eps_registry.json",
-    Path(__file__).resolve().parent / "official_eps_registry.json",
-]
+OFFICIAL_EPS_REGISTRY_PATH = Path(__file__).resolve().parent / "data" / "official_eps_registry.json"
 
 def _load_official_eps_registry() -> dict[str, Any]:
     """Load the verified EPS registry with a built-in cloud-safe seed.
@@ -1748,26 +1170,20 @@ def _load_official_eps_registry() -> dict[str, Any]:
     for row in BUILTIN_OFFICIAL_EPS_REGISTRY.get("records",[]):
         if row.get("verified") is True:
             by_key[(str(row.get("ticker")),int(row.get("year")),int(row.get("quarter")))]=dict(row)
-    loaded_paths=[]; load_errors=[]
-    for registry_path in OFFICIAL_EPS_REGISTRY_PATHS:
-        if not registry_path.exists(): continue
-        try:
-            raw=json.loads(registry_path.read_text(encoding="utf-8"))
-            if isinstance(raw,dict):
-                for row in raw.get("records",[]):
-                    try:
-                        if row.get("verified") is True:
-                            key=(str(row.get("ticker")),int(row.get("year")),int(row.get("quarter")))
-                            by_key[key]=dict(row)
-                    except Exception:
-                        continue
-                merged["file_schema_version"]=raw.get("schema_version")
-                merged["file_updated_at"]=raw.get("updated_at")
-                loaded_paths.append(registry_path.name)
-        except Exception as exc:
-            load_errors.append(f"{registry_path.name}:{type(exc).__name__}")
-    if loaded_paths: merged["file_paths"]=loaded_paths
-    if load_errors: merged["file_load_errors"]=load_errors
+    try:
+        raw=json.loads(OFFICIAL_EPS_REGISTRY_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw,dict):
+            for row in raw.get("records",[]):
+                try:
+                    if row.get("verified") is True:
+                        key=(str(row.get("ticker")),int(row.get("year")),int(row.get("quarter")))
+                        by_key[key]=dict(row)
+                except Exception:
+                    continue
+            merged["file_schema_version"]=raw.get("schema_version")
+            merged["file_updated_at"]=raw.get("updated_at")
+    except Exception as exc:
+        merged["file_load_error"]=type(exc).__name__
     merged["records"]=list(by_key.values())
     merged["records"].sort(key=lambda r:(str(r.get("ticker")),int(r.get("year",0)),int(r.get("quarter",0))))
     merged["record_count"]=len(merged["records"])
@@ -1804,10 +1220,10 @@ async def fetch_official_eps_for_period(ticker: str, year: int, quarter: int) ->
 
     Priority:
       1) official structured MOPS/TWSE data when it exactly matches the requested period;
-      2) official MOPS historical aggregate statement;
-      3) company official IR / reviewed financial report;
-      4) official MOPS board-approved disclosure;
-      5) return None. Third-party/FinMind values never fill an official predecessor quarter.
+      2) company official IR / reviewed financial report;
+      3) official MOPS board-approved disclosure;
+      4) return None.  The blocked MOPS historical HTML endpoint is intentionally *not* in the
+         production EPS path. Third-party/FinMind values never fill an official predecessor quarter.
     """
     # Layer 0: verified company-official registry. This avoids re-scraping historical pages on every request
     # and makes evidence auditable/stable. Registry rows always carry their original official URL.
@@ -1825,16 +1241,7 @@ async def fetch_official_eps_for_period(ticker: str, year: int, quarter: int) ->
     except Exception:
         pass
 
-    # Layer 2: official historical aggregate. This supplies the prior cumulative quarter required
-    # to derive Q2/Q3/Q4 standalone EPS for any listed/OTC company, without per-ticker hard-coding.
-    try:
-        historical=await fetch_mops_historical_eps(ticker,year,quarter)
-        if historical and (historical.get("ytd_eps") is not None or historical.get("quarter_eps_direct") is not None):
-            return historical
-    except Exception:
-        pass
-
-    # Layer 3: company official IR. TSMC publishes a direct quarter EPS; mapped issuers such as
+    # Layer 2: company official IR. TSMC publishes a direct quarter EPS; mapped issuers such as
     # Alchip are parsed from their reviewed/audited IR PDF when an explicit period match exists.
     if ticker=="2330":
         try:
@@ -1850,7 +1257,7 @@ async def fetch_official_eps_for_period(ticker: str, year: int, quarter: int) ->
     except Exception:
         pass
 
-    # Layer 4: official board-approved disclosure, if it contains an exact period and EPS.
+    # Layer 3: official board-approved disclosure, if it contains an exact period and EPS.
     try:
         mats=await fetch_mops_material_financial(ticker,year,quarter)
         mb=_best_period_snapshot(mats,year,quarter)
@@ -1961,13 +1368,8 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             return cur,"official_ytd_q1",p
         prev=official_ytd.get((year,quarter-1))
         if prev is None: return None,None,None
-        current_p=provenance.get(key,{})
-        prior_p=provenance.get((year,quarter-1),{})
-        p={**current_p,"derivation_inputs":{
-            "current":{"period":f"{year} Q{quarter}","ytd_eps":cur,"source":current_p.get("source"),"endpoint":current_p.get("endpoint")},
-            "prior":{"period":f"{year} Q{quarter-1}","ytd_eps":prev,"source":prior_p.get("source"),"endpoint":prior_p.get("endpoint")},
-        }}
-        return round(cur-prev,4),"official_ytd_difference",p
+        p=provenance.get(key,{})
+        return cur-prev,"official_ytd_difference",p
 
     quarter_eps=None; quarter_method=None; quarter_meta=None
     if fy and fq:
@@ -2030,14 +1432,12 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
                 "evidence_url": p.get("endpoint") or diag.get("endpoint")
             })
 
-    q_label={"official_direct":"✅ 公司/官方單季值","official_registry_verified":"✅ 官方 EPS Registry","official_ytd_q1":"✅ 官方 Q1 累計=單季",
-             "official_ytd_difference":("🧮 H1－Q1 回推，非公司單季公告" if fq==2 else "🧮 官方累計值差額回推，非公司單季公告"),
+    q_label={"official_direct":"✅ 公司/官方單季值","official_registry_verified":"✅ 官方 EPS Registry","official_ytd_q1":"✅ 官方 Q1 累計=單季","official_ytd_difference":"🧮 官方累計值差額推導",
              "structured_api_q1":"△ 結構化 API","structured_api_difference":"△ 結構化 API 差額"}.get(quarter_method,"資料不足")
     return {
         "quarter_eps":quarter_eps,"quarter_period":latest_period,"quarter_method":quarter_method,"quarter_method_label":q_label,
         "quarter_source":(quarter_meta or {}).get("source") if quarter_meta else source,
         "quarter_source_url":(quarter_meta or {}).get("endpoint") if quarter_meta else None,
-        "quarter_derivation_inputs":(quarter_meta or {}).get("derivation_inputs") if quarter_meta else None,
         "ytd_eps":ytd,"ytd_period":f"{fy} Q{fq} YTD" if fy and fq else latest_period,
         "ytd_method_label":"✅ 官方累計值" if official.get("official") and ytd is not None else ("△ 結構化 API" if ytd is not None else "資料不足"),
         "ttm_eps":ttm,"ttm_period":latest_period,"ttm_method_label":"✅ 四個實際單季加總" if ttm is not None else "四季官方單季資料不足",
@@ -2053,12 +1453,11 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             "attempted_periods":[x.get("period") for x in evidence_ledger[1:]],
             "resolved_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")=="usable"],
             "missing_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")!="usable"],
-            "policy":"official_registry_then_structured_feed_then_mops_historical_then_company_ir_then_official_disclosure; no third-party EPS for official derivation",
+            "policy":"official_registry_then_company_ir_then_official_disclosure; no third-party EPS for official derivation",
         },
-        "evidence_ledger_version":"5.3.5",
+        "evidence_ledger_version":"5.4.1",
         "blocked_mops_html_removed":True,
-        "blocked_mops_company_html_removed":True,
-        "note":"歷史季度優先讀取可稽核的官方 Registry、TWSE/MOPS 結構化資料與 MOPS 歷史彙總表，再以公司 IR/官方揭露補抓。Q2-Q4 單季 EPS 僅由同年度官方累計值差額推導；缺資料留白，第三方 EPS 不參與官方推導。"
+        "note":"V5.3.1 Evidence Engine EPS takeover：歷史季度優先讀取可稽核的公司官方 Registry，再以公司 IR/官方揭露補抓。Registry 每筆保留官方來源 URL；缺資料才留白，第三方 EPS 不參與官方推導。"
     }
 
 
@@ -2128,51 +1527,6 @@ def _extract_eps_year(text: str) -> int | None:
 def _normalize_title(s: str) -> str:
     return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", s).lower()
 
-def _company_event_identity(ticker: str, company_name: str, title: str) -> tuple[bool, str]:
-    """Conservatively bind a public event result to one stock."""
-    ticker=normalize_ticker(ticker)
-    title_text=" ".join(str(title or "").split())
-    title_key=_normalize_title(title_text)
-    title_tickers=set(re.findall(r"(?<!\d)(\d{4,6})(?!\d)",title_text))
-    if title_tickers and ticker not in title_tickers:
-        return False,"different_ticker_in_title"
-    if ticker in title_tickers:
-        return True,"ticker_in_title"
-    raw_name=str(company_name or "").strip()
-    aliases={raw_name}
-    for suffix in ("股份有限公司","有限公司","-KY","－KY","KY"):
-        aliases.add(raw_name.replace(suffix,""))
-    aliases={_normalize_title(x) for x in aliases if x}
-    aliases={x for x in aliases if len(x)>=3}
-    if any(alias in title_key for alias in aliases):
-        return True,"company_name_in_title"
-    return False,"target_identity_absent"
-
-async def fetch_official_material_info(ticker: str, company_name: str) -> tuple[list[dict[str, Any]], list[str]]:
-    """Fetch today's TWSE material disclosures and keep exact company-code matches only."""
-    endpoint=TWSE_OPENAPI+"/opendata/t187ap04_L"
-    errors=[]; rows=[]
-    try:
-        async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.5"}) as client:
-            response=await client.get(endpoint); response.raise_for_status(); payload=response.json()
-        for item in payload if isinstance(payload,list) else []:
-            code=re.sub(r"\D","",_text_field(item,"公司代號","公司代碼"))
-            if code != ticker: continue
-            subject=_text_field(item,"主旨","主旨 ")
-            description=_text_field(item,"說明")
-            rows.append({
-                "ticker":ticker,"company_name":_text_field(item,"公司名稱") or company_name,
-                "date":roc_date_to_iso(_text_field(item,"發言日期") or _text_field(item,"出表日期")),
-                "title":subject,"summary":description[:500],"summary_bullets":[],"management_outlook":[],
-                "publisher":"公開資訊觀測站","source_url":endpoint,"tags":["重大訊息"],
-                "event_type":"material_info","source_type":"official_mops_openapi",
-                "identity_verified":True,"identity_method":"official_company_code",
-                "summary_method":"official_disclosure","copyright_note":"官方重大訊息，依公司代號精確篩選。"
-            })
-    except Exception as exc:
-        errors.append(f"official_material_info:{type(exc).__name__}")
-    return rows,errors
-
 async def google_news_rss(query: str) -> list[dict[str, Any]]:
     url=f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
     async with httpx.AsyncClient(timeout=18, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.1"}) as client:
@@ -2191,37 +1545,96 @@ async def google_news_rss(query: str) -> list[dict[str, Any]]:
         out.append({"title":title,"url":link,"snippet":re.sub(r'\s+',' ',desc).strip()[:420],"published_date":pub_date,"publisher":source})
     return out
 
-async def fetch_company_events(ticker: str, company_name: str) -> dict[str, Any]:
-    """V5.3.4: keep earnings calls and material information as separate event streams.
 
-    Public search snippets are summarized rather than copied verbatim. The latest three
-    distinct earnings-call dates are exposed separately so the UI/PDF can show a compact
-    management-history view.
-    """
+def _event_source_priority(url: str | None, publisher: str | None, ticker: str) -> int:
+    u=(url or "").lower()
+    p=(publisher or "").lower()
+    official_hints=[
+        "mops.twse.com.tw","twse.com.tw","tpex.org.tw",
+        "tsmc.com","investor.tsmc.com","pr.tsmc.com",
+        "alchip.com","mediatek.com","honhai.com",
+    ]
+    if any(x in u for x in official_hints): return 100
+    if any(x in p for x in ["twse","mops","證交所","櫃買","investor relations"]): return 95
+    if any(x in u for x in ["moneydj","cnyes","udn","yahoo"]): return 72
+    return 60
+
+def _event_quarter_hint(text: str, event_date: str | None) -> str | None:
+    t=text or ""
+    year=None
+    m=re.search(r"(20\d{2})",t)
+    if m: year=int(m.group(1))
+    if year is None and event_date:
+        m=re.match(r"(20\d{2})",event_date)
+        if m: year=int(m.group(1))
+    qm=re.search(r"(?:Q|第\s*)([1-4])(?:季|季度)?",t,re.I)
+    if qm and year:
+        return f"{year} Q{qm.group(1)}"
+    if year:
+        try:
+            month=int((event_date or "")[5:7])
+            q=4 if month<=2 else (1 if month<=5 else (2 if month<=8 else 3))
+            return f"{year if q!=4 else year-1} Q{q}"
+        except Exception:
+            return None
+    return None
+
+def _classify_call_bullets(title: str, snippet: str) -> dict[str,list[str]]:
+    parts=[]
+    for raw in re.split(r"[。；;｜|]|(?:\s+-\s+)",f"{title}。{snippet}"):
+        p=" ".join(raw.split()).strip(" -•")
+        if 9 <= len(p) <= 180 and p not in parts:
+            parts.append(p)
+    cats={"financial":[],"operations":[],"outlook":[],"risk":[]}
+    keywords={
+        "financial":["營收","毛利","營益","獲利","eps","財報","淨利","匯率","margin","revenue","profit"],
+        "operations":["接單","訂單","客戶","產能","產品","先進製程","ai","伺服器","asic","出貨","需求","capex","資本支出"],
+        "outlook":["展望","預期","預估","看好","看旺","成長","上修","guidance","outlook","目標"],
+        "risk":["風險","下修","保守","庫存","遞延","延後","砍單","競爭","匯損","關稅","地緣","uncertainty"],
+    }
+    for p in parts:
+        low=p.lower()
+        matched=False
+        for cat,words in keywords.items():
+            if any(w.lower() in low for w in words):
+                cats[cat].append(p[:140]); matched=True
+        if not matched and len(cats["operations"])<2:
+            cats["operations"].append(p[:140])
+    for k in cats:
+        seen=[]; out=[]
+        for x in cats[k]:
+            key=re.sub(r"\s+","",x)
+            if key in seen: continue
+            seen.append(key); out.append(x)
+            if len(out)>=3: break
+        cats[k]=out
+    return cats
+
+def _call_group_key(row: dict[str,Any]) -> str:
+    return str(row.get("quarter_hint") or (row.get("date") or "")[:10] or _normalize_title(row.get("title") or "")[:60])
+
+async def fetch_company_events(ticker: str, company_name: str) -> dict[str, Any]:
     queries=[
+        f'"{company_name}" {ticker} site:twse.com.tw 法人說明會',
+        f'"{company_name}" {ticker} site:mops.twse.com.tw 法人說明會',
         f'"{company_name}" {ticker} 法說 法人說明會 展望 財報',
         f'"{company_name}" {ticker} earnings call investor conference',
         f'"{company_name}" {ticker} 重大訊息 公告',
-        f'"{company_name}" {ticker} 董事會 重大訊息 營收 財報',
+        f'"{company_name}" {ticker} 董事會 重大訊息',
         f'"{company_name}" {ticker} 接單 產能 客戶 訂單',
     ]
-    official_task=asyncio.create_task(fetch_official_material_info(ticker,company_name))
-    results=await asyncio.gather(*(google_news_rss(q) for q in queries), return_exceptions=True)
-    official_rows,official_errors=await official_task
+    results=await asyncio.gather(*(google_news_rss(q) for q in queries),return_exceptions=True)
     rows=[]; seen=set(); errors=[]
     for result in results:
         if isinstance(result,Exception):
             errors.append(type(result).__name__); continue
         for x in result:
-            identity_ok,identity_method=_company_event_identity(ticker,company_name,x.get("title") or "")
-            if not identity_ok: continue
-            key=_normalize_title(x["title"])[:100]
+            title=x.get("title") or ""; snippet=x.get("snippet") or ""
+            key=_normalize_title(title)[:100]
             if not key or key in seen: continue
             seen.add(key)
-            title=x["title"] or ""; snippet=x["snippet"] or ""
             text=f"{title} {snippet}"
             low=text.lower()
-
             tags=[]
             for tag,words in [
                 ("法說",["法說","法人說明會","earnings call","investor conference","investor meeting"]),
@@ -2234,70 +1647,55 @@ async def fetch_company_events(ticker: str, company_name: str) -> dict[str, Any]
                 if any(w.lower() in low for w in words): tags.append(tag)
             if not tags: continue
 
-            is_call=("法說" in tags)
+            is_call="法說" in tags
             is_material=("重大訊息" in tags) or any(w in text for w in ["董事會決議","處分","取得","增資","減資","發行","訴訟","合併","股利","除權息"])
             event_type="earnings_call" if is_call else ("material_info" if is_material else "company_update")
-
-            # Concise bullet extraction from public title/snippet. No paid/full-text reproduction.
-            raw_parts=re.split(r"[。；;｜|]|(?:\s+-\s+)", snippet)
-            bullets=[]
-            for part in raw_parts:
-                p=" ".join(part.split()).strip(" -•")
-                if len(p)<10: continue
-                if p not in bullets:
-                    bullets.append(p[:120])
-                if len(bullets)>=4: break
-            if not bullets:
-                t=" ".join(title.split())
-                if t: bullets=[t[:120]]
-
-            outlook=[]
-            for b in bullets:
-                if any(w in b for w in ["展望","預期","看好","看旺","保守","需求","成長","下修","上修","guidance","outlook"]):
-                    outlook.append(b)
+            source_priority=_event_source_priority(x.get("url"),x.get("publisher"),ticker)
+            classified=_classify_call_bullets(title,snippet)
+            summary_bullets=[]
+            for cat in ["financial","operations","outlook","risk"]:
+                for b in classified[cat]:
+                    if b not in summary_bullets: summary_bullets.append(b)
+                    if len(summary_bullets)>=5: break
+                if len(summary_bullets)>=5: break
+            quarter_hint=_event_quarter_hint(text,x.get("published_date"))
+            info_density=sum(len(v) for v in classified.values())+len(tags)
             rows.append({
-                "ticker":ticker,"company_name":company_name,
-                "date":x["published_date"],"title":title,"summary":snippet[:300],
-                "summary_bullets":bullets[:4],"management_outlook":outlook[:2],
-                "publisher":x["publisher"],"source_url":x["url"],"tags":tags[:4],
-                "event_type":event_type,
-                "source_type":"public_web_quote","identity_verified":True,"identity_method":identity_method,
-                "summary_method":"public_title_snippet_summary",
-                "copyright_note":"僅整理公開標題與摘要，不重製付費或完整逐字稿。"
+                "date":x.get("published_date"),"title":title,"summary":snippet[:320],
+                "summary_bullets":summary_bullets[:5],
+                "financial_highlights":classified["financial"],
+                "operating_highlights":classified["operations"],
+                "management_outlook":classified["outlook"],
+                "risk_highlights":classified["risk"],
+                "publisher":x.get("publisher"),"source_url":x.get("url"),"tags":tags[:4],
+                "event_type":event_type,"quarter_hint":quarter_hint,
+                "source_priority":source_priority,"official_source":source_priority>=95,
+                "information_density":info_density,
+                "summary_method":"official_first_public_summary",
+                "copyright_note":"僅整理公開標題與摘要；完整數字與原文以官方來源為準。"
             })
 
-    errors.extend(official_errors)
-    rows.extend(official_rows)
-    deduped=[]; seen_rows=set()
-    for row in sorted(rows,key=lambda z:z.get("date","") or "",reverse=True):
-        key=(row.get("ticker"),_normalize_title(row.get("title") or "")[:120])
-        if key in seen_rows: continue
-        seen_rows.add(key); deduped.append(row)
-    rows=deduped[:24]
-
-    # Latest three distinct earnings-call dates, preferring richer rows.
-    calls=[]; used_dates=set()
+    rows=sorted(rows,key=lambda z:(z.get("date") or "",z.get("source_priority") or 0,z.get("information_density") or 0),reverse=True)[:36]
+    grouped={}
     for row in [r for r in rows if r.get("event_type")=="earnings_call"]:
-        d=(row.get("date") or "")[:10]
-        if d and d in used_dates: continue
-        used_dates.add(d)
-        calls.append(row)
-        if len(calls)>=3: break
+        g=_call_group_key(row)
+        score=(row.get("source_priority") or 0)*10+(row.get("information_density") or 0)
+        if g not in grouped or score>grouped[g][0]:
+            grouped[g]=(score,row)
+    calls=[v[1] for v in grouped.values()]
+    calls=sorted(calls,key=lambda z:(z.get("date") or "",z.get("source_priority") or 0),reverse=True)[:3]
 
-    material=[r for r in rows if r.get("event_type")=="material_info"][:12]
+    material=[r for r in rows if r.get("event_type")=="material_info"]
+    material=sorted(material,key=lambda z:(z.get("date") or "",z.get("source_priority") or 0),reverse=True)[:15]
     updates=[r for r in rows if r.get("event_type")=="company_update"][:8]
+
     return {
-        "rows":rows,
-        "earnings_calls":calls,
-        "material_info":material,
-        "company_updates":updates,
-        "earnings_call_count":len(calls),
-        "material_info_count":len(material),
-        "errors":errors,
-        "queries":queries,
+        "rows":rows,"earnings_calls":calls,"material_info":material,"company_updates":updates,
+        "earnings_call_count":len(calls),"material_info_count":len(material),
+        "official_call_count":sum(1 for r in calls if r.get("official_source")),
+        "errors":errors,"queries":queries,
         "fetched_at":datetime.now().astimezone().isoformat(timespec="seconds"),
-        "ticker":ticker,"company_name":company_name,
-        "policy":"所有事件須通過股票代號或公司名稱身分驗證；上市重大訊息優先採官方公司代號，法說最多顯示最近三次不同日期。"
+        "policy":"官方/交易所來源優先；最近三次法說依季度/日期去重。內容拆分財務、營運、展望、風險四類。"
     }
 
 
@@ -2313,8 +1711,6 @@ async def fetch_public_research(ticker: str, company_name: str) -> dict[str, Any
     for result in results:
         if isinstance(result, Exception): errors.append(type(result).__name__); continue
         for x in result:
-            identity_ok,identity_method=_company_event_identity(ticker,company_name,x.get("title") or "")
-            if not identity_ok: continue
             key=_normalize_title(x['title'])[:90]
             if not key or key in seen: continue
             seen.add(key)
@@ -2323,7 +1719,6 @@ async def fetch_public_research(ticker: str, company_name: str) -> dict[str, Any
             if not any([inst,target,rating,eps]): continue
             score=35 + (25 if inst else 0) + (25 if target else 0) + (10 if rating else 0) + (5 if eps else 0)
             rows.append({
-                "ticker":ticker,"company_name":company_name,"identity_verified":True,"identity_method":identity_method,
                 "institution":inst or "未辨識機構", "report_date":x['published_date'], "rating":rating,
                 "target_price":target, "forward_eps":eps, "eps_year":eps_year, "title":x['title'], "summary":x['snippet'][:220],
                 "publisher":x['publisher'], "source_url":x['url'], "source_type":"public_web_quote",
@@ -2338,26 +1733,13 @@ def merge_research(imported: list[dict[str, Any]], web_rows: list[dict[str, Any]
         y=dict(x); y.setdefault('source_type','manual_import'); y.setdefault('confidence',95); rows.append(y)
     rows.extend(web_rows)
     rows=sorted(rows,key=lambda x:x.get('report_date',''),reverse=True)
-    cutoff=(date.today()-timedelta(days=365)).isoformat()
-    eligible_target_rows=[]; seen_targets=set()
-    for x in rows:
-        target=safe_num(x.get('target_price')); inst=x.get('institution'); report_date=x.get('report_date') or ''
-        if target is None or not inst or inst=='未辨識機構' or int(x.get('confidence') or 0)<70 or report_date<cutoff:
-            continue
-        key=(inst,report_date,round(target,2))
-        if key in seen_targets: continue
-        seen_targets.add(key); eligible_target_rows.append(x)
-    targets=[safe_num(x.get('target_price')) for x in eligible_target_rows]
-    market_mentions=[safe_num(x.get('target_price')) for x in rows if safe_num(x.get('target_price')) is not None and x not in eligible_target_rows]
+    targets=[safe_num(x.get('target_price')) for x in rows if safe_num(x.get('target_price')) is not None]
     # Annual EPS consensus must have an explicit forecast year. Mixing quarterly/TTM/annual EPS is prohibited.
-    eps_by_year_inst: dict[int,dict[str,tuple[str,float]]]={}
+    eps_by_year: dict[int,list[float]]={}
     for x in rows:
         ep=safe_num(x.get('forward_eps')); ey=x.get('eps_year')
-        if ep is not None and isinstance(ey,int) and x.get('confidence',0)>=70 and x.get('institution') not in (None,'未辨識機構'):
-            inst=str(x.get('institution')); report_date=str(x.get('report_date') or '')
-            current=eps_by_year_inst.setdefault(ey,{}).get(inst)
-            if current is None or report_date>current[0]: eps_by_year_inst[ey][inst]=(report_date,ep)
-    eps_by_year={year:[value for _,value in institutions_map.values()] for year,institutions_map in eps_by_year_inst.items()}
+        if ep is not None and isinstance(ey,int) and x.get('confidence',0)>=70:
+            eps_by_year.setdefault(ey,[]).append(ep)
     eps_consensus={str(y):median(vals) for y,vals in sorted(eps_by_year.items()) if vals}
     current_year=date.today().year
     chosen_year=next((y for y in sorted(eps_by_year) if y>=current_year),None)
@@ -2371,7 +1753,7 @@ def merge_research(imported: list[dict[str, Any]], web_rows: list[dict[str, Any]
     by_inst={}; by_inst_eps={}
     for x in rows:
         inst=x.get('institution'); tp=safe_num(x.get('target_price')); ep=safe_num(x.get('forward_eps'))
-        if inst and inst!='未辨識機構' and int(x.get('confidence') or 0)>=70 and (x.get('report_date') or '')>=cutoff:
+        if inst and inst!='未辨識機構':
             if tp is not None: by_inst.setdefault(inst,[]).append((x.get('report_date',''),tp))
             if ep is not None: by_inst_eps.setdefault(inst,[]).append((x.get('report_date',''),ep))
     for vals in by_inst.values():
@@ -2383,12 +1765,9 @@ def merge_research(imported: list[dict[str, Any]], web_rows: list[dict[str, Any]
     return {
         "count":len(rows), "institution_count":len(institutions), "median_target":median(targets) if targets else None,
         "average_target":sum(targets)/len(targets) if targets else None, "high_target":max(targets) if targets else None, "low_target":min(targets) if targets else None,
-        "target_coverage":len(eligible_target_rows),"eligible_target_reports":eligible_target_rows,
-        "market_mention_count":len(market_mentions),"market_mention_median_target":median(market_mentions) if market_mentions else None,
         "median_forward_eps":median(epss) if epss else None, "forward_eps_year":chosen_year, "forward_eps_by_year":eps_consensus, "eps_coverage":len(epss), "target_revision_pct":median(revisions) if revisions else None, "eps_revision_pct":median(eps_revisions) if eps_revisions else None,
         "ratings":ratings, "reports":rows, "public_web_count":sum(1 for x in rows if x.get('source_type')=='public_web_quote'),
         "manual_count":sum(1 for x in rows if x.get('source_type')=='manual_import'),
-        "consensus_policy":"近12個月、可辨識機構、可信度至少70，且同機構同日期同目標價去重；未辨識媒體引用不納入法人共識。",
     }
 
 
@@ -2608,39 +1987,29 @@ def calc_technical(prices: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]], lending: dict[str, Any] | None=None) -> dict[str, Any]:
+def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]]) -> dict[str, Any]:
     df=pd.DataFrame(rows)
     result: dict[str,Any]={}
     if not df.empty:
         for c in df.columns:
             if c not in ("date","stock_id"):
-                df[c]=pd.to_numeric(df[c],errors="coerce")
+                df[c]=pd.to_numeric(df[c],errors="coerce").fillna(0)
         df=df.sort_values("date")
-        def net(prefix:str,n:int)->float | None:
+        def net(prefix:str,n:int)->float:
             buy=[c for c in df.columns if c.startswith(prefix) and c.endswith("_buy")]
             sell=[c for c in df.columns if c.startswith(prefix) and c.endswith("_sell")]
-            if not buy or not sell:
-                return None
             tail=df.tail(n)
-            buy_total=tail[buy].sum(min_count=1).sum(min_count=1)
-            sell_total=tail[sell].sum(min_count=1).sum(min_count=1)
-            if pd.isna(buy_total) or pd.isna(sell_total):
-                return None
-            return float(buy_total-sell_total)
-        flow_values={
+            return float(tail[buy].sum().sum()-tail[sell].sum().sum()) if buy or sell else 0.0
+        result.update({
             "foreign_1":net("Foreign_",1),"foreign_5":net("Foreign_",5),"foreign_20":net("Foreign_",20),
             "trust_1":net("Investment_Trust",1),"trust_5":net("Investment_Trust",5),"trust_20":net("Investment_Trust",20),
             "dealer_1":net("Dealer",1),"dealer_5":net("Dealer",5),"dealer_20":net("Dealer",20),
-        }
-        result.update(flow_values)
-        if any(value is not None for value in flow_values.values()):
-            result["last_date"]=str(df.iloc[-1]["date"])
+            "last_date":str(df.iloc[-1]["date"]),
+        })
 
     mdf=pd.DataFrame(margin_rows)
     if not mdf.empty and "MarginPurchaseTodayBalance" in mdf.columns:
         mdf["MarginPurchaseTodayBalance"]=pd.to_numeric(mdf["MarginPurchaseTodayBalance"],errors="coerce")
-        if "ShortSaleTodayBalance" in mdf.columns:
-            mdf["ShortSaleTodayBalance"]=pd.to_numeric(mdf["ShortSaleTodayBalance"],errors="coerce")
         mdf=mdf.sort_values("date").dropna(subset=["MarginPurchaseTodayBalance"])
         if not mdf.empty:
             latest=float(mdf.iloc[-1]["MarginPurchaseTodayBalance"])
@@ -2654,18 +2023,6 @@ def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]], len
                 "margin_1_pct":balance_change(1),"margin_5_pct":balance_change(5),"margin_20_pct":balance_change(20),
                 "margin_last_date":str(mdf.iloc[-1]["date"])
             })
-            if "ShortSaleTodayBalance" in mdf.columns:
-                short_df=mdf.dropna(subset=["ShortSaleTodayBalance"])
-                if not short_df.empty:
-                    short_latest=float(short_df.iloc[-1]["ShortSaleTodayBalance"])
-                    def short_change(n:int):
-                        if len(short_df)<2: return None
-                        prior=float(short_df.iloc[max(0,len(short_df)-1-n)]["ShortSaleTodayBalance"])
-                        return ((short_latest/prior)-1)*100 if prior else None
-                    result.update({"short_balance":short_latest,"short_1_pct":short_change(1),"short_5_pct":short_change(5),"short_20_pct":short_change(20),
-                                   "short_margin_ratio_pct":(short_latest/latest*100) if latest else None})
-    if lending:
-        result.update(lending)
     return result
 
 
@@ -2772,40 +2129,22 @@ def model_valuation(price: float | None, perdata: dict[str, Any], eps_stack: dic
     ttm=safe_num(eps_stack.get("ttm_eps")) if allow_financial else None
     ytd=safe_num(eps_stack.get("ytd_eps")) if allow_financial else None
     q=eps_stack.get("quarter_period")
-    trailing_eps=None; trailing_basis="資料不足"; trailing_conf=0
-    if ttm and ttm>0:
-        trailing_eps=ttm; trailing_basis=f"TTM EPS {ttm:.2f}（截至 {q or 'latest'}；不使用單季×4）"; trailing_conf=78
+    if consensus_eps and coverage >= 2:
+        anchor_eps=consensus_eps; eps_basis=f"{research.get('forward_eps_year') or 'Forward'}E EPS 中位數（{coverage} 筆明確年度可比預估）"; eps_conf=82
+    elif ttm and ttm>0:
+        anchor_eps=ttm; eps_basis=f"TTM EPS {ttm:.2f}（截至 {q or 'latest'}；不使用單季×4）"; eps_conf=78
     elif ytd and ytd>0:
-        trailing_eps=ytd; trailing_basis=f"YTD EPS {ytd:.2f}（資料不足以形成 TTM，暫不年化單季）"; trailing_conf=48
+        anchor_eps=ytd; eps_basis=f"YTD EPS {ytd:.2f}（資料不足以形成 TTM，暫不年化單季）"; eps_conf=48
     elif perdata.get("per") and perdata["per"]>0 and allow_financial:
-        trailing_eps=price/perdata["per"]; trailing_basis="由現價 / 市場 PER 反推 TTM EPS（降級模型）"; trailing_conf=32
-    forward_eps=consensus_eps if consensus_eps and coverage>=2 else None
-    forward_basis=f"{research.get('forward_eps_year')}E EPS 中位數（{coverage} 筆獨立可比預估）" if forward_eps else "缺少至少2筆可辨識機構、明確年度的 Forward EPS"
-    if forward_eps:
-        anchor_eps=forward_eps; eps_basis=forward_basis; eps_conf=82; selected_model="forward_consensus"
-    elif trailing_eps:
-        anchor_eps=trailing_eps; eps_basis=trailing_basis; eps_conf=trailing_conf; selected_model="trailing"
-    else: return {"scenarios": [], "eps_basis":"資料不足", "confidence":0,"selected_model":"none"}
+        anchor_eps=price/perdata["per"]; eps_basis="由現價 / 市場 PER 反推 TTM EPS（降級模型）"; eps_conf=32
+    else: return {"scenarios": [], "eps_basis":"資料不足", "confidence":0}
     if perdata.get("pe_median"):
         bear_pe=max(5.0,perdata["pe_p25"]); base_pe=perdata["pe_median"]; bull_pe=min(150.0,perdata["pe_p75"]); pe_basis=f"近年歷史 PER 分位數（樣本 {perdata.get('sample_count',0)} 日）"; pe_conf=85
     else:
         center=perdata.get("per") if perdata.get("per") and 5<=perdata["per"]<=120 else 20.0; bear_pe,base_pe,bull_pe=max(8.0,center*.8),center,min(150.0,center*1.2); pe_basis="目前 PER ±20%（歷史樣本不足降級模型）"; pe_conf=50
-    def scenarios_for(eps: float | None):
-        if not eps: return []
-        values=[{"name":"悲觀","eps":eps*.90,"pe":bear_pe},{"name":"基準","eps":eps,"pe":base_pe},{"name":"樂觀","eps":eps*1.10,"pe":bull_pe}]
-        for item in values:
-            item["target"]=item["eps"]*item["pe"]; item["upside_pct"]=(item["target"]/price-1)*100
-        return values
-    trailing_scenarios=scenarios_for(trailing_eps); forward_scenarios=scenarios_for(forward_eps)
-    scenarios=forward_scenarios or trailing_scenarios
-    base=next((x for x in scenarios if x["name"]=="基準"),None)
-    analyst_target=safe_num(research.get("median_target")); analyst_coverage=int(research.get("target_coverage") or 0)
-    gap_pct=((analyst_target/base["target"])-1)*100 if analyst_target is not None and base and base.get("target") else None
-    return {"eps_basis":eps_basis,"trailing_eps_basis":trailing_basis,"forward_eps_basis":forward_basis,"pe_basis":pe_basis,
-            "confidence":round((eps_conf+pe_conf)/2),"anchor_eps":anchor_eps,"selected_model":selected_model,"scenarios":scenarios,
-            "trailing_scenarios":trailing_scenarios,"forward_scenarios":forward_scenarios,
-            "analyst_consensus":{"median_target":analyst_target,"coverage":analyst_coverage,"gap_vs_model_pct":gap_pct,
-              "interpretation":"法人目標價反映未來盈餘與研究假設；模型採可驗證 EPS 與歷史 PER，兩者不強制收斂。"}}
+    scenarios=[{"name":"悲觀","eps":anchor_eps*.90,"pe":bear_pe},{"name":"基準","eps":anchor_eps,"pe":base_pe},{"name":"樂觀","eps":anchor_eps*1.10,"pe":bull_pe}]
+    for x in scenarios: x["target"]=x["eps"]*x["pe"]; x["upside_pct"]=(x["target"]/price-1)*100
+    return {"eps_basis":eps_basis,"pe_basis":pe_basis,"confidence":round((eps_conf+pe_conf)/2),"anchor_eps":anchor_eps,"scenarios":scenarios}
 
 
 def scores(technical: dict[str, Any], revenue: dict[str, Any], flow: dict[str, Any], perdata: dict[str, Any], financial: dict[str, Any], research: dict[str, Any]) -> dict[str, int]:
@@ -2869,7 +2208,7 @@ def _source_type_for_financial(financial: dict[str,Any], eps_stack: dict[str,Any
 
 def build_evidence_graph(ticker: str, tech: dict[str,Any], revenue: dict[str,Any], flow: dict[str,Any], perdata: dict[str,Any],
                          financial: dict[str,Any], eps_stack: dict[str,Any], research: dict[str,Any], company_events: dict[str,Any],
-                         integrity: dict[str,Any]) -> dict[str,Any]:
+                         integrity: dict[str,Any], mcp_snapshot: dict[str,Any] | None=None) -> dict[str,Any]:
     ev=[]
     if tech.get("last") is not None:
         ev.append(make_evidence("close",tech.get("last"),category="market",period=tech.get("last_date"),as_of=tech.get("last_date"),source="market feed",source_type="market_feed",confidence=82,unit="TWD"))
@@ -2893,13 +2232,9 @@ def build_evidence_graph(ticker: str, tech: dict[str,Any], revenue: dict[str,Any
             else:
                 kind="fact"; definition="cumulative_ytd_eps"
             ev.append(make_evidence(metric,val,category="fundamental",kind=kind,period=eps_stack.get("quarter_period") or financial.get("period"),source=(eps_stack.get("quarter_source") if key=="quarter_eps" else None) or financial.get("source") or eps_stack.get("source") or "financial feed",source_type=("company_official" if key=="quarter_eps" and qmethod in {"official_direct","official_registry_verified"} else st),confidence=fin_conf,unit="TWD/share",note=eps_stack.get("quarter_method_label") if key=="quarter_eps" else eps_stack.get("note"),definition=definition))
-    for key in ("gross_margin","operating_margin","net_margin"):
+    for key in ("gross_margin","operating_margin"):
         if financial.get(key) is not None:
-            ev.append(make_evidence(f"ytd_{key}",financial.get(key),category="fundamental",period=financial.get("margin_period") or financial.get("period"),source=financial.get("source") or "financial statement",source_type=st,confidence=fin_conf,unit="%",definition="cumulative_ytd_margin"))
-    quarter_margins=((financial.get("margin_views") or {}).get("quarter") or {})
-    for key in ("gross_margin","operating_margin","net_margin"):
-        if quarter_margins.get(key) is not None:
-            ev.append(make_evidence(f"quarter_{key}",quarter_margins.get(key),category="fundamental",kind="derived_fact" if quarter_margins.get("method")=="official_ytd_difference" else "fact",period=quarter_margins.get("period"),source=quarter_margins.get("source") or financial.get("source") or "financial statement",source_type=st,confidence=fin_conf,unit="%",note=quarter_margins.get("note"),definition="standalone_quarter_margin"))
+            ev.append(make_evidence(key,financial.get(key),category="fundamental",period=financial.get("period"),source=financial.get("source") or "financial statement",source_type=st,confidence=fin_conf,unit="%"))
     for key,metric in (("foreign_1","foreign_1d"),("foreign_5","foreign_5d"),("foreign_20","foreign_20d"),
                        ("trust_1","trust_1d"),("trust_5","trust_5d"),("trust_20","trust_20d"),
                        ("dealer_1","dealer_1d"),("dealer_5","dealer_5d"),("dealer_20","dealer_20d"),
@@ -2919,6 +2254,22 @@ def build_evidence_graph(ticker: str, tech: dict[str,Any], revenue: dict[str,Any
             ev.append(make_evidence("analyst_target_price",safe_num(row.get("target_price")),category="research",kind="estimate",period=str(row.get("target_period") or "forward"),as_of=row.get("report_date"),source=row.get("institution") or row.get("publisher") or "public research",source_type="public_web",source_url=row.get("source_url"),confidence=int(row.get("confidence") or 60),unit="TWD",note=row.get("title"),definition="analyst_target_price_estimate"))
         if row.get("forward_eps") is not None:
             ev.append(make_evidence("analyst_forward_eps",safe_num(row.get("forward_eps")),category="research",kind="estimate",period=str(row.get("forward_eps_year") or "forward"),as_of=row.get("report_date"),source=row.get("institution") or "public research",source_type="public_web",source_url=row.get("source_url"),confidence=int(row.get("confidence") or 60),unit="TWD/share",note=row.get("title"),definition="analyst_forward_eps_estimate"))
+    # V5.4.1: TWStock MCP is an independent secondary evidence provider.
+    # It never silently overwrites official data; it can corroborate or trigger a conflict.
+    for row in ((mcp_snapshot or {}).get("records") or []):
+        if row.get("value") is None: continue
+        metric=row.get("metric")
+        # Align definitions to existing primary evidence only when semantics are sufficiently clear.
+        definition=row.get("definition") or metric
+        period=row.get("period")
+        if metric=="close" and not period: period=tech.get("last_date")
+        if metric=="monthly_revenue" and not period: period=revenue.get("revenue_period")
+        if metric in {"PER","PBR"} and not period: period=perdata.get("last_date")
+        ev.append(make_evidence(metric,row.get("value"),category="crosscheck",kind="fact",period=period,
+                                source="TWStock MCP",source_type="mcp_aggregator",confidence=int(row.get("confidence") or 76),
+                                unit=row.get("unit"),note=f"tool={row.get('tool')} path={row.get('raw_path')}",
+                                definition=definition))
+
     # V5.3.2 quality engine: only comparable Facts/Derived Facts can conflict.
     # Estimates and model outputs are revisions/scenarios, not source conflicts.
     conflicts=[]; groups={}
@@ -2974,18 +2325,214 @@ def build_evidence_graph(ticker: str, tech: dict[str,Any], revenue: dict[str,Any
             "policy":"V5.3.2: Official Fact → Derived Fact → Estimate → Model Output. Conflict requires identical metric + period + definition + unit across independent factual sources. Estimate changes are tracked as revisions, not conflicts."}
 
 
-async def probe_twstock_mcp() -> dict[str,Any]:
-    out={"provider":"TWStock MCP compatible adapter","enabled":TWSTOCK_MCP_ENABLED,"url":TWSTOCK_MCP_URL,"mode":"shadow_crosscheck","status":"disabled"}
-    if not TWSTOCK_MCP_ENABLED: return out
-    payload={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.3.5"}}}
-    try:
-        async with httpx.AsyncClient(timeout=8,follow_redirects=True,headers={"Accept":"application/json, text/event-stream","Content-Type":"application/json"}) as client:
-            r=await client.post(TWSTOCK_MCP_URL,json=payload)
-        out.update({"http_status":r.status_code,"content_type":r.headers.get("content-type"),"status":"reachable" if r.status_code<500 else "error","preview":r.text[:300]})
-    except Exception as e:
-        out.update({"status":"error","error":f"{type(e).__name__}: {e}"})
+def _mcp_text_payload(resp_json: Any) -> Any:
+    """Decode common MCP tool result shapes into JSON-ish content."""
+    if isinstance(resp_json,dict) and "result" in resp_json:
+        result=resp_json.get("result")
+    else:
+        result=resp_json
+    if isinstance(result,dict) and isinstance(result.get("content"),list):
+        texts=[]
+        for item in result["content"]:
+            if isinstance(item,dict) and item.get("type")=="text":
+                texts.append(str(item.get("text") or ""))
+            elif isinstance(item,(str,int,float)):
+                texts.append(str(item))
+        joined="\n".join(texts).strip()
+        if joined:
+            try: return json.loads(joined)
+            except Exception: return joined
+    return result
+
+def _walk_dict_values(obj: Any, prefix: str="") -> list[tuple[str,Any]]:
+    out=[]
+    if isinstance(obj,dict):
+        for k,v in obj.items():
+            path=f"{prefix}.{k}" if prefix else str(k)
+            out.append((path,v))
+            out.extend(_walk_dict_values(v,path))
+    elif isinstance(obj,list):
+        for i,v in enumerate(obj[:80]):
+            out.extend(_walk_dict_values(v,f"{prefix}[{i}]"))
     return out
 
+def _extract_mcp_metric(obj: Any, aliases: list[str]) -> tuple[float|None,str|None]:
+    pairs=_walk_dict_values(obj)
+    for path,v in pairs:
+        p=re.sub(r"[^a-z0-9\u4e00-\u9fff]","",path.lower())
+        if any(re.sub(r"[^a-z0-9\u4e00-\u9fff]","",a.lower()) in p for a in aliases):
+            n=parse_num_text(v)
+            if n is not None: return n,path
+    return None,None
+
+def _extract_mcp_date(obj: Any) -> str|None:
+    for path,v in _walk_dict_values(obj):
+        pl=path.lower()
+        if any(k in pl for k in ["date","time","日期","交易日","reportdate","period"]):
+            sv=str(v or "")
+            m=re.search(r"(20\d{2})[-/.]?(\d{1,2})[-/.]?(\d{1,2})",sv)
+            if m: return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    return None
+
+def _tool_score(tool: dict[str,Any], words:list[str]) -> int:
+    text=f"{tool.get('name','')} {tool.get('description','')}".lower()
+    return sum(3 if w.lower() in str(tool.get("name","")).lower() else 1 for w in words if w.lower() in text)
+
+def _args_for_mcp_tool(tool: dict[str,Any], ticker:str) -> dict[str,Any]:
+    schema=tool.get("inputSchema") or tool.get("input_schema") or {}
+    props=schema.get("properties") or {}
+    required=set(schema.get("required") or [])
+    args={}
+    ticker_keys=["ticker","stock_id","stockid","symbol","code","stock_code","stockcode","co_id","company_code"]
+    for k,meta in props.items():
+        lk=k.lower().replace("-","_")
+        if lk in ticker_keys or any(x==lk for x in ticker_keys):
+            args[k]=ticker
+        elif lk in {"market","exchange"}:
+            args[k]="TWSE"
+        elif lk in {"days","limit","count","n"}:
+            args[k]=20
+        elif lk in {"period","timeframe","interval"}:
+            args[k]="1d"
+        elif k in required:
+            typ=(meta or {}).get("type")
+            if typ=="string": args[k]=ticker
+            elif typ=="integer": args[k]=20
+            elif typ=="number": args[k]=20
+            elif typ=="boolean": args[k]=False
+    return args
+
+async def fetch_twstock_mcp_snapshot(ticker:str) -> dict[str,Any]:
+    """V5.4.1 live secondary provider.
+    Discovers MCP tools at runtime, invokes best matching Taiwan-stock tools using their schemas,
+    and returns cross-check evidence. Any MCP failure is non-blocking.
+    """
+    out={"provider":"TWStock MCP compatible adapter","enabled":TWSTOCK_MCP_ENABLED,"url":TWSTOCK_MCP_URL,
+         "mode":"secondary_crosscheck","status":"disabled","records":[],"tool_calls":[],"discovered_tools":[]}
+    if not TWSTOCK_MCP_ENABLED: return out
+    headers={"Accept":"application/json, text/event-stream","Content-Type":"application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=12,follow_redirects=True,headers=headers) as client:
+            init={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.4.1"}}}
+            ir=await client.post(TWSTOCK_MCP_URL,json=init)
+            out["initialize_status"]=ir.status_code
+            if ir.status_code>=500:
+                out.update({"status":"error","error":f"initialize HTTP {ir.status_code}"}); return out
+
+            lr=await client.post(TWSTOCK_MCP_URL,json={"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
+            out["tools_list_status"]=lr.status_code
+            if lr.status_code>=400:
+                out.update({"status":"error","error":f"tools/list HTTP {lr.status_code}","preview":lr.text[:400]}); return out
+            lj=lr.json()
+            tools=((lj.get("result") or {}).get("tools") if isinstance(lj,dict) else None) or []
+            out["discovered_tools"]=[{"name":t.get("name"),"description":(t.get("description") or "")[:140]} for t in tools[:80]]
+            out["tool_count"]=len(tools)
+
+            categories={
+                "quote":["quote","price","realtime","real-time","即時","成交價","stock price"],
+                "institutional":["institution","investor","foreign","法人","三大法人","buy sell"],
+                "margin":["margin","short","融資","融券"],
+                "revenue":["revenue","monthly","營收"],
+                "valuation":["per","pbr","valuation","本益比","股價淨值比"],
+                "financial":["financial","income","eps","財報","損益","基本面"],
+            }
+            chosen={}
+            for cat,words in categories.items():
+                ranked=sorted((( _tool_score(t,words),t) for t in tools),key=lambda x:x[0],reverse=True)
+                if ranked and ranked[0][0]>0: chosen[cat]=ranked[0][1]
+
+            call_id=10
+            raw_by_cat={}
+            for cat,tool in chosen.items():
+                args=_args_for_mcp_tool(tool,ticker)
+                payload={"jsonrpc":"2.0","id":call_id,"method":"tools/call","params":{"name":tool.get("name"),"arguments":args}}
+                call_id+=1
+                try:
+                    rr=await client.post(TWSTOCK_MCP_URL,json=payload)
+                    rec={"category":cat,"tool":tool.get("name"),"args":args,"http_status":rr.status_code}
+                    if rr.status_code<400:
+                        try:
+                            decoded=_mcp_text_payload(rr.json())
+                            raw_by_cat[cat]=decoded
+                            rec["status"]="ok"; rec["preview"]=str(decoded)[:240]
+                        except Exception as e:
+                            rec["status"]="parse_error"; rec["error"]=f"{type(e).__name__}: {e}"
+                    else:
+                        rec["status"]="http_error"; rec["preview"]=rr.text[:240]
+                    out["tool_calls"].append(rec)
+                except Exception as e:
+                    out["tool_calls"].append({"category":cat,"tool":tool.get("name"),"args":args,"status":"error","error":f"{type(e).__name__}: {e}"})
+
+        metric_specs=[
+            ("close","quote",["close","price","lastprice","成交價","收盤價"],"TWD","market_close"),
+            ("foreign_20d","institutional",["foreign20","foreign_net","外資","外陸資"],None,"institutional_net_20d"),
+            ("margin_balance","margin",["marginbalance","margin_purchase_balance","融資餘額"],None,"margin_balance"),
+            ("monthly_revenue","revenue",["revenue","monthlyrevenue","營收"],"TWD","monthly_revenue"),
+            ("PER","valuation",["per","pe","本益比"],"x","price_earnings_ratio"),
+            ("PBR","valuation",["pbr","pb","股價淨值比"],"x","price_book_ratio"),
+            ("quarter_eps","financial",["eps","earningspershare","每股盈餘","基本每股盈餘"],"TWD/share","quarter_or_latest_eps"),
+        ]
+        records=[]
+        for metric,cat,aliases,unit,definition in metric_specs:
+            obj=raw_by_cat.get(cat)
+            if obj is None: continue
+            val,path=_extract_mcp_metric(obj,aliases)
+            if val is None: continue
+            records.append({"metric":metric,"value":val,"unit":unit,"period":_extract_mcp_date(obj),
+                            "source":"TWStock MCP","source_type":"mcp_aggregator","confidence":76,
+                            "definition":definition,"raw_path":path,"tool":chosen.get(cat,{}).get("name")})
+        out["records"]=records
+        ok_calls=sum(1 for x in out["tool_calls"] if x.get("status")=="ok")
+        out["status"]="ok" if ok_calls else "degraded"
+        out["successful_calls"]=ok_calls
+        out["fetched_at"]=datetime.now().astimezone().isoformat(timespec="seconds")
+        return out
+    except Exception as e:
+        out.update({"status":"error","error":f"{type(e).__name__}: {e}","fetched_at":datetime.now().astimezone().isoformat(timespec="seconds")})
+        return out
+
+async def probe_twstock_mcp() -> dict[str,Any]:
+    # Kept for diagnostics compatibility; live stock requests use fetch_twstock_mcp_snapshot().
+    snap=await fetch_twstock_mcp_snapshot("2330")
+    return {k:v for k,v in snap.items() if k!="records"}
+
+
+
+def build_data_boundary(source_status, integrity, evidence_graph):
+    missing=[x for x in source_status if x.get("status")=="missing"]
+    stale=[x for x in source_status if x.get("status")=="stale"]
+    conflicts=evidence_graph.get("conflicts") or []
+    material=[]
+    if not integrity.get("official_verified"): material.append("最新財報季度尚未通過官方驗證")
+    if conflicts: material.append(f"{len(conflicts)} 組同期間/同定義核心數據存在來源衝突")
+    if missing: material.append("缺少："+"、".join(x.get("name","資料") for x in missing[:4]))
+    if stale and integrity.get("official_verified"): material.append("部分資料源存在時效落差")
+    grade="A" if not material else ("B" if len(material)==1 else ("C" if len(material)<=3 else "D"))
+    return {"grade":grade,"material_boundaries":material,"missing_count":len(missing),"stale_count":len(stale),
+            "conflict_count":len(conflicts),"message":"；".join(material) if material else "目前未發現會改變核心結論的重大資料邊界。"}
+
+def build_research_pipeline(ticker,scores_map,narrative_map,evidence_graph,financial_integrity,expectation,valuation,source_status,technical,flow,revenue,research):
+    records=evidence_graph.get("records") or []
+    counts={k:len([x for x in records if x.get("kind")==k and x.get("status")=="usable"]) for k in ["fact","derived_fact","estimate","model_output"]}
+    boundary=build_data_boundary(source_status,financial_integrity,evidence_graph)
+    score=scores_map.get("綜合",50)
+    stance="偏多 / Positive" if score>=80 else ("中性偏多 / Constructive" if score>=65 else ("中性 / Neutral" if score>=45 else "審慎 / Cautious"))
+    conditions=[]
+    ma60=(technical.get("ma") or {}).get(60)
+    if ma60 is not None: conditions.append({"type":"trend","condition":f"股價維持 MA60 {ma60:.1f} 之上","meaning":"中期趨勢維持"})
+    if flow.get("foreign_20") is not None: conditions.append({"type":"positioning","condition":"外資20日籌碼改善或維持買超","meaning":"籌碼確認"})
+    if research.get("eps_revision_pct") is not None: conditions.append({"type":"estimate","condition":"Forward EPS 持續上修","meaning":"市場預期改善"})
+    if valuation.get("scenarios"):
+        base=next((x for x in valuation["scenarios"] if x.get("name")=="基準"),valuation["scenarios"][0])
+        conditions.append({"type":"valuation","condition":f"基準合理價約 {base.get('target',0):,.0f} 元","meaning":"估值參考，不代表保證價格"})
+    invalidation=["營收年增明顯轉負或連續惡化","Forward EPS 由上修轉為連續下修","跌破 MA60 且法人20日籌碼同步惡化","重大公司事件改變原本獲利假設"]
+    return {"ticker":ticker,"scene":"single_stock_deep_dive","stance":stance,"research_score":score,
+            "evidence_counts":{"facts":counts["fact"],"derived_facts":counts["derived_fact"],"estimates":counts["estimate"],"model_outputs":counts["model_output"]},
+            "data_boundary":boundary,"investment_view":narrative_map.get("thesis"),"expectation_regime":expectation.get("regime"),
+            "catalysts":narrative_map.get("catalysts") or [],"risks":narrative_map.get("risks") or [],
+            "action_conditions":conditions[:5],"invalidation_conditions":invalidation,
+            "workflow":["定義研究問題與時間邊界","多來源取得行情/基本面/籌碼/公司揭露","Evidence 正規化與官方性/期間/新鮮度驗證","只計算可重現 Derived Facts","整合基本面/籌碼面/技術面/預期差/估值","形成結論、成立條件、失效條件與 PDF"],
+            "policy":"Evidence first. Missing data is not zero; estimates are not facts; material conflicts are disclosed."}
 
 def narrative(s: dict[str, int], tech: dict[str, Any], revenue: dict[str, Any], flow: dict[str, Any], valuation: dict[str, Any], research: dict[str, Any]) -> dict[str, Any]:
     base = next((x for x in valuation.get("scenarios", []) if x["name"] == "基準"), None)
@@ -3011,29 +2558,12 @@ def narrative(s: dict[str, int], tech: dict[str, Any], revenue: dict[str, Any], 
 
 
 async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any]:
-    ticker=normalize_ticker(ticker)
-    if not force_refresh and ticker in _CACHE:
-        cached_age=time.time()-_CACHE[ticker][0]
-        cached_ttl=int(_CACHE[ticker][1].get("cache",{}).get("ttl_seconds") or CACHE_TTL)
-        if cached_age < cached_ttl:
-            cached=dict(_CACHE[ticker][1]); cached["cache"]={"hit":True,"ttl_seconds":cached_ttl}; return cached
+    if not force_refresh and ticker in _CACHE and time.time() - _CACHE[ticker][0] < CACHE_TTL:
+        cached = dict(_CACHE[ticker][1]); cached["cache"] = {"hit": True, "ttl_seconds": CACHE_TTL}; return cached
     today = date.today(); errors: list[str] = []
-    provider_status={"price_provider":None,"info_provider":None,"fallback_used":False,"fallback_errors":[],
-                     "finmind_available":False,"finmind_price_available":False,"official_price_fallback_success":False,
-                     "twse_fallback_success":False,"tpex_fallback_success":False,"price_rows":0,"latest_price_date":None,
-                     "institutional_provider":None,"margin_provider":None,"revenue_provider":None,
-                     "lending_provider":None,"supplemental_fallback_datasets":[]}
     async def grab(dataset: str, days: int):
-        last_error=None
-        for attempt in range(2):
-            try:
-                rows=await finmind(dataset,ticker,today-timedelta(days=days),today)
-                if rows: return rows
-                last_error="empty"
-            except Exception as exc:
-                last_error=type(exc).__name__
-            if attempt==0: await asyncio.sleep(0.25)
-        errors.append(f"{dataset}: {last_error or 'empty'} after retry"); return []
+        try: return await finmind(dataset, ticker, today - timedelta(days=days), today)
+        except Exception as e: errors.append(f"{dataset}: {type(e).__name__}"); return []
     async def info_grab():
         try:
             infos = await finmind("TaiwanStockInfo")
@@ -3045,72 +2575,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         grab("TaiwanStockMarginPurchaseShortSale", 120), grab("TaiwanStockMonthRevenue", 900),
         grab("TaiwanStockPER", 1100), grab("TaiwanStockFinancialStatements", 1100)
     )
-    provider_status["finmind_available"]=any(bool(rows) for rows in (info,prices,inst,margin,rev,pers,fin))
-    info=normalize_stock_info(info,ticker)
-    if info:
-        provider_status["info_provider"]="FinMind TaiwanStockInfo"
-    else:
-        provider_status["fallback_used"]=True
-        provider_status["fallback_errors"].append("FinMind TaiwanStockInfo returned no matching row")
-        info,official_info_errors=await fetch_official_stock_info(ticker)
-        provider_status["fallback_errors"].extend(official_info_errors)
-        if info:
-            provider_status["info_provider"]=info.get("source")
-    if prices:
-        provider_status.update({"price_provider":"FinMind TaiwanStockPrice","finmind_price_available":True})
-    else:
-        provider_status["fallback_used"]=True
-        provider_status["fallback_errors"].append("FinMind TaiwanStockPrice returned no usable rows")
-        prices,official_price_provider,official_price_errors=await fetch_official_stock_day(ticker,info.get("type") or "")
-        provider_status["fallback_errors"].extend(official_price_errors)
-        if prices:
-            provider_status.update({"price_provider":official_price_provider,"official_price_fallback_success":True})
-            provider_status["twse_fallback_success"]=official_price_provider=="TWSE STOCK_DAY"
-            provider_status["tpex_fallback_success"]=official_price_provider=="TPEx afterTrading/tradingStock"
-
-    provider_status["institutional_provider"]="FinMind TaiwanStockInstitutionalInvestorsBuySellWide" if inst else None
-    provider_status["margin_provider"]="FinMind TaiwanStockMarginPurchaseShortSale" if margin else None
-    provider_status["revenue_provider"]="FinMind TaiwanStockMonthRevenue" if rev else None
-    if (not inst or not margin or not rev) and info.get("type")=="上市":
-        provider_status["fallback_used"]=True
-        trading_dates=[str(row.get("date") or "") for row in prices]
-        flow_task=fetch_twse_flow_fallback(ticker,trading_dates) if (not inst or not margin) else None
-        revenue_task=fetch_twse_revenue_fallback(ticker) if not rev else None
-        flow_result,revenue_result=await asyncio.gather(
-            flow_task if flow_task else asyncio.sleep(0,result=([],[],[])),
-            revenue_task if revenue_task else asyncio.sleep(0,result=([],[])),
-        )
-        official_inst,official_margin,flow_errors=flow_result
-        official_revenue,revenue_errors=revenue_result
-        provider_status["fallback_errors"].extend(flow_errors+revenue_errors)
-        if not inst and official_inst:
-            inst=official_inst; provider_status["institutional_provider"]="TWSE T86"; provider_status["supplemental_fallback_datasets"].append("institutional")
-        if not margin and official_margin:
-            margin=official_margin; provider_status["margin_provider"]="TWSE MI_MARGN"; provider_status["supplemental_fallback_datasets"].append("margin")
-        if not rev and official_revenue:
-            rev=official_revenue; provider_status["revenue_provider"]="TWSE/MOPS t187ap05_L"; provider_status["supplemental_fallback_datasets"].append("revenue")
-
-    lending={}
-    if info.get("type")=="上市" and prices:
-        lending,lending_errors=await fetch_twse_lending_snapshot(ticker,str(prices[-1].get("date") or ""))
-        provider_status["fallback_errors"].extend(lending_errors)
-        if lending:
-            provider_status["lending_provider"]="TWSE TWT93U / TWT72U"
-
-    def calculate(label: str, fn, *args):
-        try:
-            return fn(*args)
-        except Exception as exc:
-            errors.append(f"{label}: {type(exc).__name__}")
-            return {}
-
-    tech=calculate("Technical",calc_technical,prices)
-    flow=calculate("InstitutionalOrMargin",calc_flow,inst,margin,lending)
-    revenue=calculate("MonthRevenue",calc_revenue,rev)
-    perdata=calculate("PER",calc_per,pers)
-    financial=calculate("FinancialStatements",calc_financials,fin)
-    provider_status["price_rows"]=len(prices)
-    provider_status["latest_price_date"]=tech.get("last_date")
+    tech=calc_technical(prices); flow=calc_flow(inst,margin); revenue=calc_revenue(rev); perdata=calc_per(pers); financial=calc_financials(fin)
     try:
         official_financial=await fetch_official_income_statement(ticker)
     except Exception as e:
@@ -3122,7 +2587,6 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         errors.append(f"OfficialReconcile: {type(e).__name__}")
     eps_stack=await build_eps_stack(ticker, fin, official_financial, financial)
     financial_integrity=assess_financial_integrity(official_financial, eps_stack, today)
-    margin_views=await build_financial_margin_views(ticker,official_financial)
     # Official snapshot has highest priority for latest period margins/amounts.
     if official_financial.get("official"):
         financial.update({
@@ -3138,19 +2602,23 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
             financial["gross_margin"]=(financial.get("gross_profit")/financial["revenue"]*100) if financial.get("gross_profit") is not None else financial.get("gross_margin")
             financial["operating_margin"]=(financial.get("operating_income")/financial["revenue"]*100) if financial.get("operating_income") is not None else financial.get("operating_margin")
             financial["net_margin"]=(financial.get("net_income")/financial["revenue"]*100) if financial.get("net_income") is not None else financial.get("net_margin")
-        financial["margin_views"]=margin_views
-        financial["margin_period"]=(margin_views.get("ytd") or {}).get("period")
-        financial["margin_basis"]="cumulative_ytd"
-        financial["margin_warning"]=margin_views.get("warning")
+        if official_financial.get("gross_margin_direct") is not None:
+            financial["gross_margin"]=official_financial.get("gross_margin_direct")
+        if official_financial.get("operating_margin_direct") is not None:
+            financial["operating_margin"]=official_financial.get("operating_margin_direct")
     if not financial_integrity.get("official_verified"):
         financial["official"]=False
         financial["source"]=(financial.get("source") or "FinMind") + "（未通過官方最新季度驗證）"
         financial["integrity_warning"]=financial_integrity.get("message")
     company_name=info.get("stock_name") or ticker
     try:
-        web_research, company_events = await asyncio.gather(fetch_public_research(ticker, company_name), fetch_company_events(ticker, company_name))
+        web_research, company_events, mcp_snapshot = await asyncio.gather(
+            fetch_public_research(ticker, company_name),
+            fetch_company_events(ticker, company_name),
+            fetch_twstock_mcp_snapshot(ticker)
+        )
     except Exception as e:
-        errors.append(f"PublicWebResearch: {type(e).__name__}"); web_research={"rows":[],"errors":[type(e).__name__],"fetched_at":datetime.now().astimezone().isoformat(timespec="seconds")}; company_events={"rows":[],"errors":[type(e).__name__],"fetched_at":datetime.now().astimezone().isoformat(timespec="seconds")}
+        errors.append(f"PublicWebResearch: {type(e).__name__}"); web_research={"rows":[],"errors":[type(e).__name__],"fetched_at":datetime.now().astimezone().isoformat(timespec="seconds")}; company_events={"rows":[],"errors":[type(e).__name__],"fetched_at":datetime.now().astimezone().isoformat(timespec="seconds")}; mcp_snapshot={"provider":"TWStock MCP","status":"error","records":[],"error":type(e).__name__}
     research=merge_research(load_research(ticker), web_research.get("rows", []))
     lp=tech.get("last")
     valuation=model_valuation(lp,perdata,eps_stack,research,financial_integrity)
@@ -3159,171 +2627,95 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     expectation=expectation_gap_analysis(research, company_events, perdata, revenue, sc, lp)
     prev=tech.get("series",[])[-2]["close"] if len(tech.get("series",[]))>=2 else None
     change=((lp/prev-1)*100) if lp and prev else None
-    evidence_graph=build_evidence_graph(ticker,tech,revenue,flow,perdata,financial,eps_stack,research,company_events,financial_integrity)
+    evidence_graph=build_evidence_graph(ticker,tech,revenue,flow,perdata,financial,eps_stack,research,company_events,financial_integrity,mcp_snapshot)
     source_status=[
-        {"name":"股價","dataset":provider_status.get("price_provider") or "TaiwanStockPrice / TWSE STOCK_DAY / TPEx tradingStock","as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日收盤後"},
-        {"name":"三大法人","dataset":provider_status.get("institutional_provider") or "FinMind / TWSE T86","as_of":flow.get("last_date"),"status":"ok" if flow.get("last_date") else "missing","scheduled_update":"交易日約 20:00"},
-        {"name":"融資融券","dataset":provider_status.get("margin_provider") or "FinMind / TWSE MI_MARGN","as_of":flow.get("margin_last_date"),"status":"ok" if flow.get("margin_last_date") else "missing","scheduled_update":"交易日約 21:00"},
-        {"name":"借券／借券賣出","dataset":provider_status.get("lending_provider") or "TWSE TWT72U / TWT93U","as_of":flow.get("lending_last_date"),"status":"ok" if flow.get("sbl_balance") is not None or flow.get("sbl_short_balance") is not None else "missing","scheduled_update":"交易日約 20:30–23:30"},
-        {"name":"月營收","dataset":provider_status.get("revenue_provider") or "FinMind / TWSE MOPS t187ap05_L","as_of":revenue.get("last_date") or revenue.get("revenue_period"),"status":"ok" if revenue else "missing","scheduled_update":"依公司公告"},
+        {"name":"股價","dataset":"TaiwanStockPrice","as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日約 17:30"},
+        {"name":"三大法人","dataset":"TaiwanStockInstitutionalInvestorsBuySellWide","as_of":flow.get("last_date"),"status":"ok" if flow.get("last_date") else "missing","scheduled_update":"交易日約 20:00"},
+        {"name":"融資融券","dataset":"TaiwanStockMarginPurchaseShortSale","as_of":flow.get("margin_last_date"),"status":"ok" if flow.get("margin_last_date") else "missing","scheduled_update":"交易日約 21:00"},
+        {"name":"月營收","dataset":"TaiwanStockMonthRevenue","as_of":revenue.get("last_date") or revenue.get("revenue_period"),"status":"ok" if revenue else "missing","scheduled_update":"依公司公告"},
         {"name":"PER/PBR","dataset":"TaiwanStockPER","as_of":perdata.get("last_date"),"status":"ok" if perdata else "missing","scheduled_update":"交易日約 18:00"},
         {"name":"財務報表","dataset":financial.get("source") or "FinMind TaiwanStockFinancialStatements","as_of":financial.get("period") or financial.get("statement_date"),"status":"ok" if financial_integrity.get("official_verified") else "stale","scheduled_update":"僅官方最新季度驗證通過才標示 OK"},
         {"name":"財報完整性閘門","dataset":"Official period gate","as_of":financial_integrity.get("official_period") or eps_stack.get("structured_api_period"),"status":"ok" if financial_integrity.get("core_financials_allowed") else "stale","scheduled_update":financial_integrity.get("message")},
         {"name":"公開法人研究","dataset":"Google News RSS + 公開網路引用","as_of":web_research.get("fetched_at"),"status":"ok" if web_research.get("rows") else "missing","scheduled_update":"每次強制刷新重新搜尋"},
         {"name":"公司事件雷達","dataset":"公開新聞/法說/重大訊息引用","as_of":company_events.get("fetched_at"),"status":"ok" if company_events.get("rows") else "missing","scheduled_update":"每次強制刷新重新搜尋"},
     ]
+    source_status.append({"name":"TWStock MCP 二次驗證","dataset":"TWStock MCP live adapter","as_of":mcp_snapshot.get("fetched_at"),
+                          "status":"ok" if mcp_snapshot.get("status")=="ok" else ("stale" if mcp_snapshot.get("status")=="degraded" else "missing"),
+                          "scheduled_update":f"工具 {mcp_snapshot.get('tool_count',0)} / 成功呼叫 {mcp_snapshot.get('successful_calls',0)} / Evidence {len(mcp_snapshot.get('records') or [])}"})
     source_status.append({"name":"Evidence Engine","dataset":"Multi-Source Evidence Schema v1","as_of":evidence_graph.get("generated_at"),"status":"ok" if evidence_graph.get("summary",{}).get("usable") else "missing","scheduled_update":f"Fact {evidence_graph.get('summary',{}).get('facts',0)} / Derived {evidence_graph.get('summary',{}).get('derived_facts',0)} / Conflicts {evidence_graph.get('summary',{}).get('conflicts',0)}"})
     conf=calc_confidence(source_status,valuation,research)
-    lending_complete=info.get("type")!="上市" or flow.get("sbl_balance") is not None or flow.get("sbl_short_balance") is not None
-    core_supplemental_complete=bool(flow.get("last_date") and flow.get("margin_last_date") and revenue and lending_complete)
-    result_cache_ttl=CACHE_TTL if core_supplemental_complete else min(CACHE_TTL,60)
+    research_pipeline=build_research_pipeline(ticker,sc,nar,evidence_graph,financial_integrity,expectation,valuation,source_status,tech,flow,revenue,research)
     data={"ticker":ticker,"name":info.get("stock_name") or ticker,"industry":info.get("industry_category") or "—","market_type":info.get("type") or "—",
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
-          "source_status":source_status,"evidence_graph":evidence_graph,"errors":errors,"provider_status":provider_status,"cache":{"hit":False,"ttl_seconds":result_cache_ttl,"complete":core_supplemental_complete},"web_research_meta":web_research,"company_events":company_events,
-          "data_policy":"V5.3.5 Provider Fallback：FinMind 保留為結構化來源；上市股票以 TWSE 補行情、法人、融資融券、借券及月營收。法人目標價僅採近12個月、可辨識機構且通過可信度門檻的去重資料；媒體引用與模型估值分開呈現。"}
+          "source_status":source_status,"evidence_graph":evidence_graph,"research_pipeline":research_pipeline,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,"twstock_mcp":mcp_snapshot,
+          "data_policy":"V5.4.1 Cross-Validation：所有資料先正規化為 Evidence Record，依官方性、新鮮度、期間與衝突檢查後才進研究模型；Fact、Derived Fact、Estimate 分層；TWStock MCP 僅作第二來源交叉驗證，不靜默覆蓋官方值。"}
     _CACHE[ticker]=(time.time(),data)
     return data
 
 
 def report_html(d: dict[str, Any]) -> str:
     esc=lambda x: html.escape("—" if x is None else str(x))
-    sc=d["scores"]; tech=d["technical"]; rev=d["revenue"]; flow=d["flow"]; per=d["per"]; fin=d["financial"]; research=d["research"]; exp=d.get("expectation_gap",{}); val=d["valuation"]; conf=d["confidence"]
+    sc=d["scores"]; tech=d["technical"]; rev=d["revenue"]; flow=d["flow"]; per=d["per"]; fin=d["financial"]; research=d["research"]; exp=d.get("expectation_gap",{}); val=d["valuation"]; conf=d["confidence"]; rp=d.get("research_pipeline",{}); db=rp.get("data_boundary",{})
     src="".join(f"<tr><td>{esc(x['name'])}</td><td>{esc(x.get('dataset'))}</td><td>{esc(x.get('as_of'))}</td><td>{esc(x['scheduled_update'])}</td><td>{'OK' if x['status']=='ok' else '缺資料'}</td></tr>" for x in d["source_status"])
     scenarios="".join(f"<tr><td>{x['name']}</td><td>{x['eps']:.2f}</td><td>{x['pe']:.1f}x</td><td><b>{x['target']:,.0f}</b></td><td>{x['upside_pct']:+.1f}%</td></tr>" for x in val.get("scenarios",[])) or "<tr><td colspan='5'>估值資料不足</td></tr>"
     rrows="".join(f"<tr><td>{esc(x.get('institution'))}</td><td>{esc(x.get('report_date'))}</td><td>{esc(x.get('rating'))}</td><td>{nfmt(safe_num(x.get('target_price')),0)}</td><td>{nfmt(safe_num(x.get('forward_eps')),2)}</td></tr>" for x in research.get("reports",[])) or "<tr><td colspan='5'>目前尚未搜尋到可解析的公開法人研究引用。</td></tr>"
     erows="".join(f"<tr><td>{esc(x.get('institution'))}</td><td>{esc(x.get('previous_date'))} → {esc(x.get('latest_date'))}</td><td>{pct(x.get('eps_revision_pct'))}</td><td>{pct(x.get('target_revision_pct'))}</td><td>{nfmt(x.get('latest_target'),0)}</td></tr>" for x in exp.get("institution_revisions",[])) or "<tr><td colspan='5'>同機構前後修正資料不足。</td></tr>"
     cats="".join(f"<li>{esc(x)}</li>" for x in d.get("catalysts",[])); risks="".join(f"<li>{esc(x)}</li>" for x in d.get("risks",[]))
-    margins=fin.get("margin_views") or {}; qm=margins.get("quarter") or {}; ym=margins.get("ytd") or {}
     return f"""<!doctype html><html lang='zh-Hant'><head><meta charset='utf-8'><style>
     @page{{size:A4;margin:11mm}} body{{font-family:'Noto Sans TC','PingFang TC',sans-serif;color:#13202a;font-size:9.5pt;line-height:1.55}} h1{{font-size:23pt;margin:0}} h2{{font-size:14pt;border-bottom:2px solid #173847;padding-bottom:4px;margin:18px 0 8px}} .muted{{color:#60727c}} .head{{display:flex;justify-content:space-between;border-bottom:3px solid #173847;padding-bottom:9px}} .price{{font-size:23pt;font-weight:800;text-align:right}} .pill{{display:inline-block;border:1px solid #719188;border-radius:20px;padding:2px 8px;margin-right:5px}} .grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin:10px 0}} .card{{border:1px solid #d7e0e4;border-radius:7px;padding:8px}} .card b{{font-size:14pt;display:block}} table{{width:100%;border-collapse:collapse;font-size:8.4pt}} th,td{{padding:5px;border-bottom:1px solid #dce4e8;text-align:left}} th{{background:#f2f6f7}} .call{{border-left:4px solid #17866b;background:#f4faf8;padding:9px}} .warn{{border:1px solid #d7b94b;background:#fff9e7;padding:8px;margin-top:10px}} .small{{font-size:8pt}} .page-break{{break-before:page}} .cols{{display:grid;grid-template-columns:1fr 1fr;gap:10px}} ul{{margin:4px 0 0;padding-left:18px}} .badge{{font-weight:700}}
     </style></head><body>
-    <div class='head'><div><div class='muted'>AI STOCK RESEARCH TERMINAL V5.3.5 • TAIWAN EQUITY RESEARCH</div><h1>{esc(d['name'])} <span class='muted'>{esc(d['ticker'])}</span></h1><div><span class='pill'>{esc(d['industry'])}</span><span class='pill'>{esc(d['stance'])}</span><span class='pill'>可信度 {conf['overall']}/100</span></div></div><div><div class='muted'>最新收盤</div><div class='price'>{nfmt(d['price'],1)}</div><div>{pct(d['change_pct'])}</div></div></div>
+    <div class='head'><div><div class='muted'>AI STOCK RESEARCH TERMINAL V5.4.0 • EVIDENCE-DRIVEN TAIWAN EQUITY RESEARCH</div><h1>{esc(d['name'])} <span class='muted'>{esc(d['ticker'])}</span></h1><div><span class='pill'>{esc(d['industry'])}</span><span class='pill'>{esc(d['stance'])}</span><span class='pill'>可信度 {conf['overall']}/100</span></div></div><div><div class='muted'>最新收盤</div><div class='price'>{nfmt(d['price'],1)}</div><div>{pct(d['change_pct'])}</div></div></div>
     <div class='small muted'>報告產生：{esc(d['generated_at'])} ｜ 資料完整度：{conf['data_completeness']}% ｜ 估值信心：{conf['valuation_confidence']}%</div>
     <h2>1. Executive Summary</h2><div class='call'>{esc(d['thesis'])}</div>
     <div class='grid'><div class='card'>綜合評分<b>{sc['綜合']}/100</b></div><div class='card'>基本面<b>{sc['基本面']}</b></div><div class='card'>籌碼面<b>{sc['籌碼面']}</b></div><div class='card'>技術面<b>{sc['技術面']}</b></div></div>
     <div class='cols'><div><b>主要催化劑</b><ul>{cats}</ul></div><div><b>主要風險</b><ul>{risks}</ul></div></div>
     <h2>2. Expectation Gap & Revision Radar</h2><div class='call'><b>{esc(exp.get('regime'))}</b><br>{esc(exp.get('summary'))}</div><div class='grid'><div class='card'>預期修正分數<b>{exp.get('revision_score','—')}/100</b></div><div class='card'>EPS 修正<b>{pct(research.get('eps_revision_pct'))}</b></div><div class='card'>目標價修正<b>{pct(research.get('target_revision_pct'))}</b></div><div class='card'>估值區域<b style='font-size:10pt'>{esc(exp.get('valuation_zone'))}</b></div></div><table><tr><th>法人</th><th>前次 → 最新</th><th>EPS 修正</th><th>目標價修正</th><th>最新目標</th></tr>{erows}</table><p class='small muted'>{esc(exp.get('methodology'))}</p>
-    <h2>3. Fundamentals & EPS Integrity</h2><table><tr><th>最新月營收</th><th>YoY</th><th>單季 EPS</th><th>YTD EPS</th><th>TTM EPS</th><th>財報期間</th></tr><tr><td>{nfmt(rev.get('latest_revenue'),0)}</td><td>{pct(rev.get('revenue_yoy'))}</td><td>{nfmt(d.get('eps_stack',{}).get('quarter_eps'),2)}</td><td>{nfmt(d.get('eps_stack',{}).get('ytd_eps'),2)}</td><td>{nfmt(d.get('eps_stack',{}).get('ttm_eps'),2)}</td><td>{esc(fin.get('period') or fin.get('statement_date'))}</td></tr></table><p class='small muted'>{esc(d.get('eps_stack',{}).get('note'))}</p>
-    <table><tr><th>獲利率口徑</th><th>期間</th><th>毛利率</th><th>營益率</th><th>淨利率</th><th>說明</th></tr><tr><td>單季</td><td>{esc(qm.get('period'))}</td><td>{pct(qm.get('gross_margin'))}</td><td>{pct(qm.get('operating_margin'))}</td><td>{pct(qm.get('net_margin'))}</td><td>{esc(qm.get('note') or margins.get('warning'))}</td></tr><tr><td>累計</td><td>{esc(ym.get('period'))}</td><td>{pct(ym.get('gross_margin'))}</td><td>{pct(ym.get('operating_margin'))}</td><td>{pct(ym.get('net_margin'))}</td><td>{esc(ym.get('note'))}</td></tr></table>
-    <h2>4. Positioning & Technicals</h2><table><tr><th>外資20日</th><th>投信20日</th><th>融資餘額</th><th>融券餘額</th><th>券資比</th><th>借券餘額</th><th>借券賣出餘額</th></tr><tr><td>{nfmt(flow.get('foreign_20'),0)}</td><td>{nfmt(flow.get('trust_20'),0)}</td><td>{nfmt(flow.get('margin_balance'),0)} 張</td><td>{nfmt(flow.get('short_balance'),0)} 張</td><td>{pct(flow.get('short_margin_ratio_pct'))}</td><td>{nfmt(flow.get('sbl_balance'),0)} 張</td><td>{nfmt(flow.get('sbl_short_balance'),0)} 張</td></tr></table><p class='small muted'>借券餘額不等於放空；借券賣出餘額較接近尚未回補的借券放空部位。資料日 {esc(flow.get('lending_last_date') or flow.get('margin_last_date'))}。</p>
-    <div class='page-break'></div><h2>5. Analyst Research & Revisions</h2><p>匯入報告數：<b>{research.get('count',0)}</b> ｜ Forward EPS 修正：<b>{pct(research.get('eps_revision_pct'))}</b></p><table><tr><th>法人/券商</th><th>日期</th><th>評等</th><th>目標價</th><th>Forward EPS</th></tr>{rrows}</table><p class='small muted'>本區彙整公開網路可取得之研究引用與使用者匯入資料；僅保存標題、摘要、數值、發布者與來源連結，不重製付費研究全文。</p>
-    <h2>6. Company Events & Earnings-call Radar</h2><table><tr><th>日期</th><th>事件</th><th>發布者</th></tr>{''.join(f"<tr><td>{esc(x.get('date'))}</td><td>{esc(x.get('title'))}</td><td>{esc(x.get('publisher'))}</td></tr>" for x in d.get('company_events',{{}}).get('rows',[])[:8]) or "<tr><td colspan='3'>目前未搜尋到公司事件引用。</td></tr>"}</table>
-    <h2>7. Valuation Framework</h2><p>目前採用：{esc(val.get('selected_model'))}<br>TTM：{esc(val.get('trailing_eps_basis'))}<br>Forward：{esc(val.get('forward_eps_basis'))}<br>法人共識：{nfmt(val.get('analyst_consensus',{{}}).get('median_target'),0)}（{val.get('analyst_consensus',{{}}).get('coverage',0)} 筆）<br>法人相對模型差距：{pct(val.get('analyst_consensus',{{}}).get('gap_vs_model_pct'))}<br>PE：{esc(val.get('pe_basis'))}</p><table><tr><th>情境</th><th>EPS</th><th>合理 PE</th><th>模型合理價</th><th>相對現價</th></tr>{scenarios}</table>
+    <h2>3. Research Pipeline & Data Boundary</h2><div class='grid'><div class='card'>Research View<b style='font-size:11pt'>{esc(rp.get('stance'))}</b></div><div class='card'>Boundary Grade<b>{esc(db.get('grade'))}</b></div><div class='card'>Facts<b>{rp.get('evidence_counts',{}).get('facts','—')}</b></div><div class='card'>Estimates<b>{rp.get('evidence_counts',{}).get('estimates','—')}</b></div></div><div class='call'>{esc(rp.get('investment_view'))}</div><p><b>Data Boundary:</b> {esc(db.get('message'))}</p><div class='cols'><div><b>成立條件</b><ul>{''.join(f"<li>{esc(x.get('condition'))}</li>" for x in rp.get('action_conditions',[]))}</ul></div><div><b>失效條件</b><ul>{''.join(f"<li>{esc(x)}</li>" for x in rp.get('invalidation_conditions',[]))}</ul></div></div>
+    <h2>4. Fundamentals & EPS Integrity</h2><table><tr><th>最新月營收</th><th>YoY</th><th>單季 EPS</th><th>YTD EPS</th><th>TTM EPS</th><th>財報期間</th></tr><tr><td>{nfmt(rev.get('latest_revenue'),0)}</td><td>{pct(rev.get('revenue_yoy'))}</td><td>{nfmt(d.get('eps_stack',{}).get('quarter_eps'),2)}</td><td>{nfmt(d.get('eps_stack',{}).get('ytd_eps'),2)}</td><td>{nfmt(d.get('eps_stack',{}).get('ttm_eps'),2)}</td><td>{esc(fin.get('period') or fin.get('statement_date'))}</td></tr></table><p class='small muted'>{esc(d.get('eps_stack',{}).get('note'))}</p>
+    <h2>5. Positioning & Technicals</h2><table><tr><th>外資20日</th><th>投信20日</th><th>融資20日</th><th>趨勢</th><th>RSI14</th><th>量比</th><th>支撐 / 壓力</th></tr><tr><td>{nfmt(flow.get('foreign_20'),0)}</td><td>{nfmt(flow.get('trust_20'),0)}</td><td>{pct(flow.get('margin_20_pct'))}</td><td>{esc(tech.get('trend'))}</td><td>{nfmt(tech.get('rsi14'),1)}</td><td>{nfmt(tech.get('volume_ratio_20'),2)}x</td><td>{nfmt(tech.get('support1'),1)} / {nfmt(tech.get('resistance'),1)}</td></tr></table>
+    <div class='page-break'></div><h2>6. Analyst Research & Revisions</h2><p>匯入報告數：<b>{research.get('count',0)}</b> ｜ Forward EPS 修正：<b>{pct(research.get('eps_revision_pct'))}</b></p><table><tr><th>法人/券商</th><th>日期</th><th>評等</th><th>目標價</th><th>Forward EPS</th></tr>{rrows}</table><p class='small muted'>本區彙整公開網路可取得之研究引用與使用者匯入資料；僅保存標題、摘要、數值、發布者與來源連結，不重製付費研究全文。</p>
+    <h2>7. Company Events & Earnings-call Radar</h2><table><tr><th>日期</th><th>事件</th><th>發布者</th></tr>{''.join(f"<tr><td>{esc(x.get('date'))}</td><td>{esc(x.get('title'))}</td><td>{esc(x.get('publisher'))}</td></tr>" for x in d.get('company_events',{{}}).get('rows',[])[:8]) or "<tr><td colspan='3'>目前未搜尋到公司事件引用。</td></tr>"}</table>
+    <h2>8. Valuation Framework</h2><p>EPS：{esc(val.get('eps_basis'))}<br>PE：{esc(val.get('pe_basis'))}</p><table><tr><th>情境</th><th>EPS</th><th>合理 PE</th><th>模型合理價</th><th>相對現價</th></tr>{scenarios}</table>
     <p class='small muted'>歷史 PER：P25 {nfmt(per.get('pe_p25'),1)}x / Median {nfmt(per.get('pe_median'),1)}x / P75 {nfmt(per.get('pe_p75'),1)}x；模型合理價與法人目標價分開呈現。</p>
-    <h2>8. Data Lineage & Freshness</h2><table><tr><th>資料</th><th>Dataset</th><th>截至</th><th>預定更新</th><th>狀態</th></tr>{src}</table>
+    <h2>9. Data Lineage & Freshness</h2><table><tr><th>資料</th><th>Dataset</th><th>截至</th><th>預定更新</th><th>狀態</th></tr>{src}</table>
     <div class='warn'><b>重要揭露</b><br>本報告為研究與資訊整理工具，不構成個人化投資建議、招攬或收益保證。模型估值對 EPS 與估值倍數高度敏感；請以每列資料截至日與來源為準。</div>
     </body></html>"""
 
 
-def write_report_pdf(d: dict[str, Any], output_path: Path) -> None:
-    """Create a self-contained Traditional Chinese investor PDF without native Pango dependencies."""
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.lib.units import mm
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-
-    font_name="NotoSansTC"
-    font_path=ROOT / "assets" / "fonts" / "NotoSansTC-Regular.ttf"
-    if font_name not in pdfmetrics.getRegisteredFontNames():
-        pdfmetrics.registerFont(TTFont(font_name,str(font_path)))
-    styles=getSampleStyleSheet()
-    body=ParagraphStyle("zh-body",parent=styles["BodyText"],fontName=font_name,fontSize=9,leading=14,textColor=colors.HexColor("#263640"))
-    small=ParagraphStyle("zh-small",parent=body,fontSize=7.5,leading=11,textColor=colors.HexColor("#60727c"))
-    title=ParagraphStyle("zh-title",parent=body,fontSize=21,leading=27,textColor=colors.HexColor("#13202a"),spaceAfter=4)
-    section=ParagraphStyle("zh-section",parent=body,fontSize=13,leading=18,textColor=colors.HexColor("#173847"),spaceBefore=10,spaceAfter=6)
-    table_header=ParagraphStyle("zh-table-header",parent=small,textColor=colors.white)
-    esc=lambda value: html.escape("-" if value is None else str(value))
-    para=lambda value,style=body: Paragraph(esc(value),style)
-    story=[]
-
-    def table(rows,widths=None,header=True):
-        normalized=[]
-        for row_index,row in enumerate(rows):
-            style=table_header if header and row_index==0 else small
-            normalized.append([cell if isinstance(cell,Paragraph) else para(cell,style) for cell in row])
-        item=Table(normalized,colWidths=widths,repeatRows=1 if header else 0,hAlign="LEFT")
-        commands=[("FONTNAME",(0,0),(-1,-1),font_name),("VALIGN",(0,0),(-1,-1),"MIDDLE"),("GRID",(0,0),(-1,-1),.35,colors.HexColor("#d7e0e4")),("LEFTPADDING",(0,0),(-1,-1),5),("RIGHTPADDING",(0,0),(-1,-1),5),("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5)]
-        if header:
-            commands.extend([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#173847")),("TEXTCOLOR",(0,0),(-1,0),colors.white)])
-        item.setStyle(TableStyle(commands)); return item
-
-    def footer(canvas,doc):
-        canvas.saveState(); canvas.setFont(font_name,7); canvas.setFillColor(colors.HexColor("#60727c"))
-        canvas.drawString(14*mm,8*mm,"AI Stock Research Terminal V5.3.5")
-        canvas.drawRightString(A4[0]-14*mm,8*mm,f"Page {doc.page}"); canvas.restoreState()
-
-    doc=SimpleDocTemplate(str(output_path),pagesize=A4,rightMargin=13*mm,leftMargin=13*mm,topMargin=13*mm,bottomMargin=15*mm,title=f"{d.get('ticker')} AI Stock Research V5.3.5",author="AI Stock Research Terminal")
-    story.extend([para(f"{d.get('name','-')}  {d.get('ticker','-')}",title),para("AI STOCK RESEARCH TERMINAL V5.3.5 - TAIWAN EQUITY RESEARCH",small)])
-    header_rows=[["最新收盤","漲跌","產業／市場","報告時間"],[nfmt(d.get("price"),1),pct(d.get("change_pct")),f"{d.get('industry','-')} / {d.get('market_type','-')}",d.get("generated_at","-")]]
-    story.extend([Spacer(1,4*mm),table(header_rows,[30*mm,27*mm,48*mm,60*mm]),para("1. 投資摘要",section),para(d.get("thesis") or "目前資料不足。")])
-    scores_data=d.get("scores") or {}
-    story.extend([Spacer(1,2*mm),table([["綜合","基本面","籌碼面","技術面","估值"],[scores_data.get("綜合"),scores_data.get("基本面"),scores_data.get("籌碼面"),scores_data.get("技術面"),scores_data.get("估值")]],[33*mm]*5)])
-    story.extend([para("主要催化劑",section),para("；".join(d.get("catalysts") or ["資料不足"])),para("主要風險",section),para("；".join(d.get("risks") or ["資料不足"]))])
-
-    eps=d.get("eps_stack") or {}; financial=d.get("financial") or {}; revenue=d.get("revenue") or {}
-    story.extend([para("2. 基本面與 EPS",section),table([["項目","數值","期間／來源"],["最新月營收",nfmt(revenue.get("latest_revenue"),0),revenue.get("revenue_period") or revenue.get("last_date")],["營收 YoY",pct(revenue.get("revenue_yoy")),revenue.get("revenue_period")],["單季 EPS",nfmt(eps.get("quarter_eps"),2),eps.get("quarter_period")],["YTD EPS",nfmt(eps.get("ytd_eps"),2),eps.get("quarter_period")],["TTM EPS",nfmt(eps.get("ttm_eps"),2),financial.get("source")]], [48*mm,42*mm,75*mm])])
-    margin_views=financial.get("margin_views") or {}; qm=margin_views.get("quarter") or {}; ym=margin_views.get("ytd") or {}
-    story.extend([Spacer(1,3*mm),table([["口徑／期間","毛利率","營益率","淨利率","說明"],[f"單季 {qm.get('period') or '-'}",pct(qm.get("gross_margin")),pct(qm.get("operating_margin")),pct(qm.get("net_margin")),qm.get("note") or margin_views.get("warning")],[f"累計 {ym.get('period') or '-'}",pct(ym.get("gross_margin")),pct(ym.get("operating_margin")),pct(ym.get("net_margin")),ym.get("note")]], [34*mm,25*mm,25*mm,25*mm,56*mm])])
-
-    tech=d.get("technical") or {}; flow=d.get("flow") or {}
-    story.extend([para("3. 籌碼與技術",section),table([["指標","1日","5日","20日"],["外資",nfmt(flow.get("foreign_1"),0),nfmt(flow.get("foreign_5"),0),nfmt(flow.get("foreign_20"),0)],["投信",nfmt(flow.get("trust_1"),0),nfmt(flow.get("trust_5"),0),nfmt(flow.get("trust_20"),0)],["自營商",nfmt(flow.get("dealer_1"),0),nfmt(flow.get("dealer_5"),0),nfmt(flow.get("dealer_20"),0)],["融資變化",pct(flow.get("margin_1_pct")),pct(flow.get("margin_5_pct")),pct(flow.get("margin_20_pct"))],["融券變化",pct(flow.get("short_1_pct")),pct(flow.get("short_5_pct")),pct(flow.get("short_20_pct"))]],[42*mm,41*mm,41*mm,41*mm]),Spacer(1,3*mm),table([["融資餘額","融券餘額","券資比","借券餘額","借券賣出餘額"],[nfmt(flow.get("margin_balance"),0),nfmt(flow.get("short_balance"),0),pct(flow.get("short_margin_ratio_pct")),nfmt(flow.get("sbl_balance"),0),nfmt(flow.get("sbl_short_balance"),0)]],[33*mm]*5),Spacer(1,3*mm),table([["趨勢","MA20","MA60","RSI14","支撐","壓力"],[tech.get("trend"),nfmt((tech.get("ma") or {}).get(20) or (tech.get("ma") or {}).get("20"),1),nfmt((tech.get("ma") or {}).get(60) or (tech.get("ma") or {}).get("60"),1),nfmt(tech.get("rsi14"),1),nfmt(tech.get("support1"),1),nfmt(tech.get("resistance"),1)]],[27.5*mm]*6)])
-
-    research=d.get("research") or {}; reports=research.get("reports") or []
-    story.append(para("4. 法人研究與預期修正",section))
-    report_rows=[["機構","日期","評級","目標價","Forward EPS"]]+[[r.get("institution"),r.get("report_date"),r.get("rating"),nfmt(safe_num(r.get("target_price")),0),nfmt(safe_num(r.get("forward_eps")),2)] for r in reports[:12]]
-    story.append(table(report_rows if len(report_rows)>1 else [["機構","日期","評級","目標價","Forward EPS"],["目前無可解析公開研究","-","-","-","-"]],[46*mm,29*mm,28*mm,30*mm,32*mm]))
-    valuation=d.get("valuation") or {}; scenarios=valuation.get("scenarios") or []
-    story.append(para("5. 估值情境",section))
-    scenario_rows=[["情境","EPS","PE","模型合理價","相對現價"]]+[[s.get("name"),nfmt(s.get("eps"),2),f"{nfmt(s.get('pe'),1)}x",nfmt(s.get("target"),0),pct(s.get("upside_pct"))] for s in scenarios]
-    story.append(table(scenario_rows if len(scenario_rows)>1 else [["情境","EPS","PE","模型合理價","相對現價"],["資料不足","-","-","-","-"]],[34*mm,30*mm,30*mm,37*mm,34*mm]))
-    analyst=valuation.get("analyst_consensus") or {}
-    story.append(para(f"TTM：{valuation.get('trailing_eps_basis') or '-'}；Forward：{valuation.get('forward_eps_basis') or '-'}；合格法人共識：{nfmt(analyst.get('median_target'),0)} 元（{analyst.get('coverage',0)} 筆）；法人相對模型差距：{pct(analyst.get('gap_vs_model_pct'))}。模型與法人假設分開呈現，不強制收斂。",small))
-    story.append(para("6. 資料來源與新鮮度",section))
-    source_rows=[["資料","Provider / Dataset","截至","狀態"]]+[[s.get("name"),s.get("dataset"),s.get("as_of"),"OK" if s.get("status")=="ok" else "缺資料"] for s in d.get("source_status",[])]
-    story.append(table(source_rows,[30*mm,72*mm,40*mm,23*mm]))
-    story.extend([Spacer(1,4*mm),para("重要聲明：本報告為研究與資訊整理工具，不構成個人化投資建議、招攬或收益保證。價格、財務與籌碼資料可能因交易所或資料供應商更新時間而延遲。",small)])
-    doc.build(story,onFirstPage=footer,onLaterPages=footer)
-
-
 @app.get("/")
-async def home(): return FileResponse(ROOT / "index.html", headers={"Cache-Control":"no-store, max-age=0"})
+async def home(): return FileResponse(ROOT / "index.html")
 @app.get("/app.js")
 async def js(): return FileResponse(ROOT / "app.js", media_type="application/javascript", headers={"Cache-Control":"no-cache"})
 @app.get("/styles.css")
 async def css(): return FileResponse(ROOT / "styles.css", media_type="text/css", headers={"Cache-Control":"no-cache"})
 @app.get("/sw.js")
-async def sw(): return FileResponse(ROOT / "sw.js", media_type="application/javascript", headers={"Cache-Control":"no-store, max-age=0", "Service-Worker-Allowed":"/"})
+async def sw(): return FileResponse(ROOT / "sw.js", media_type="application/javascript", headers={"Cache-Control":"no-cache", "Service-Worker-Allowed":"/"})
 
 
 @app.get("/api/diagnostics/financial/{ticker}")
 async def financial_diagnostics(ticker: str):
-    ticker=require_numeric_taiwan_ticker(ticker)
+    ticker=ticker.strip()
+    if not ticker.isdigit() or len(ticker) not in (4,5,6): raise HTTPException(400,"請輸入有效台股代號")
     result=await diagnose_official_financial_sources(ticker)
     return JSONResponse(result, headers={"Cache-Control":"no-store"})
 
 @app.get("/api/stock/{ticker}")
 async def stock_api(ticker: str, refresh: bool = Query(False)):
-    ticker=require_numeric_taiwan_ticker(ticker)
+    ticker=ticker.strip()
+    if not ticker.isdigit() or len(ticker) not in (4,5,6): raise HTTPException(400,"請輸入有效台股代號")
     d=await build_stock(ticker, force_refresh=refresh)
     if d["price"] is None and d["name"] == ticker: raise HTTPException(404,"查無股票或資料來源暫時無法連線")
     return JSONResponse(d, headers={"Cache-Control":"no-store"})
 
 @app.get("/api/stock/{ticker}/pdf")
 async def stock_pdf(ticker: str, refresh: bool = Query(True)):
-    ticker=require_numeric_taiwan_ticker(ticker)
-    d=await build_stock(ticker, force_refresh=refresh)
+    d=await build_stock(ticker.strip(), force_refresh=refresh)
     if d["price"] is None: raise HTTPException(503,"目前無法取得股價資料，為避免輸出錯誤報告，PDF 未產生。")
     stamp=datetime.now().strftime("%Y%m%d_%H%M")
-    out=REPORT_DIR/f"{ticker}_{stamp}_research_v5_3_5.pdf"
-    try:
-        write_report_pdf(d,out)
-    except Exception as exc:
-        raise HTTPException(500,f"PDF 產生失敗：{type(exc).__name__}") from exc
-    return FileResponse(out,media_type="application/pdf",filename=f"{ticker}_AI_research_V5_3_5_{stamp}.pdf")
+    out=REPORT_DIR/f"{ticker}_{stamp}_research_v5_4_0.pdf"
+    HTML(string=report_html(d),base_url=str(ROOT)).write_pdf(out)
+    return FileResponse(out,media_type="application/pdf",filename=f"{ticker}_AI_research_V5_4_0_{stamp}.pdf")
 
 @app.post("/api/cache/clear")
 async def cache_clear():
@@ -3331,7 +2723,7 @@ async def cache_clear():
 
 @app.get("/api/diagnostics/eps/{ticker}")
 async def eps_diagnostics(ticker: str):
-    ticker=require_numeric_taiwan_ticker(ticker)
+    ticker=ticker.strip().upper()
     official=await fetch_official_income_statement(ticker)
     official=await reconcile_official_financial_snapshot(ticker, official)
     fin_rows=[]
@@ -3356,47 +2748,49 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.3.5",
+        "ticker":ticker,"version":"5.4.1",
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
         "raw_period_trace_links":raw_periods,
-        "note":"正式 EPS 路徑使用 MOPS 官方歷史彙總表，不依賴已封鎖的公司別舊版 HTML；raw endpoint 僅保留供故障排查。"
+        "note":"V5.2.13 production EPS no longer depends on blocked MOPS historical HTML; raw endpoint diagnostics are retained only for troubleshooting."
     }
 
 @app.get("/api/diagnostics/eps-raw/{ticker}")
 async def eps_raw_diagnostics(ticker: str, year: int = Query(..., ge=1990, le=2100), quarter: int = Query(..., ge=1, le=4)):
-    ticker=require_numeric_taiwan_ticker(ticker)
+    ticker=ticker.strip().upper()
+    if not ticker.isdigit(): raise HTTPException(400,"ticker must be numeric")
     return await trace_mops_company_ifrs(ticker,year,quarter)
 
 @app.get("/api/diagnostics/eps-registry/{ticker}")
 async def eps_registry_diagnostics(ticker: str):
-    ticker=require_numeric_taiwan_ticker(ticker)
+    ticker=normalize_ticker(ticker)
     reg=_load_official_eps_registry()
     rows=[r for r in reg.get("records",[]) if str(r.get("ticker"))==ticker]
     rows=sorted(rows,key=lambda r:(r.get("year") or 0,r.get("quarter") or 0),reverse=True)
-    return {"ticker":ticker,"version":"5.3.5","registry_schema_version":reg.get("schema_version"),
+    return {"ticker":ticker,"version":"5.4.1","registry_schema_version":reg.get("schema_version"),
             "updated_at":reg.get("updated_at"),"record_count":len(rows),"records":rows}
 
 @app.get("/api/evidence/{ticker}")
 async def evidence_api(ticker: str, refresh: int = 0):
-    ticker=normalize_ticker(ticker)
+    ticker=ticker.strip().upper()
     if not re.fullmatch(r"[0-9A-Z]{2,10}", ticker): raise HTTPException(400,"invalid ticker")
     d=await build_stock(ticker, bool(refresh))
     return d.get("evidence_graph") or {}
 
 @app.get("/api/diagnostics/providers/{ticker}")
 async def provider_diagnostics(ticker: str):
-    ticker=require_numeric_taiwan_ticker(ticker)
-    d=await build_stock(ticker, True)
-    status=d.get("provider_status") or {}
-    provider_errors=list(dict.fromkeys([*(status.get("fallback_errors") or []),*(d.get("errors") or [])]))
-    return {"version":"5.3.5","ticker":ticker,"finmind_available":bool(status.get("finmind_available")),
-            "finmind_price_available":bool(status.get("finmind_price_available")),
-            "official_price_fallback_success":bool(status.get("official_price_fallback_success")),
-            "twse_fallback_success":bool(status.get("twse_fallback_success")),"tpex_fallback_success":bool(status.get("tpex_fallback_success")),"price_provider":status.get("price_provider"),
-            "info_provider":status.get("info_provider"),"price_rows":status.get("price_rows",0),
-            "latest_price_date":status.get("latest_price_date"),"provider_errors":provider_errors}
+    ticker=ticker.strip().upper()
+    d=await build_stock(ticker, False)
+    mcp=await probe_twstock_mcp()
+    return {"version":"5.4.1","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
+
+
+@app.get("/api/diagnostics/mcp/{ticker}")
+async def mcp_diagnostics(ticker: str):
+    ticker=validate_ticker(ticker)
+    snap=await fetch_twstock_mcp_snapshot(ticker)
+    return snap
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.3.5","mode":"cloud-mobile-earnings-call-events","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":"5.4.1","mode":"cloud-mobile-mcp-cross-validation","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}

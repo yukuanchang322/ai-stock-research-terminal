@@ -1,4 +1,4 @@
-# AI Stock Research Terminal V5.3.5
+# AI Stock Research Terminal V5.3.1
 
 Multi-Source Evidence Engine: data is normalized and verified before analysis. Official/verified sources are primary; third-party and public-web sources are fallback/context.
 
@@ -120,3 +120,23 @@ Production EPS resolution uses official structured data and company IR. Blocked 
 ## V5.2.15 Official EPS Registry
 
 歷史 EPS 先讀取 `data/official_eps_registry.json` 的公司官方證據，再 fallback 到公司 IR/官方揭露。每筆 registry 均保留官方來源 URL 與 verified 狀態。新增 `/api/diagnostics/eps-registry/{ticker}`。
+
+
+## V5.4.1 — TWStock MCP Cross-Validation
+
+TWStock MCP is now a live secondary provider by default.
+
+Environment variables:
+- `TWSTOCK_MCP_ENABLED=1`
+- `TWSTOCK_MCP_URL=https://TW-Stock-MCP-Server.fastmcp.app/mcp`
+
+Behavior:
+1. Discover tools with MCP `tools/list`.
+2. Select likely quote / institutional / margin / revenue / valuation / financial tools.
+3. Build arguments from each tool's input schema.
+4. Call tools non-blockingly.
+5. Convert returned values into cross-check Evidence.
+6. Never overwrite official TWSE/MOPS/IR values silently.
+7. Comparable differences are surfaced through Evidence Conflict.
+
+If the MCP server is unreachable, the site falls back to the existing official + FinMind pipeline.
