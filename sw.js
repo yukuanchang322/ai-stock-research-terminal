@@ -1,5 +1,5 @@
-const CACHE="ai-stock-v5.9.9";
-const SHELL = ['/styles.css?v=5.9.9', '/app.js?v=5.9.9', '/recovery.js?v=5.9.9', '/v547_hotfix.js?v=5.9.9', '/static/manifest.webmanifest'];
+const CACHE="ai-stock-v5.10.0";
+const SHELL = ['/styles.css?v=5.10.0', '/app.js?v=5.10.0', '/recovery.js?v=5.10.0', '/v547_hotfix.js?v=5.10.0', '/v5100_hotfix.js?v=5.10.0', '/static/manifest.webmanifest'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
 });
@@ -13,7 +13,7 @@ self.addEventListener('fetch', event => {
     event.respondWith(fetch(event.request,{cache:'no-store'}));
     return;
   }
-  if (['/app.js','/recovery.js','/v547_hotfix.js','/styles.css','/sw.js'].includes(url.pathname)) {
+  if (['/app.js','/recovery.js','/v547_hotfix.js','/v5100_hotfix.js','/styles.css','/sw.js'].includes(url.pathname)) {
     event.respondWith(fetch(event.request,{cache:'reload'}).then(resp => {
       const copy=resp.clone(); caches.open(CACHE).then(cache=>cache.put(event.request,copy)); return resp;
     }).catch(()=>caches.match(event.request)));
