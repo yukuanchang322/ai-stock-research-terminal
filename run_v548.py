@@ -5,13 +5,13 @@ TWStock MCP strictly as a secondary cross-check when primary official evidence i
 """
 from __future__ import annotations
 
-from copy import deepcopy
 from datetime import date
 from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+import run_v546
 import run_v547
 import server
 
@@ -48,7 +48,6 @@ def _iso_date(raw: Any) -> str:
 
 
 async def _official_per(ticker: str) -> list[dict[str, Any]]:
-    # Primary official endpoint: TWSE daily valuation ratios (BWIBBU_ALL).
     candidates = [
         "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL",
         "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_d",
@@ -117,9 +116,7 @@ def _normalize_mcp_secondary(d: dict[str, Any]):
     for x in statuses:
         if x.get("name") == "TWStock MCP 二次驗證" and x.get("status") != "ok":
             x["status"] = "secondary_unavailable"
-            x["scheduled_update"] = (
-                "二次驗證來源暫時不可用；官方股價/法人/營收/財報仍為主證據，不降低主要資料可用性。"
-            )
+            x["scheduled_update"] = "二次驗證來源暫時不可用；官方主要證據仍為主，不降低主要資料可用性。"
     try:
         filtered = [x for x in statuses if x.get("name") != "TWStock MCP 二次驗證"]
         d["confidence"] = server.calc_confidence(filtered, d.get("valuation") or {}, d.get("research") or {})
