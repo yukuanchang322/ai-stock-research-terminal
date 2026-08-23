@@ -1,9 +1,9 @@
-// AI Stock Research Terminal V5.4.6 — Data Recovery + UI version sync
+// AI Stock Research Terminal V5.4.8 — Data Recovery + UI version sync
 // Transparent network fallback: live API remains authoritative; a device backup is
 // returned only when /api/stock/{ticker} fails or returns an invalid research payload.
 (() => {
   'use strict';
-  const VERSION='5.4.6';
+  const VERSION='5.4.8';
   const DB_NAME='ai-stock-research-terminal';
   const STORE='research-recovery';
   // Keep V5.4.5 key prefix so existing successful backups remain reusable after upgrade.
@@ -110,7 +110,7 @@
     });
     const cloud=document.getElementById('cloudStatus');
     if(cloud && /雲端服務正常/.test(cloud.textContent||'')){
-      fetch('/health',{cache:'no-store'}).then(r=>r.json()).then(j=>{
+      nativeFetch('/health',{cache:'no-store'}).then(r=>r.json()).then(j=>{
         if(j?.version) cloud.textContent=`雲端服務正常 · V${j.version}`;
       }).catch(()=>{});
     }
