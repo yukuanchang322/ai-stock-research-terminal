@@ -1,5 +1,5 @@
-const CACHE="ai-stock-v5.4.7";
-const SHELL = ['/', '/styles.css', '/app.js', '/recovery.js', '/v547_hotfix.js', '/static/manifest.webmanifest', '/static/icons/icon-192.png', '/static/icons/icon-512.png'];
+const CACHE="ai-stock-v5.4.8";
+const SHELL = ['/', '/styles.css', '/app.js', '/recovery.js', '/v547_hotfix.js', '/static/manifest.webmanifest'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
 });
@@ -26,5 +26,6 @@ self.addEventListener('fetch', event => {
   })));
 });
 
-// V5.4.7 Margin + UI Cleanup, retaining V5.4.5 Data Recovery.
-// API responses are never stored in Service Worker Cache.
+// V5.4.8 Valuation Recovery, retaining official data fallback and Data Recovery.
+// API responses are never stored in Service Worker Cache. Missing optional icons are
+// intentionally excluded from the atomic shell install so a 404 cannot break SW activation.
