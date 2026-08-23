@@ -1,5 +1,5 @@
-const CACHE="ai-stock-v5.5.0";
-const SHELL = ['/', '/styles.css', '/app.js', '/recovery.js', '/v547_hotfix.js', '/static/manifest.webmanifest'];
+const CACHE="ai-stock-v5.9.2";
+const SHELL = ['/', '/styles.css?v=5.9.2', '/app.js?v=5.9.2', '/recovery.js?v=5.9.2', '/v547_hotfix.js?v=5.9.2', '/static/manifest.webmanifest'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));
 });
@@ -26,6 +26,5 @@ self.addEventListener('fetch', event => {
   })));
 });
 
-// V5.5.0 Price Integrity + UI hardening.
-// API responses are never cached. Core JS/CSS use network-first + no-store so iPhone PWA
-// cannot stay pinned to an older chart/layout implementation after a deployment.
+// V5.9.2 Version Sync Fix.
+// API is never cached; navigation and core JS/CSS are network-first/no-store.
