@@ -329,7 +329,9 @@ def parse_twse_institutional_payload(payload: Any, ticker: str, day: str) -> lis
     row = next((r for r in _twse_rows(payload) if _twse_ticker_matches(r, ticker)), None)
     if not row:
         return []
-    out = {"date": day, "stock_id": ticker, "_source": "TWSE T86 official"}
+    company_name = next((str(value).strip() for key, value in row.items()
+                         if "證券名稱" in _normalized_key(key) and str(value).strip()), None)
+    out = {"date": day, "stock_id": ticker, "_source": "TWSE T86 official", "_company_name": company_name}
     prefixes = {"foreign": "Foreign_Investor", "trust": "Investment_Trust", "dealer": "Dealer"}
     for participant, prefix in prefixes.items():
         values = _t86_participant(row, participant)
@@ -2935,15 +2937,24 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         cached = dict(_CACHE[ticker][1]); cached["cache"] = {"hit": True, "ttl_seconds": CACHE_TTL}; return cached
     today = date.today(); errors: list[str] = []
     async def grab(dataset: str, days: int):
+        if not FINMIND_TOKEN:
+            return []
         try: return await finmind(dataset, ticker, today - timedelta(days=days), today)
         except Exception as e: errors.append(f"{dataset}: {type(e).__name__}"); return []
     async def info_grab():
+        if not FINMIND_TOKEN:
+            return {}
         try:
             infos = await finmind("TaiwanStockInfo")
             return next((x for x in infos if str(x.get("stock_id")) == ticker), {})
         except Exception as e: errors.append(f"TaiwanStockInfo: {type(e).__name__}"); return {}
 
+    # Start every independent official chain together. On a free single-worker
+    # Render instance, serial fallback stages otherwise add up beyond the
+    # browser/proxy timeout even when each provider is healthy.
     supplements_task = asyncio.create_task(asyncio.wait_for(fetch_official_market_supplements(ticker, today), timeout=42))
+    official_financial_task = asyncio.create_task(asyncio.wait_for(fetch_official_income_statement(ticker), timeout=28))
+    official_price_task = asyncio.create_task(asyncio.wait_for(fetch_twse_stock_day_history(ticker,13), timeout=25))
     info, prices, inst, margin, rev, pers, fin = await asyncio.gather(
         info_grab(),
         grab("TaiwanStockPrice",460),
@@ -2957,12 +2968,14 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     price_source="FinMind TaiwanStockPrice"
     if not prices:
         try:
-            prices=await asyncio.wait_for(fetch_twse_stock_day_history(ticker,13), timeout=25)
+            prices=await official_price_task
             if prices:
                 price_source="TWSE STOCK_DAY fallback"
                 errors.append("TaiwanStockPrice: FinMind unavailable; TWSE fallback active")
         except Exception as e:
             errors.append(f"TWSEStockDayFallback: {type(e).__name__}")
+    elif not official_price_task.done():
+        official_price_task.cancel()
     try:
         supplements = await supplements_task
     except Exception as e:
@@ -2978,6 +2991,10 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     # FinMind history remains useful, but an official row wins on the same date.
     if supplements.get("institutional"):
         inst = supplements["institutional"]
+        if not info.get("stock_name"):
+            official_name = next((row.get("_company_name") for row in reversed(inst) if row.get("_company_name")), None)
+            if official_name:
+                info["stock_name"] = official_name
     if supplements.get("margin"):
         margin = supplements["margin"]
     if supplements.get("revenue"):
@@ -2991,7 +3008,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
 
     async def official_financial_bounded():
         try:
-            return await asyncio.wait_for(fetch_official_income_statement(ticker), timeout=28)
+            return await official_financial_task
         except Exception as e:
             errors.append(f"OfficialFinancial: {type(e).__name__}")
             return {"official":False,"errors":[type(e).__name__]}
