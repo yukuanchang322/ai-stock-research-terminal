@@ -38,6 +38,8 @@ FINMIND_BASE = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_OFFICIAL_HISTORY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_OFFICIAL_HISTORY_TASKS: dict[str, asyncio.Task] = {}
 
 app = FastAPI(title="AI Stock Research Terminal", version=APP_VERSION)
 app.add_middleware(GZipMiddleware, minimum_size=800)
@@ -367,7 +369,7 @@ def parse_twse_margin_payload(payload: Any, ticker: str, day: str) -> list[dict[
     return []
 
 
-async def fetch_official_market_supplements(ticker: str, anchor: date | None = None) -> dict[str, Any]:
+async def fetch_official_market_supplements(ticker: str, anchor: date | None = None, history_days: int = 45) -> dict[str, Any]:
     """Bounded official fallbacks for datasets that otherwise require FinMind."""
     end = anchor or date.today()
     async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=OFFICIAL_JSON_HEADERS) as client:
@@ -425,7 +427,7 @@ async def fetch_official_market_supplements(ticker: str, anchor: date | None = N
                     if latest:
                         output.extend(latest)
                         break
-            batches = await asyncio.gather(*(guarded(end - timedelta(days=i)) for i in range(45)))
+            batches = await asyncio.gather(*(guarded(end - timedelta(days=i)) for i in range(history_days)))
             for batch in batches:
                 output.extend(batch)
             dedup = {row["date"]: row for row in output}
@@ -434,6 +436,23 @@ async def fetch_official_market_supplements(ticker: str, anchor: date | None = N
         results = await asyncio.gather(revenue(), valuation(), history("institutional"), history("margin"), return_exceptions=True)
     keys = ("revenue", "valuation", "institutional", "margin")
     return {key: ([] if isinstance(value, Exception) else value) for key, value in zip(keys, results)}
+
+
+async def _warm_official_history(ticker: str) -> None:
+    try:
+        data = await asyncio.wait_for(fetch_official_market_supplements(ticker, history_days=45), timeout=48)
+        if data.get("institutional") or data.get("margin"):
+            _OFFICIAL_HISTORY_CACHE[ticker] = (time.time(), data)
+            _CACHE.pop(ticker, None)
+    finally:
+        _OFFICIAL_HISTORY_TASKS.pop(ticker, None)
+
+
+def schedule_official_history(ticker: str) -> None:
+    task = _OFFICIAL_HISTORY_TASKS.get(ticker)
+    if task and not task.done():
+        return
+    _OFFICIAL_HISTORY_TASKS[ticker] = asyncio.create_task(_warm_official_history(ticker))
 
 
 
@@ -2474,7 +2493,8 @@ def scores(technical: dict[str, Any], revenue: dict[str, Any], flow: dict[str, A
     if revenue.get("revenue_yoy") is not None: fundamental += max(-20, min(25, revenue["revenue_yoy"] * .5))
     if revenue.get("revenue_3m_yoy") is not None: fundamental += max(-10, min(15, revenue["revenue_3m_yoy"] * .2))
     if financial.get("gross_margin") is not None: fundamental += 5 if financial["gross_margin"] > 30 else 0
-    chip = 50 + (15 if flow.get("foreign_20", 0) > 0 else -15 if flow.get("foreign_20") is not None else 0) + (10 if flow.get("trust_20", 0) > 0 else -10 if flow.get("trust_20") is not None else 0)
+    foreign20, trust20 = flow.get("foreign_20"), flow.get("trust_20")
+    chip = 50 + (15 if foreign20 is not None and foreign20 > 0 else -15 if foreign20 is not None else 0) + (10 if trust20 is not None and trust20 > 0 else -10 if trust20 is not None else 0)
     tech = 50 + (25 if technical.get("trend") == "多頭" else 12 if technical.get("trend") == "偏多" else -5)
     r = technical.get("rsi14")
     if r is not None: tech += 7 if 50 <= r <= 70 else (-8 if r > 80 or r < 25 else 0)
@@ -2868,7 +2888,7 @@ def narrative(s: dict[str, int], tech: dict[str, Any], revenue: dict[str, Any], 
     stance = "偏多" if s["綜合"] >= 75 else "中性偏多" if s["綜合"] >= 58 else "中性" if s["綜合"] >= 42 else "偏弱"
     catalysts=[]; risks=[]
     if revenue.get("revenue_yoy") is not None and revenue["revenue_yoy"] > 15: catalysts.append("營收成長動能高於中性門檻")
-    if flow.get("foreign_20",0) > 0 and flow.get("trust_20",0) > 0: catalysts.append("外資與投信近20日同向買超")
+    if flow.get("foreign_20") is not None and flow.get("trust_20") is not None and flow["foreign_20"] > 0 and flow["trust_20"] > 0: catalysts.append("外資與投信近20日同向買超")
     if tech.get("trend") == "多頭": catalysts.append("中期均線結構維持多頭")
     if research.get("eps_revision_pct") is not None and research["eps_revision_pct"] > 3: catalysts.append("Forward EPS 共識出現上修")
     pe = valuation.get("scenarios", [{}])[1].get("pe") if len(valuation.get("scenarios", [])) > 1 else None
@@ -2952,7 +2972,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     # Start every independent official chain together. On a free single-worker
     # Render instance, serial fallback stages otherwise add up beyond the
     # browser/proxy timeout even when each provider is healthy.
-    supplements_task = asyncio.create_task(asyncio.wait_for(fetch_official_market_supplements(ticker, today), timeout=42))
+    supplements_task = asyncio.create_task(asyncio.wait_for(fetch_official_market_supplements(ticker, today, history_days=0), timeout=16))
     official_financial_task = asyncio.create_task(asyncio.wait_for(fetch_official_income_statement(ticker), timeout=28))
     official_price_task = asyncio.create_task(asyncio.wait_for(fetch_twse_stock_day_history(ticker,13), timeout=25))
     info, prices, inst, margin, rev, pers, fin = await asyncio.gather(
@@ -2981,6 +3001,14 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     except Exception as e:
         errors.append(f"OfficialMarketSupplements: {type(e).__name__}")
         supplements = {"institutional": [], "margin": [], "revenue": [], "valuation": []}
+
+    cached_history = _OFFICIAL_HISTORY_CACHE.get(ticker)
+    if cached_history and time.time() - cached_history[0] < 3600:
+        history_data = cached_history[1]
+        if history_data.get("institutional"):
+            supplements["institutional"] = history_data["institutional"]
+        if history_data.get("margin"):
+            supplements["margin"] = history_data["margin"]
 
     def merge_by_date(base: list[dict[str, Any]], official: list[dict[str, Any]]) -> list[dict[str, Any]]:
         merged = {str(row.get("date")): row for row in base if row.get("date")}
@@ -3128,6 +3156,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
           "cashflow":{"institutional":institutional_payload.get("institutional") or {},"institutional_source":institutional_source,"last_date":flow.get("last_date")},"version":APP_VERSION,
           "data_policy":"V5.4.1 Cross-Validation：所有資料先正規化為 Evidence Record，依官方性、新鮮度、期間與衝突檢查後才進研究模型；Fact、Derived Fact、Estimate 分層；TWStock MCP 僅作第二來源交叉驗證，不靜默覆蓋官方值。"}
     _CACHE[ticker]=(time.time(),data)
+    schedule_official_history(ticker)
     return data
 
 
