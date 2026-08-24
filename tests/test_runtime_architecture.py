@@ -8,6 +8,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RuntimeArchitectureTests(unittest.TestCase):
+    def test_repository_contains_no_retired_runtime_artifacts(self):
+        self.assertEqual(list(ROOT.glob("run_v*.py")), [])
+        self.assertEqual(list(ROOT.glob("*_hotfix.js")), [])
+        self.assertEqual(list(ROOT.glob("ai_stock_research_terminal_*.zip")), [])
+        self.assertFalse((ROOT / "recovery.js").exists())
+        self.assertFalse((ROOT / "server.cpython-313.pyc").exists())
+
     def test_render_uses_only_canonical_server_app(self):
         render = (ROOT / "render.yaml").read_text(encoding="utf-8")
         self.assertIn("uvicorn server:app", render)
