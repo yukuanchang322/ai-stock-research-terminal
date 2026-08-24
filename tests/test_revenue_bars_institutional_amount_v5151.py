@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import AsyncMock, patch
 
 import server
 
@@ -41,6 +42,16 @@ class RevenueBarsInstitutionalAmountTests(unittest.TestCase):
         result=server.calc_flow(rows,[],None,[])
         self.assertIsNone(result["foreign_1_amount"])
         self.assertNotIn("institutional_amount_method",result)
+
+
+class IndependentHistoryWarmupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_revenue_survives_market_history_timeout(self):
+        revenue=[{"stock_id":"2330","revenue_year":2026,"revenue_month":7,"revenue":1.0,"date":"2026-07-01"}]
+        server._OFFICIAL_HISTORY_CACHE.pop("2330",None)
+        with patch.object(server,"fetch_official_market_supplements",new=AsyncMock(side_effect=TimeoutError())), \
+             patch.object(server,"fetch_mops_monthly_revenue_history",new=AsyncMock(return_value=revenue)):
+            await server._warm_official_history("2330")
+        self.assertEqual(server._OFFICIAL_HISTORY_CACHE["2330"][1]["revenue"],revenue)
 
 
 if __name__ == "__main__":

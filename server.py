@@ -28,7 +28,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.15.1"
+APP_VERSION = "5.15.2"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -293,7 +293,7 @@ async def fetch_twse_t86_latest(ticker: str, price: float | None, anchor: date |
     return {"institutional": {}, "flow": {}, "last_date": None, "source": "TWSE T86 official", "attempts": attempts}
 
 
-OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.1"}
+OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.2"}
 
 
 def _roc_date(raw: Any) -> str:
@@ -417,7 +417,8 @@ def parse_twse_margin_payload(payload: Any, ticker: str, day: str) -> list[dict[
     return []
 
 
-async def fetch_official_market_supplements(ticker: str, anchor: date | None = None, history_days: int = 45) -> dict[str, Any]:
+async def fetch_official_market_supplements(ticker: str, anchor: date | None = None, history_days: int = 45,
+                                            include_revenue_history: bool = True) -> dict[str, Any]:
     """Bounded official fallbacks for datasets that otherwise require FinMind."""
     end = anchor or date.today()
     async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=OFFICIAL_JSON_HEADERS) as client:
@@ -428,7 +429,7 @@ async def fetch_official_market_supplements(ticker: str, anchor: date | None = N
 
         async def revenue():
             latest = parse_twse_revenue_rows(await get_json("https://openapi.twse.com.tw/v1/opendata/t187ap05_L"), ticker)
-            if not history_days:
+            if not history_days or not include_revenue_history:
                 return latest
             history = await fetch_mops_monthly_revenue_history(client, ticker, end, 24)
             merged = {row["date"]: row for row in latest + history}
@@ -498,7 +499,26 @@ async def fetch_official_market_supplements(ticker: str, anchor: date | None = N
 
 async def _warm_official_history(ticker: str) -> None:
     try:
-        data = await asyncio.wait_for(fetch_official_market_supplements(ticker, history_days=45), timeout=48)
+        # Keep MOPS monthly revenue independent from the heavier T86/MI_MARGN
+        # batches. A timeout in one provider must not discard another
+        # provider's completed history.
+        async def market_history():
+            try:
+                return await asyncio.wait_for(
+                    fetch_official_market_supplements(ticker, history_days=45, include_revenue_history=False), timeout=48)
+            except Exception:
+                return {}
+
+        async def revenue_history():
+            try:
+                async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=OFFICIAL_JSON_HEADERS) as client:
+                    return await asyncio.wait_for(fetch_mops_monthly_revenue_history(client, ticker, date.today(), 24), timeout=36)
+            except Exception:
+                return []
+
+        data, revenue = await asyncio.gather(market_history(), revenue_history())
+        if revenue:
+            data["revenue"] = revenue
         if data.get("institutional") or data.get("margin") or data.get("revenue"):
             _OFFICIAL_HISTORY_CACHE[ticker] = (time.time(), data)
             _CACHE.pop(ticker, None)
