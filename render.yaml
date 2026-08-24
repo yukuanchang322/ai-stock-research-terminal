@@ -1,10 +1,10 @@
-# redeploy-trigger: V5.10.4
+# redeploy-trigger: V5.11.0
 services:
   - type: web
     name: ai-stock-research-terminal
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: sh -c 'uvicorn run_v5104:app --host 0.0.0.0 --port "${PORT:-10000}"'
+    startCommand: sh -c 'uvicorn run_v5110:app --host 0.0.0.0 --port "${PORT:-10000}"'
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
