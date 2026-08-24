@@ -71,9 +71,9 @@ function bindCreditChartTooltips(series){
     svg.addEventListener('pointerdown',show);svg.addEventListener('pointermove',e=>{if(e.pointerType==='mouse'||e.buttons)show(e)});svg.addEventListener('pointerleave',()=>{tip.hidden=true});
   });
 }
-function scheduleMarginHistoryRefresh(ticker,seriesLength){
+function scheduleMarginHistoryRefresh(ticker,seriesLength,revenueLength){
   clearTimeout(marginHistoryRefreshTimer);
-  if(seriesLength>=2){delete marginHistoryRefreshAttempts[ticker];return;}
+  if(seriesLength>=2&&revenueLength>=24){delete marginHistoryRefreshAttempts[ticker];return;}
   if((marginHistoryRefreshAttempts[ticker]||0)>=2)return;
   marginHistoryRefreshTimer=setTimeout(async()=>{if(currentTicker!==ticker)return;marginHistoryRefreshAttempts[ticker]=(marginHistoryRefreshAttempts[ticker]||0)+1;try{const response=await fetch(`/api/stock/${encodeURIComponent(ticker)}`,{cache:'no-store'}),data=await readApiResponse(response);if(response.ok&&currentTicker===ticker)render(data)}catch(e){console.warn('margin history refresh pending',e)}},55000);
 }
@@ -247,7 +247,7 @@ function render(d){
   $('flowTable').innerHTML=flowMatrix(fl);
   $('marginHistoryCharts').innerHTML=marginHistoryDashboard(fl);
   bindCreditChartTooltips(fl.margin_history||[]);
-  scheduleMarginHistoryRefresh(d.ticker,(fl.margin_history||[]).length);
+  scheduleMarginHistoryRefresh(d.ticker,(fl.margin_history||[]).length,(r.series||[]).length);
   const flows={外資:fl.foreign_20_amount,投信:fl.trust_20_amount,自營商:fl.dealer_20_amount};
   const available=Object.values(flows).filter(v=>v!=null), mx=Math.max(1,...available.map(Math.abs));
   $('flowBars').innerHTML=Object.entries(flows).map(([k,v])=>`<div class="flow-row"><span>${k} 20日</span><div class="flow-track"><div class="flow-fill ${v!=null&&v<0?'neg':''}" style="width:${v==null?0:Math.abs(v)/mx*100}%"></div></div><b>${money(v)}</b></div>`).join('');
