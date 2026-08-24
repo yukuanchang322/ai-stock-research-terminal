@@ -82,6 +82,8 @@
 }
 
 .disclosure-grid{display:grid;grid-template-columns:1.25fr .9fr;gap:14px}
+.revenue-chart{position:relative}.revenue-chart svg{display:block;width:100%;height:auto;touch-action:pan-y}.revenue-chart>small,.flow-amount-note{display:block;color:var(--muted);font-size:9px;line-height:1.5;margin-top:5px}.revenue-bar{fill:#4ce0b3}.revenue-bar:hover{fill:#82b7ff}.revenue-grid{stroke:#304653;stroke-width:1}.revenue-axis,.revenue-date{fill:#aebbc4;font-size:11px}.revenue-hit{fill:transparent;pointer-events:all}.revenue-tooltip{position:absolute;top:18px;z-index:2;min-width:142px;transform:translateX(-50%);padding:8px 10px;border:1px solid #55727f;border-radius:9px;background:rgba(5,12,17,.96);pointer-events:none}.revenue-tooltip b,.revenue-tooltip span{display:block}.revenue-tooltip b{font-size:11px;margin-bottom:3px}.revenue-tooltip span{font-size:10px;color:#d1dade;line-height:1.45}.flow-amount-note{margin:-3px 2px 12px}
+@media(max-width:600px){.revenue-axis,.revenue-date{font-size:13px}.revenue-tooltip{min-width:154px}.flow-amount-note{font-size:10px}}
 .subsection-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
 .subsection-head h4{margin:0}.subsection-head small{color:var(--muted);font-size:9px}.subsection-head>span{background:rgba(76,224,179,.12);color:var(--accent);border:1px solid rgba(76,224,179,.35);border-radius:999px;padding:5px 10px;font-weight:800}
 #earningsCallList{display:grid;gap:12px}.earnings-call-card{border:1px solid var(--line);background:#091720;border-radius:12px;padding:14px}
