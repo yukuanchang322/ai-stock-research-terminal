@@ -289,7 +289,9 @@ const ex=d.expectation_gap||{};
   const mcp=d.twstock_mcp||{};
   if($('mcpCrosscheck')) {
     const mrecs=mcp.records||[];
-    $('mcpCrosscheck').innerHTML=`<div class="mcp-crosscheck ${mcp.status||'missing'}"><div><b>TWStock MCP 二次驗證</b><span>${mcp.status||'missing'}</span></div><small>工具 ${mcp.tool_count??0} · 成功 ${mcp.successful_calls??0} · Evidence ${mrecs.length}</small>${mrecs.length?`<div class="mcp-evidence-mini">${mrecs.slice(0,6).map(x=>`<span>${x.metric}: ${fmt(x.value,2)}</span>`).join('')}</div>`:''}<a href="/api/diagnostics/mcp/${encodeURIComponent(d.ticker)}" target="_blank" rel="noopener noreferrer">查看 MCP 診斷</a></div>`;
+    const mcpLabel={ok:'已完成',pending:'背景準備中',degraded:'暫無可比 Evidence',error:'選用來源暫不可用',timeout:'選用來源逾時',disabled:'未啟用'}[mcp.status]||'選用來源暫不可用';
+    const mcpNote=mcp.message||((mcp.status==='ok')?'僅作第二來源交叉驗證。':'此為選用二次驗證，不影響官方核心資料評級。');
+    $('mcpCrosscheck').innerHTML=`<div class="mcp-crosscheck ${mcp.status||'optional'}"><div><b>TWStock MCP 二次驗證（選用）</b><span>${mcpLabel}</span></div><small>工具 ${mcp.tool_count??0} · 成功 ${mcp.successful_calls??0} · Evidence ${mrecs.length}</small><small>${mcpNote}</small>${mrecs.length?`<div class="mcp-evidence-mini">${mrecs.slice(0,6).map(x=>`<span>${x.metric}: ${fmt(x.value,2)}</span>`).join('')}</div>`:''}<a href="/api/diagnostics/mcp/${encodeURIComponent(d.ticker)}" target="_blank" rel="noopener noreferrer">查看 MCP 診斷</a></div>`;
   }
   if($('invalidationConditions')) $('invalidationConditions').innerHTML=(rp.invalidation_conditions||[]).map(x=>`<div class="condition-row invalid"><b>${x}</b></div>`).join('');
   $('valuationBody').innerHTML=scenarios.length?scenarios.map(x=>`<tr><td>${x.name}</td><td>${fmt(x.eps,2)}</td><td>${fmt(x.pe,1)}x</td><td><b>${fmt0(x.target)}</b></td><td>${pct(x.upside_pct)}</td></tr>`).join(''):'<tr><td colspan="5">估值資料不足</td></tr>';
@@ -302,7 +304,7 @@ const ex=d.expectation_gap||{};
 
   $('catalystList').innerHTML=(d.catalysts||[]).map(x=>`<li>${x}</li>`).join(''); $('riskList').innerHTML=(d.risks||[]).map(x=>`<li>${x}</li>`).join('');
   $('freshnessStrip').innerHTML=d.source_status.map(x=>`<div class="fresh ${x.status}"><span>${x.name}</span><b>${x.as_of||'缺資料'}</b></div>`).join('');
-  $('sourceTable').innerHTML=`<table class="clean-table"><thead><tr><th>資料</th><th>Dataset</th><th>最新資料日</th><th>預定更新</th><th>狀態</th></tr></thead><tbody>${d.source_status.map(x=>`<tr><td>${x.name}</td><td>${x.dataset}</td><td>${x.as_of||'—'}</td><td>${x.scheduled_update}</td><td>${x.status==='ok'?'可用':x.status==='stale'?'STALE / 已降權':'缺資料'}</td></tr>`).join('')}</tbody></table>`;
+  $('sourceTable').innerHTML=`<table class="clean-table"><thead><tr><th>資料</th><th>Dataset</th><th>最新資料日</th><th>預定更新</th><th>狀態</th></tr></thead><tbody>${d.source_status.map(x=>`<tr><td>${x.name}</td><td>${x.dataset}</td><td>${x.as_of||'—'}</td><td>${x.scheduled_update}</td><td>${x.status==='ok'?'可用':x.status==='stale'?'STALE / 已降權':x.status==='optional'?'選用 / 不影響評級':'缺資料'}</td></tr>`).join('')}</tbody></table>`;
   wrapWideTables();
 }
 
