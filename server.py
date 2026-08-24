@@ -29,7 +29,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.16.8"
+APP_VERSION = "5.16.9"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -1754,7 +1754,11 @@ BUILTIN_OFFICIAL_EPS_REGISTRY = {
         {"ticker":"3661","year":2025,"quarter":2,"quarter_eps":16.37,"ytd_eps":34.49,"source":"Alchip reviewed financial report","source_url":"https://www.alchip.com/upload/2025_08_18/3_20250818101142i3cka8jyk0.pdf","evidence_kind":"company_official_financial_pdf","verified":True},
         {"ticker":"3661","year":2025,"quarter":3,"quarter_eps":16.40,"ytd_eps":50.89,"source":"Alchip reviewed financial report","source_url":"https://www.alchip.com/upload/2025_11_12/3_20251112141146lr7eqkVGQ0.pdf","evidence_kind":"company_official_financial_pdf","verified":True},
         {"ticker":"3661","year":2025,"quarter":4,"quarter_eps":18.30,"fy_eps":69.18,"source":"Alchip official FY2025 results","source_url":"https://www.alchip.com/en/Newsroom/Alchip_2025_Q4_financial_results","evidence_kind":"company_official_quarter_eps","verified":True},
-        {"ticker":"3661","year":2026,"quarter":1,"quarter_eps":17.55,"ytd_eps":17.55,"source":"Alchip reviewed financial report","source_url":"https://www.alchip.com/upload/2026_05_11/3_20260511103038sgoopzYTC0.pdf","evidence_kind":"company_official_financial_pdf","verified":True}
+        {"ticker":"3661","year":2026,"quarter":1,"quarter_eps":17.55,"ytd_eps":17.55,"source":"Alchip reviewed financial report","source_url":"https://www.alchip.com/upload/2026_05_11/3_20260511103038sgoopzYTC0.pdf","evidence_kind":"company_official_financial_pdf","verified":True},
+        {"ticker":"2454","year":2025,"quarter":3,"quarter_eps":15.84,"source":"MediaTek Quarterly Earnings Release","source_url":"https://www.mediatek.com/hubfs/MediaTek%20Assets/Pdfs/Quarterly%20Earnings%20Release/2025/Quarterly%20Earnings%20Release-2025Q3/Press%20Release.pdf?hsLang=en","evidence_kind":"company_official_quarter_eps","verified":True},
+        {"ticker":"2454","year":2025,"quarter":4,"quarter_eps":14.39,"source":"MediaTek Quarterly Earnings Release","source_url":"https://www.mediatek.com/hubfs/MediaTek%20Assets/Pdfs/Quarterly%20Earnings%20Release/2025/Quarterly%20Earnings%20Release-2025Q4/Press%20Release.pdf","evidence_kind":"company_official_quarter_eps","verified":True},
+        {"ticker":"2454","year":2026,"quarter":1,"quarter_eps":15.17,"ytd_eps":15.17,"source":"MediaTek Quarterly Earnings Release","source_url":"https://www.mediatek.com/hubfs/MediaTek%20Assets/Pdfs/Quarterly%20Earnings%20Release/2026/Quarterly%20Earnings%20Release-2026Q1/Press%20Release.pdf","evidence_kind":"company_official_quarter_eps","verified":True},
+        {"ticker":"2454","year":2026,"quarter":2,"ytd_eps":30.44,"source":"MediaTek Financial Information / MOPS cumulative EPS","source_url":"https://www.mediatek.com/investor-relations/financial-information","evidence_kind":"company_official_ytd_eps","verified":True}
     ]
 }
 
@@ -2745,10 +2749,14 @@ def calc_revenue(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def calc_per(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def calc_per(rows: list[dict[str, Any]], ticker: str | None=None) -> dict[str, Any]:
     df = pd.DataFrame(rows)
     if df.empty:
         return {}
+    if ticker and "stock_id" in df.columns:
+        df = df[df["stock_id"].astype(str).str.strip() == str(ticker)]
+        if df.empty:
+            return {}
     df = df.sort_values("date")
     for c in ["PER", "PBR", "dividend_yield"]:
         if c in df.columns:
@@ -2826,22 +2834,42 @@ def model_valuation(price: float | None, perdata: dict[str, Any], eps_stack: dic
     ttm=safe_num(eps_stack.get("ttm_eps")) if allow_financial else None
     ytd=safe_num(eps_stack.get("ytd_eps")) if allow_financial else None
     q=eps_stack.get("quarter_period")
-    if consensus_eps and coverage >= 2:
-        anchor_eps=consensus_eps; eps_basis=f"{research.get('forward_eps_year') or 'Forward'}E EPS 中位數（{coverage} 筆明確年度可比預估）"; eps_conf=82
-    elif ttm and ttm>0:
+    forward_valid=bool(consensus_eps and consensus_eps>0 and coverage>=2 and research.get("forward_eps_year"))
+    if ttm and ttm>0:
         anchor_eps=ttm; eps_basis=f"TTM EPS {ttm:.2f}（截至 {q or 'latest'}；不使用單季×4）"; eps_conf=78
+        selected_model="trailing_ttm"
+    elif forward_valid:
+        anchor_eps=consensus_eps; eps_basis=f"{research.get('forward_eps_year')}E EPS 中位數（{coverage} 筆明確年度可比預估）"; eps_conf=82
+        selected_model="forward_consensus"
     elif ytd and ytd>0:
-        anchor_eps=ytd; eps_basis=f"YTD EPS {ytd:.2f}（資料不足以形成 TTM，暫不年化單季）"; eps_conf=48
+        qm=re.search(r"Q([1-4])",str(q or eps_stack.get("ytd_period") or ""),re.I)
+        elapsed=int(qm.group(1)) if qm else None
+        if not elapsed: return {"scenarios": [], "eps_basis":"YTD 期間不明，禁止直接當全年 EPS", "confidence":0}
+        anchor_eps=ytd/elapsed*4; eps_basis=f"YTD EPS {ytd:.2f} ÷ {elapsed}季 × 4 = {anchor_eps:.2f}（年化暫估，非 TTM／非公司指引）"; eps_conf=35
+        selected_model="annualized_ytd_estimate"
     elif perdata.get("per") and perdata["per"]>0 and allow_financial:
         anchor_eps=price/perdata["per"]; eps_basis="由現價 / 市場 PER 反推 TTM EPS（降級模型）"; eps_conf=32
+        selected_model="market_implied"
     else: return {"scenarios": [], "eps_basis":"資料不足", "confidence":0}
     if perdata.get("pe_median"):
         bear_pe=max(5.0,perdata["pe_p25"]); base_pe=perdata["pe_median"]; bull_pe=min(150.0,perdata["pe_p75"]); pe_basis=f"近年歷史 PER 分位數（樣本 {perdata.get('sample_count',0)} 日）"; pe_conf=85
     else:
         center=perdata.get("per") if perdata.get("per") and 5<=perdata["per"]<=120 else 20.0; bear_pe,base_pe,bull_pe=max(8.0,center*.8),center,min(150.0,center*1.2); pe_basis="目前 PER ±20%（歷史樣本不足降級模型）"; pe_conf=50
-    scenarios=[{"name":"悲觀","eps":anchor_eps*.90,"pe":bear_pe},{"name":"基準","eps":anchor_eps,"pe":base_pe},{"name":"樂觀","eps":anchor_eps*1.10,"pe":bull_pe}]
-    for x in scenarios: x["target"]=x["eps"]*x["pe"]; x["upside_pct"]=(x["target"]/price-1)*100
-    return {"eps_basis":eps_basis,"pe_basis":pe_basis,"confidence":round((eps_conf+pe_conf)/2),"anchor_eps":anchor_eps,"scenarios":scenarios}
+    def scenario_set(eps: float | None) -> list[dict[str,Any]]:
+        if not eps or eps<=0: return []
+        out=[{"name":"悲觀","eps":eps*.90,"pe":bear_pe},{"name":"基準","eps":eps,"pe":base_pe},{"name":"樂觀","eps":eps*1.10,"pe":bull_pe}]
+        for x in out: x["target"]=x["eps"]*x["pe"]; x["upside_pct"]=(x["target"]/price-1)*100
+        return out
+    trailing_scenarios=scenario_set(ttm)
+    forward_scenarios=scenario_set(consensus_eps if forward_valid else None)
+    scenarios=scenario_set(anchor_eps)
+    implied_pe=price/ttm if ttm and ttm>0 else safe_num(perdata.get("per"))
+    return {"eps_basis":eps_basis,"pe_basis":pe_basis,"confidence":round((eps_conf+pe_conf)/2),
+            "anchor_eps":anchor_eps,"selected_model":selected_model,"scenarios":scenarios,
+            "trailing_scenarios":trailing_scenarios,"forward_scenarios":forward_scenarios,
+            "market_implied":{"price":price,"ttm_eps":ttm,"implied_pe":implied_pe,
+                              "official_market_pe":safe_num(perdata.get("per")),"official_market_pbr":safe_num(perdata.get("pbr")),
+                              "as_of":perdata.get("last_date")}}
 
 
 def scores(technical: dict[str, Any], revenue: dict[str, Any], flow: dict[str, Any], perdata: dict[str, Any], financial: dict[str, Any], research: dict[str, Any]) -> dict[str, int]:
@@ -3789,7 +3817,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
             price_source = f"{last_good[2]} last-good cache"
             errors.append("Price providers unavailable; preserved last successful history")
 
-    tech=calc_technical(prices); flow=calc_flow(inst,margin,None,prices); revenue=calc_revenue(rev); perdata=calc_per(pers); financial=calc_financials(fin)
+    tech=calc_technical(prices); flow=calc_flow(inst,margin,None,prices); revenue=calc_revenue(rev); perdata=calc_per(pers,ticker); financial=calc_financials(fin)
     flow["institutional_history_count"]=len({str(row.get("date")) for row in inst if row.get("date")})
     flow["institutional_history_required"]=20
     flow["margin_history_required"]=21
