@@ -143,6 +143,7 @@ html,body{max-width:100%;overflow-x:hidden}body{padding-bottom:calc(92px + env(s
 .mobile-dock{left:8px;right:8px;bottom:calc(6px + env(safe-area-inset-bottom));height:50px}.mobile-dock button{min-height:50px}
 }
 .valuation-compare{margin-top:18px;border-top:1px solid var(--line);padding-top:14px}
+.valuation-warning{display:block;margin-top:8px;color:var(--amber)!important}.valuation-alert{margin-top:10px;padding:10px;border:1px solid rgba(240,199,102,.35);border-radius:9px;background:rgba(240,199,102,.07);color:var(--amber);line-height:1.55}.target-row.market b{color:var(--blue)}
 .valuation-compare-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
 .valuation-compare-grid>div{position:relative;display:flex;flex-direction:column;gap:6px;min-width:0;padding:12px;border:1px solid var(--line);border-radius:12px;background:rgba(4,16,25,.45)}
 .valuation-compare-grid span,.valuation-compare-grid small{color:var(--muted)}

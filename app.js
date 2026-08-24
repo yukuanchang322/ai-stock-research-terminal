@@ -283,8 +283,12 @@ function render(d){
   $('scoreBars').innerHTML=['基本面','籌碼面','技術面','估值'].map(k=>`<div class="scorebar"><span>${k}</span><div class="scorebar-track"><div class="scorebar-fill" style="width:${d.scores[k]}%"></div></div><b>${d.scores[k]}</b></div>`).join('');
 
   const scenarios=d.valuation.scenarios||[];
-  $('targetRows').innerHTML=scenarios.length?scenarios.map(targetRow).join(''):'<div class="empty">估值資料不足</div>';
-  $('epsBasis').textContent=`EPS 基礎：${d.valuation.eps_basis||'資料不足'}`;
+  const layerBase=xs=>(xs||[]).find(x=>x.name==='基準');
+  const ttmLayer=layerBase(d.valuation.trailing_scenarios), forwardLayer=layerBase(d.valuation.forward_scenarios), analystLayer=d.valuation.analyst_consensus||{};
+  const targetHeading=$('targetRows')?.previousElementSibling; if(targetHeading) targetHeading.textContent='估值分層比較';
+  const layeredRows=[['TTM 歷史回歸',ttmLayer?.target,'bear'],[`Forward EPS${d.valuation.forward_status==='single_source'?'（單一來源）':forwardLayer?'':'（資料不足）'}`,forwardLayer?.target,'base'],[`法人目標${analystLayer.status==='consensus'?'中位數':analystLayer.status==='single_source'?'（單一來源）':'（未驗證）'}`,analystLayer.median_target,'bull'],['目前市價',d.price,'market']];
+  $('targetRows').innerHTML=layeredRows.map(x=>`<div class="target-row ${x[2]}"><span>${x[0]}</span><b>${x[1]!=null?fmt0(x[1]):'—'}</b></div>`).join('');
+  $('epsBasis').innerHTML=`EPS 基礎：${d.valuation.eps_basis||'資料不足'}<span class="valuation-warning">${d.valuation.valuation_warning||'各層口徑不同；歷史回歸價與法人目標價不可混為單一預測。'}</span>`;
 
   const f=d.financial||{}, r=d.revenue||{}, p=d.per||{}, es=d.eps_stack||{}, fi=d.financial_integrity||{};
   const diagLink=`<a class="diagnostic-link" href="/api/diagnostics/financial/${encodeURIComponent(d.ticker)}" target="_blank" rel="noopener noreferrer">查看官方資料診斷</a>`;
@@ -329,7 +333,7 @@ function render(d){
   $('levels').innerHTML=[['MA20',t.ma?.['20']],['MA60',t.ma?.['60']],['第一支撐',t.support1],['60日壓力',t.resistance],['KD K',t.k],['KD D',t.d],['RSI14',t.rsi14],['MACD Hist',t.macd_hist]].map(x=>`<div class="level"><span>${x[0]}</span><b>${fmt(x[1],x[0].includes('MACD')?2:1)}</b></div>`).join('');
   $('techAnalysis').textContent=`近一年日K；MA60 為中期趨勢核心。趨勢：${t.trend||'—'}；K/D ${fmt(t.k,1)}/${fmt(t.d,1)}；MACD Hist ${fmt(t.macd_hist,2)}；RSI14 ${fmt(t.rsi14,1)}。KD >80 / <20、RSI >70 / <30 僅代表動能極端，需搭配均線與量價確認。`;
 
-  const rr=d.research||{}; $('reportCount').textContent=rr.count||0; $('consensusText').textContent=rr.median_target?`目標價中位數 ${fmt0(rr.median_target)} · 平均 ${fmt0(rr.average_target)}`:'目前尚無可解析的法人目標價共識'; $('revisionText').textContent=rr.forward_eps_year?`${rr.forward_eps_year}E EPS 中位數 ${fmt(rr.median_forward_eps,2)}（${rr.eps_coverage||0} 筆明確年度預估）`:(rr.target_revision_pct!=null?`同機構目標價修正中位數 ${pct(rr.target_revision_pct)}`:'Forward EPS：缺乏可比年度標註，不納入估值');
+  const rr=d.research||{}; $('reportCount').textContent=rr.count||0; $('consensusText').textContent=rr.median_target?`${rr.target_coverage>=2?'法人目標價中位數':'單一已辨識機構目標'} ${fmt0(rr.median_target)}${rr.target_coverage>=2?` · ${rr.target_coverage} 筆`:' · 尚未形成共識'}`:'目前尚無通過公司與機構驗證的法人目標價'; $('revisionText').textContent=rr.forward_eps_year?`${rr.forward_eps_year}E EPS ${rr.eps_coverage>=2?'中位數':'單一來源'} ${fmt(rr.median_forward_eps,2)}（${rr.eps_coverage||0} 筆明確年度預估${rr.eps_coverage<2?'，不作法人共識':''}）`:(rr.target_revision_pct!=null?`同機構目標價修正中位數 ${pct(rr.target_revision_pct)}`:'Forward EPS：缺乏可比年度標註，不納入估值');
   if($('consensusStats')) $('consensusStats').innerHTML=[['法人機構',rr.institution_count||0],['最高目標',fmt0(rr.high_target)],['最低目標',fmt0(rr.low_target)],['買進/正向',rr.ratings?.['買進']||0],['中立',rr.ratings?.['中立']||0],['公開網路',rr.public_web_count||0]].map(x=>`<div><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');
   $('analystTable').innerHTML=(rr.reports||[]).length?`<table class="clean-table analyst-web-table"><thead><tr><th>法人/券商</th><th>日期</th><th>評等</th><th>目標價</th><th>來源/標題</th><th>可信度</th></tr></thead><tbody>${rr.reports.map(x=>`<tr><td>${x.institution||'—'}</td><td>${x.report_date||'—'}</td><td>${x.rating||'—'}</td><td>${fmt0(x.target_price)}</td><td>${x.source_url?`<a href="${x.source_url}" target="_blank" rel="noopener noreferrer">${x.title||x.publisher||'查看來源'}</a>`:(x.title||x.publisher||'自行匯入')}</td><td>${x.confidence!=null?`${x.confidence}/100`:'—'}</td></tr>`).join('')}</tbody></table>`:'<div class="empty bordered">目前尚未搜尋到可解析的公開法人研究引用。可按「強制刷新」重新搜尋最新網路資料。</div>';
 
@@ -365,13 +369,13 @@ const ex=d.expectation_gap||{};
   }
   if($('invalidationConditions')) $('invalidationConditions').innerHTML=(rp.invalidation_conditions||[]).map(x=>`<div class="condition-row invalid"><b>${x}</b></div>`).join('');
   $('valuationBody').innerHTML=scenarios.length?scenarios.map(x=>`<tr><td>${x.name}</td><td>${fmt(x.eps,2)}</td><td>${fmt(x.pe,1)}x</td><td><b>${fmt0(x.target)}</b></td><td>${pct(x.upside_pct)}</td></tr>`).join(''):'<tr><td colspan="5">估值資料不足</td></tr>';
-  $('assumptions').innerHTML=`<div class="assumption-row"><b>EPS Basis</b><span>${d.valuation.eps_basis||'—'}</span></div><div class="assumption-row"><b>PE Basis</b><span>${d.valuation.pe_basis||'—'}</span></div><div class="assumption-row"><b>估值信心</b><span>${d.valuation.confidence||0}/100</span></div><div class="assumption-row"><b>模型原則</b><span>Bear/Base/Bull 對 EPS 與 PE 同時做情境化，而非單點預測。</span></div>`; $('peBand').innerHTML=`歷史 PER：P25 <b>${fmt(d.per?.pe_p25,1)}x</b> · Median <b>${fmt(d.per?.pe_median,1)}x</b> · P75 <b>${fmt(d.per?.pe_p75,1)}x</b>`;
+  $('assumptions').innerHTML=`<div class="assumption-row"><b>EPS Basis</b><span>${d.valuation.eps_basis||'—'}</span></div><div class="assumption-row"><b>PE Basis</b><span>${d.valuation.pe_basis||'—'}</span></div><div class="assumption-row"><b>資料完整度 / 估值信心</b><span>${d.confidence?.data_completeness??0}/100 · ${d.valuation.confidence||0}/100</span></div><div class="assumption-row"><b>模型原則</b><span>歷史回歸、Forward EPS、法人目標與市場隱含估值分開呈現，不合併成單一保證價。</span></div>`; $('peBand').innerHTML=`歷史 PER：P25 <b>${fmt(d.per?.pe_p25,1)}x</b> · Median <b>${fmt(d.per?.pe_median,1)}x</b> · P75 <b>${fmt(d.per?.pe_p75,1)}x</b>${d.valuation.regime_shift_warning?'<div class="valuation-alert">目前市場 PER 已明顯脫離歷史區間，歷史回歸價僅供風險壓力測試。</div>':''}`;
   const valuationBase=xs=>(xs||[]).find(x=>x.name==='基準');
   const trailingBase=valuationBase(d.valuation.trailing_scenarios), forwardBase=valuationBase(d.valuation.forward_scenarios), implied=d.valuation.market_implied||{};
   $('valuationCompare').innerHTML=`<h4>三種估值交叉檢查</h4><div class="valuation-compare-grid">
-    <div><span>TTM 歷史估值</span><b>${trailingBase?fmt0(trailingBase.target):'—'}</b><small>${trailingBase?`TTM EPS ${fmt(implied.ttm_eps,2)} × 歷史中位 PER`:'四季 EPS 尚未齊全'}</small>${d.valuation.selected_model==='trailing_ttm'?'<em>目前採用</em>':''}</div>
-    <div><span>Forward EPS 估值</span><b>${forwardBase?fmt0(forwardBase.target):'—'}</b><small>${forwardBase?'至少 2 筆同年度法人預估':'缺乏 2 筆同年度可比預估'}</small>${d.valuation.selected_model==='forward_consensus'?'<em>目前採用</em>':''}</div>
-    <div><span>市場隱含估值</span><b>${implied.implied_pe!=null?`${fmt(implied.implied_pe,1)}x`:'—'}</b><small>現價 ÷ TTM EPS${implied.as_of?` · ${implied.as_of}`:''}</small>${d.valuation.selected_model==='market_implied'?'<em>降級採用</em>':''}</div>
+    <div><span>TTM 歷史均值回歸</span><b>${trailingBase?fmt0(trailingBase.target):'—'}</b><small>${trailingBase?`TTM EPS ${fmt(implied.ttm_eps,2)} × 歷史中位 PER；不是短期目標價`:'四季 EPS 尚未齊全'}</small>${d.valuation.selected_model==='trailing_ttm'?'<em>EPS 主基準</em>':''}</div>
+    <div><span>Forward EPS 估值</span><b>${forwardBase?fmt0(forwardBase.target):'—'}</b><small>${d.valuation.forward_status==='consensus'?'至少 2 筆同年度法人預估':d.valuation.forward_status==='single_source'?'單一已辨識機構預估，尚未形成共識':'缺乏明確年度可比預估'}</small>${d.valuation.selected_model==='forward_consensus'?'<em>目前採用</em>':d.valuation.forward_status==='single_source'?'<em>僅供參考</em>':''}</div>
+    <div><span>市場隱含估值</span><b>${implied.implied_pe!=null?`${fmt(implied.implied_pe,1)}x`:'—'}</b><small>現價 ÷ TTM EPS${implied.as_of?` · ${implied.as_of}`:''}</small>${d.valuation.regime_shift_warning?'<em>估值制度轉換警示</em>':d.valuation.selected_model==='market_implied'?'<em>降級採用</em>':''}</div>
   </div>`;
 
   const base=scenarios.find(x=>x.name==='基準');
