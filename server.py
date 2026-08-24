@@ -28,7 +28,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.15.7"
+APP_VERSION = "5.15.8"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -41,6 +41,9 @@ _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _OFFICIAL_HISTORY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _OFFICIAL_HISTORY_TASKS: dict[str, asyncio.Task] = {}
 _OFFICIAL_HISTORY_JOBS: dict[str, dict[str, dict[str, Any]]] = {}
+_OFFICIAL_FINANCIAL_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_OFFICIAL_FINANCIAL_TASKS: dict[str, asyncio.Task] = {}
+_OFFICIAL_FINANCIAL_JOBS: dict[str, dict[str, Any]] = {}
 _MCP_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _MCP_TASKS: dict[str, asyncio.Task] = {}
 
@@ -296,7 +299,7 @@ async def fetch_twse_t86_latest(ticker: str, price: float | None, anchor: date |
     return {"institutional": {}, "flow": {}, "last_date": None, "source": "TWSE T86 official", "attempts": attempts}
 
 
-OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.7"}
+OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.8"}
 
 
 def _roc_date(raw: Any) -> str:
@@ -525,6 +528,16 @@ def _save_official_history(ticker: str, provider: str, rows: list[dict[str, Any]
     merged[provider] = [by_date[key] for key in sorted(by_date)][-limit:]
     _OFFICIAL_HISTORY_CACHE[ticker] = (time.time(), merged)
     _CACHE.pop(ticker, None)
+
+
+def _history_revision(ticker: str) -> float:
+    cached = _OFFICIAL_HISTORY_CACHE.get(ticker)
+    return cached[0] if cached and time.time() - cached[0] < 3600 else 0
+
+
+def _cached_stock_is_current(ticker: str, payload: dict[str, Any]) -> bool:
+    """Never serve a report built from an older incremental history snapshot."""
+    return _history_revision(ticker) <= float(payload.get("history_cache_at_used") or 0)
 
 
 async def _warm_market_provider(ticker: str, provider: str) -> None:
@@ -1585,6 +1598,52 @@ async def reconcile_official_financial_snapshot(ticker: str, selected: dict[str,
     merged["mapping_reconciled"]=True
     merged["mapping_sources"]=[{"source":x.get("source"),"endpoint":x.get("endpoint"),"period":x.get("period"),"completeness":x.get("completeness")} for x in latest]
     return merged
+
+
+async def _warm_official_financial(ticker: str) -> dict[str, Any]:
+    job = _OFFICIAL_FINANCIAL_JOBS.setdefault(ticker, {})
+    job.update(status="running", last_error=None,
+               started_at=datetime.now().astimezone().isoformat(timespec="seconds"))
+    try:
+        selected = await asyncio.wait_for(fetch_official_income_statement(ticker), timeout=90)
+        selected = await asyncio.wait_for(reconcile_official_financial_snapshot(ticker, selected), timeout=45)
+        if selected.get("official"):
+            _OFFICIAL_FINANCIAL_CACHE[ticker] = (time.time(), dict(selected))
+            _CACHE.pop(ticker, None)
+            job.update(status="complete", period=selected.get("period"), source=selected.get("source"))
+        else:
+            job.update(status="partial", last_error="no_official_candidate")
+        return selected
+    except asyncio.CancelledError:
+        job["status"] = "cancelled"
+        raise
+    except Exception as exc:
+        job.update(status="error", last_error=f"{type(exc).__name__}: {str(exc)[:160]}")
+        return {"official": False, "errors": [type(exc).__name__]}
+    finally:
+        job["updated_epoch"] = time.time()
+        job["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        _OFFICIAL_FINANCIAL_TASKS.pop(ticker, None)
+
+
+def schedule_official_financial(ticker: str) -> asyncio.Task:
+    cached = _OFFICIAL_FINANCIAL_CACHE.get(ticker)
+    if cached and time.time() - cached[0] < 21600:
+        async def cached_result() -> dict[str, Any]:
+            return dict(cached[1])
+        return asyncio.create_task(cached_result())
+    task = _OFFICIAL_FINANCIAL_TASKS.get(ticker)
+    if task and not task.done():
+        return task
+    prior_job = _OFFICIAL_FINANCIAL_JOBS.get(ticker) or {}
+    if (prior_job.get("status") in {"partial", "error"}
+            and time.time() - float(prior_job.get("updated_epoch") or 0) < 60):
+        async def recent_result() -> dict[str, Any]:
+            return {"official": False, "errors": [prior_job.get("last_error") or "official_financial_retry_pending"]}
+        return asyncio.create_task(recent_result())
+    task = asyncio.create_task(_warm_official_financial(ticker))
+    _OFFICIAL_FINANCIAL_TASKS[ticker] = task
+    return task
 
 def expected_latest_financial_period(as_of: date | None=None) -> tuple[int,int,str]:
     """Conservative Taiwan quarterly filing calendar used only as a freshness gate.
@@ -3265,7 +3324,8 @@ async def fetch_twse_stock_day_history(ticker: str, months: int = 13) -> list[di
     return [dedup[k] for k in sorted(dedup)]
 
 async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any]:
-    if not force_refresh and ticker in _CACHE and time.time() - _CACHE[ticker][0] < CACHE_TTL:
+    if (not force_refresh and ticker in _CACHE and time.time() - _CACHE[ticker][0] < CACHE_TTL
+            and _cached_stock_is_current(ticker, _CACHE[ticker][1])):
         cached = dict(_CACHE[ticker][1]); cached["cache"] = {"hit": True, "ttl_seconds": CACHE_TTL}; return cached
     today = date.today(); errors: list[str] = []
     async def grab(dataset: str, days: int):
@@ -3285,7 +3345,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     # Render instance, serial fallback stages otherwise add up beyond the
     # browser/proxy timeout even when each provider is healthy.
     supplements_task = asyncio.create_task(asyncio.wait_for(fetch_official_market_supplements(ticker, today, history_days=0), timeout=16))
-    official_financial_task = asyncio.create_task(asyncio.wait_for(fetch_official_income_statement(ticker), timeout=28))
+    official_financial_task = schedule_official_financial(ticker)
     official_price_task = asyncio.create_task(asyncio.wait_for(fetch_twse_stock_day_history(ticker,13), timeout=25))
     info, prices, inst, margin, rev, pers, fin = await asyncio.gather(
         info_grab(),
@@ -3315,6 +3375,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         supplements = {"institutional": [], "margin": [], "revenue": [], "valuation": []}
 
     cached_history = _OFFICIAL_HISTORY_CACHE.get(ticker)
+    history_cache_at_used = cached_history[0] if cached_history and time.time() - cached_history[0] < 3600 else 0
     if cached_history and time.time() - cached_history[0] < 3600:
         history_data = cached_history[1]
         if history_data.get("institutional"):
@@ -3355,8 +3416,11 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     institutional_payload: dict[str, Any] = {}
 
     async def official_financial_bounded():
+        cached_financial = _OFFICIAL_FINANCIAL_CACHE.get(ticker)
+        if cached_financial and time.time() - cached_financial[0] < 21600:
+            return dict(cached_financial[1])
         try:
-            return await official_financial_task
+            return await asyncio.wait_for(asyncio.shield(official_financial_task), timeout=28)
         except Exception as e:
             errors.append(f"OfficialFinancial: {type(e).__name__}")
             return {"official":False,"errors":[type(e).__name__]}
@@ -3383,10 +3447,11 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     elif not flow.get("last_date"):
         errors.append("TWSET86: ticker unavailable within provider budget")
     # V5.2.8 official mapping + EPS resolver guard: force the newest official MOPS quarter into the main payload.
-    try:
-        official_financial=await reconcile_official_financial_snapshot(ticker, official_financial)
-    except Exception as e:
-        errors.append(f"OfficialReconcile: {type(e).__name__}")
+    if not official_financial.get("mapping_reconciled"):
+        try:
+            official_financial=await reconcile_official_financial_snapshot(ticker, official_financial)
+        except Exception as e:
+            errors.append(f"OfficialReconcile: {type(e).__name__}")
     eps_stack=await build_eps_stack(ticker, fin, official_financial, financial)
     financial_integrity=assess_financial_integrity(official_financial, eps_stack, today)
     # Official snapshot has highest priority for latest period margins/amounts.
@@ -3474,8 +3539,16 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
           "source_status":source_status,"evidence_graph":evidence_graph,"research_pipeline":research_pipeline,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,"twstock_mcp":mcp_snapshot,
           "cashflow":{"institutional":institutional_payload.get("institutional") or {},"institutional_source":institutional_source,"last_date":flow.get("last_date")},"version":APP_VERSION,
-          "data_policy":"V5.4.1 Cross-Validation：所有資料先正規化為 Evidence Record，依官方性、新鮮度、期間與衝突檢查後才進研究模型；Fact、Derived Fact、Estimate 分層；TWStock MCP 僅作第二來源交叉驗證，不靜默覆蓋官方值。"}
-    _CACHE[ticker]=(time.time(),data)
+          "data_policy":"V5.4.1 Cross-Validation：所有資料先正規化為 Evidence Record，依官方性、新鮮度、期間與衝突檢查後才進研究模型；Fact、Derived Fact、Estimate 分層；TWStock MCP 僅作第二來源交叉驗證，不靜默覆蓋官方值。",
+          "history_cache_at_used":history_cache_at_used,
+          "financial_backfill_status":(_OFFICIAL_FINANCIAL_JOBS.get(ticker) or {}).get("status")}
+    # A background history job may finish while this slower report is still
+    # building. Never let that older snapshot overwrite the newly completed
+    # official history for the full cache TTL.
+    if _history_revision(ticker) <= history_cache_at_used:
+        _CACHE[ticker]=(time.time(),data)
+    else:
+        data["cache"]["skipped_stale_history_write"] = True
     schedule_official_history(ticker)
     return data
 
@@ -3569,6 +3642,8 @@ async def history_diagnostics(ticker: str):
         "ticker": ticker, "version": APP_VERSION,
         "counts": {key: len(cached.get(key) or []) for key in ("institutional", "margin", "revenue")},
         "jobs": _OFFICIAL_HISTORY_JOBS.get(ticker, {}),
+        "financial_job": _OFFICIAL_FINANCIAL_JOBS.get(ticker, {}),
+        "financial_cached": ticker in _OFFICIAL_FINANCIAL_CACHE,
         "active": sorted(key.split(":",1)[1] for key, task in _OFFICIAL_HISTORY_TASKS.items()
                          if key.startswith(f"{ticker}:") and not task.done()),
     }, headers={"Cache-Control":"no-store"})
@@ -3588,7 +3663,10 @@ async def stock_pdf(ticker: str, refresh: bool = Query(True)):
 
 @app.post("/api/cache/clear")
 async def cache_clear():
-    _CACHE.clear(); return {"status":"ok","message":"cache cleared"}
+    _CACHE.clear()
+    _OFFICIAL_HISTORY_CACHE.clear()
+    _OFFICIAL_FINANCIAL_CACHE.clear()
+    return {"status":"ok","message":"cache cleared"}
 
 @app.get("/api/diagnostics/eps/{ticker}")
 async def eps_diagnostics(ticker: str):

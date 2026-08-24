@@ -3,6 +3,7 @@ const fmt=(v,d=1)=>v==null?'—':Number(v).toLocaleString('zh-TW',{maximumFracti
 const fmt0=v=>v==null?'—':Number(v).toLocaleString('zh-TW',{maximumFractionDigits:0});
 const pct=(v,d=1)=>v==null?'—':`${v>=0?'+':''}${Number(v).toFixed(d)}%`;
 let currentTicker='';
+let stockRequestSequence=0;
 let marginHistoryRefreshTimer=null;
 const marginHistoryRefreshAttempts={};
 
@@ -71,9 +72,9 @@ function bindCreditChartTooltips(series){
     svg.addEventListener('pointerdown',show);svg.addEventListener('pointermove',e=>{if(e.pointerType==='mouse'||e.buttons)show(e)});svg.addEventListener('pointerleave',()=>{tip.hidden=true});
   });
 }
-function scheduleMarginHistoryRefresh(ticker,seriesLength,revenueLength,institutionalLength){
+function scheduleMarginHistoryRefresh(ticker,seriesLength,revenueLength,institutionalLength,financialVerified){
   clearTimeout(marginHistoryRefreshTimer);
-  if(seriesLength>=21&&revenueLength>=24&&institutionalLength>=20){delete marginHistoryRefreshAttempts[ticker];return;}
+  if(seriesLength>=21&&revenueLength>=24&&institutionalLength>=20&&financialVerified){delete marginHistoryRefreshAttempts[ticker];return;}
   if((marginHistoryRefreshAttempts[ticker]||0)>=20)return;
   marginHistoryRefreshTimer=setTimeout(async()=>{if(currentTicker!==ticker)return;marginHistoryRefreshAttempts[ticker]=(marginHistoryRefreshAttempts[ticker]||0)+1;try{const response=await fetch(`/api/stock/${encodeURIComponent(ticker)}`,{cache:'no-store'}),data=await readApiResponse(response);if(response.ok&&currentTicker===ticker)render(data)}catch(e){console.warn('official history refresh pending',e)}},10000);
 }
@@ -225,12 +226,13 @@ function render(d){
 
   const f=d.financial||{}, r=d.revenue||{}, p=d.per||{}, es=d.eps_stack||{}, fi=d.financial_integrity||{};
   const diagLink=`<a class="diagnostic-link" href="/api/diagnostics/financial/${encodeURIComponent(d.ticker)}" target="_blank" rel="noopener noreferrer">查看官方資料診斷</a>`;
-  const staleNote=fi.official_verified ? `✅ ${fi.message||'官方最新財報期已驗證'}` : `⚠ ${fi.message||'財報最新季度尚未通過官方驗證'} · ${diagLink}`;
+  const staleText=fi.official_verified ? `✅ ${fi.message||'官方最新財報期已驗證'}` : `⚠ ${fi.message||'財報最新季度尚未通過官方驗證'}`;
+  const staleHtml=fi.official_verified?staleText:`${staleText} · ${diagLink}`;
   const perNote=fi.core_financials_allowed ? (p.last_date||'市場資料') : `${p.last_date||''} · 市場 PER 可顯示，但不代表財報已驗證`;
   $('fundamentalTable').innerHTML=[
     metric('最新月營收',fmt0(r.latest_revenue),r.revenue_period||''), metric('營收 YoY',pct(r.revenue_yoy),'年增率'),
     metric('單季 EPS',fmt(es.quarter_eps,2),`${es.quarter_period||'—'} · ${es.quarter_method_label||'資料不足'}`), metric('YTD EPS',fmt(es.ytd_eps,2),`${es.ytd_period||'—'} · ${es.ytd_method_label||''}`),
-    metric('TTM EPS',fmt(es.ttm_eps,2),`${es.ttm_period||'—'} · ${es.ttm_method_label||''}`), metric('財報來源',f.source||es.source||'—',`${f.period||f.statement_date||''} · ${staleNote}`),
+    metric('TTM EPS',fmt(es.ttm_eps,2),`${es.ttm_period||'—'} · ${es.ttm_method_label||''}`), metric('財報來源',f.source||es.source||'—',`${f.period||f.statement_date||''} · ${staleHtml}`),
     metric('毛利率',pct(f.gross_margin),f.period||'最新財報期'), metric('營益率',pct(f.operating_margin),f.period||'最新財報期'), metric('PER / PBR',`${fmt(p.per,1)}x / ${fmt(p.pbr,1)}x`,perNote)
   ].join('');
   const ledger=(es.evidence_ledger||[]);
@@ -241,13 +243,13 @@ function render(d){
   document.querySelector('.eps-ledger')?.insertAdjacentHTML('afterend',evidenceHtml);
   $('fundChart').innerHTML=revenueBarSvg(r.series||[]);
   bindRevenueTooltip(r.series||[]);
-  $('fundAnalysis').textContent=r.revenue_yoy==null?`營收年增資料不足。${staleNote}`:`最新月營收年增 ${pct(r.revenue_yoy)}；${fi.core_financials_allowed?`${es.quarter_period||'最新財報'} 單季 EPS ${fmt(es.quarter_eps,2)}、YTD EPS ${fmt(es.ytd_eps,2)}、TTM EPS ${fmt(es.ttm_eps,2)}。`:'財報 EPS 尚未通過最新季度閘門，不進核心估值。'} ${staleNote}`;
+  $('fundAnalysis').textContent=r.revenue_yoy==null?`營收年增資料不足。${staleText}`:`最新月營收年增 ${pct(r.revenue_yoy)}；${fi.core_financials_allowed?`${es.quarter_period||'最新財報'} 單季 EPS ${fmt(es.quarter_eps,2)}、YTD EPS ${fmt(es.ytd_eps,2)}、TTM EPS ${fmt(es.ttm_eps,2)}。`:'財報 EPS 尚未通過最新季度閘門，不進核心估值。'} ${staleText}`;
 
   const fl=d.flow||{};
   $('flowTable').innerHTML=flowMatrix(fl);
   $('marginHistoryCharts').innerHTML=marginHistoryDashboard(fl);
   bindCreditChartTooltips(fl.margin_history||[]);
-  scheduleMarginHistoryRefresh(d.ticker,(fl.margin_history||[]).length,(r.series||[]).length,fl.institutional_history_count||0);
+  scheduleMarginHistoryRefresh(d.ticker,(fl.margin_history||[]).length,(r.series||[]).length,fl.institutional_history_count||0,Boolean(fi.official_verified));
   const flows={外資:fl.foreign_20_amount,投信:fl.trust_20_amount,自營商:fl.dealer_20_amount};
   const available=Object.values(flows).filter(v=>v!=null), mx=Math.max(1,...available.map(Math.abs));
   $('flowBars').innerHTML=Object.entries(flows).map(([k,v])=>`<div class="flow-row"><span>${k} 20日</span><div class="flow-track"><div class="flow-fill ${v!=null&&v<0?'neg':''}" style="width:${v==null?0:Math.abs(v)/mx*100}%"></div></div><b>${money(v)}</b></div>`).join('');
@@ -322,6 +324,9 @@ async function readApiResponse(response){
 
 async function loadTicker(ticker, force=false){
   ticker=String(ticker||'').trim().toUpperCase();
+  const requestId=++stockRequestSequence;
+  currentTicker=ticker;
+  clearTimeout(marginHistoryRefreshTimer);
   $('errorBox').classList.add('hidden');
   if(!/^[0-9A-Z.-]{2,12}$/.test(ticker)){
     $('report').classList.add('hidden');
@@ -334,17 +339,19 @@ async function loadTicker(ticker, force=false){
     const path=`/api/stock/${encodeURIComponent(ticker)}${force?'?refresh=true':''}`;
     const r=await fetch(path,{method:'GET',headers:{'Accept':'application/json'},cache:force?'no-store':'default'});
     const j=await readApiResponse(r);
+    if(requestId!==stockRequestSequence)return;
     if(!r.ok) throw new Error(j.detail||j.message||`資料取得失敗（HTTP ${r.status}）`);
     try{render(j);}catch(renderError){
       console.error('render failed',renderError);
       throw new Error(`畫面產生失敗：${renderError?.message||'未知錯誤'}`);
     }
   }catch(e){
+    if(requestId!==stockRequestSequence)return;
     console.error('loadTicker failed',e);
     $('report').classList.add('hidden');
     $('errorBox').textContent=e?.message||'資料取得失敗，請稍後再試。';
     $('errorBox').classList.remove('hidden');
-  } finally {$('loading').classList.add('hidden'); $('searchBtn').disabled=false;}
+  } finally {if(requestId===stockRequestSequence){$('loading').classList.add('hidden'); $('searchBtn').disabled=false;}}
 }
 $('searchBtn').onclick=()=>loadTicker($('tickerInput').value.trim()); $('refreshBtn').onclick=()=>loadTicker($('tickerInput').value.trim(), true);
 $('tickerInput').addEventListener('keydown',e=>{if(e.key==='Enter')loadTicker(e.target.value.trim())});
