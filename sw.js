@@ -1,52 +1,10 @@
-const CACHE="ai-stock-v5.10.2";
-const SHELL=[
-  '/static/styles.css?v=5.10.2',
-  '/static/app.js?v=5.10.2',
-  '/static/v5101_hotfix.js?v=5.10.2',
-  '/static/manifest.webmanifest?v=5.10.2'
-];
-
-self.addEventListener('install',event=>{
-  event.waitUntil(
-    caches.keys()
-      .then(keys=>Promise.all(keys.map(k=>caches.delete(k))))
-      .then(()=>caches.open(CACHE))
-      .then(cache=>Promise.allSettled(SHELL.map(url=>cache.add(url))))
-      .then(()=>self.skipWaiting())
-  );
-});
-
-self.addEventListener('activate',event=>{
-  event.waitUntil(
-    caches.keys()
-      .then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k))))
-      .then(()=>self.clients.claim())
-  );
-});
-
+const CACHE='ai-stock-v5.11.0';
+const SHELL=['/static/styles.css?v=5.11.0','/static/app.js?v=5.11.0','/static/manifest.webmanifest?v=5.11.0'];
+self.addEventListener('install',event=>event.waitUntil(caches.keys().then(keys=>Promise.all(keys.map(k=>caches.delete(k)))).then(()=>caches.open(CACHE)).then(c=>Promise.allSettled(SHELL.map(u=>c.add(u)))).then(()=>self.skipWaiting())));
+self.addEventListener('activate',event=>event.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim())));
 self.addEventListener('fetch',event=>{
-  const url=new URL(event.request.url);
-  if(event.request.method!=='GET'||url.pathname.startsWith('/api/')||url.pathname==='/health') return;
-
-  if(event.request.mode==='navigate'||url.pathname==='/'){
-    event.respondWith(fetch(event.request,{cache:'no-store'}));
-    return;
-  }
-
-  if(url.pathname.startsWith('/static/')||url.pathname==='/sw.js'||url.pathname==='/app.js'){
-    event.respondWith(
-      fetch(event.request,{cache:'reload'})
-        .then(resp=>{
-          if(resp.ok&&url.pathname.startsWith('/static/')){
-            const copy=resp.clone();
-            caches.open(CACHE).then(cache=>cache.put(event.request,copy));
-          }
-          return resp;
-        })
-        .catch(()=>caches.match(event.request))
-    );
-    return;
-  }
-
-  event.respondWith(fetch(event.request).catch(()=>caches.match(event.request)));
+ const u=new URL(event.request.url);
+ if(event.request.method!=='GET'||u.pathname.startsWith('/api/')||u.pathname==='/health') return;
+ if(event.request.mode==='navigate'||u.pathname==='/'){event.respondWith(fetch(event.request,{cache:'no-store'}));return;}
+ if(u.pathname.startsWith('/static/')||u.pathname==='/sw.js') event.respondWith(fetch(event.request,{cache:'reload'}).catch(()=>caches.match(event.request)));
 });
