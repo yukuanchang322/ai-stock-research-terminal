@@ -25,10 +25,10 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
-from weasyprint import HTML
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
+APP_VERSION = "5.12.0"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -39,7 +39,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
-app = FastAPI(title="AI Stock Research Terminal", version="5.4.4")
+app = FastAPI(title="AI Stock Research Terminal", version=APP_VERSION)
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.mount("/static", StaticFiles(directory=ROOT), name="static")
 
@@ -188,6 +188,106 @@ async def openapi_json(base: str, path: str) -> list[dict[str, Any]]:
     async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0 AI-Stock-Research/5.3.2"}) as client:
         r=await client.get(base + path); r.raise_for_status(); data=r.json()
     return data if isinstance(data,list) else []
+
+
+def _twse_rows(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for table in payload.get("tables") or [payload]:
+        if not isinstance(table, dict):
+            continue
+        fields = table.get("fields") or []
+        for row in table.get("data") or []:
+            rows.append(row if isinstance(row, dict) else dict(zip(fields, row)))
+    return rows
+
+
+def _normalized_key(value: Any) -> str:
+    return re.sub(r"[\s　]", "", str(value or ""))
+
+
+def _twse_ticker_matches(row: dict[str, Any], ticker: str) -> bool:
+    target = str(ticker).strip()
+    for key, value in row.items():
+        normalized = _normalized_key(key).lower()
+        if any(token in normalized for token in ("證券代號", "股票代號", "code", "stock_id", "stockno")):
+            return _normalized_key(value).removesuffix(".0") == target
+    return False
+
+
+def _twse_number(row: dict[str, Any], includes: tuple[str, ...], excludes: tuple[str, ...] = ()) -> float | None:
+    for key, value in row.items():
+        normalized = _normalized_key(key)
+        if all(token in normalized for token in includes) and not any(token in normalized for token in excludes):
+            parsed = parse_num_text(value)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _t86_participant(row: dict[str, Any], participant: str) -> dict[str, float | None] | None:
+    tokens = {
+        "foreign": (("外陸資",), ("外資及陸資",), ("外資",)),
+        "trust": (("投信",),),
+        "dealer": (("自營商",),),
+    }[participant]
+    # The official foreign fields contain the phrase "不含外資自營商"; excluding
+    # every key containing 自營商 incorrectly removes the desired row itself.
+    excludes: tuple[str, ...] = ()
+
+    def find(kind: str) -> float | None:
+        for token_set in tokens:
+            value = _twse_number(row, token_set + (kind,), excludes)
+            if value is not None:
+                return value
+        return None
+
+    buy, sell, net = find("買進"), find("賣出"), find("買賣超")
+    if participant == "dealer" and (buy is None or sell is None):
+        dealer_buy = [_twse_number(row, ("自營商", "買進", kind)) for kind in ("自行買賣", "避險")]
+        dealer_sell = [_twse_number(row, ("自營商", "賣出", kind)) for kind in ("自行買賣", "避險")]
+        if buy is None and any(value is not None for value in dealer_buy):
+            buy = sum(value or 0 for value in dealer_buy)
+        if sell is None and any(value is not None for value in dealer_sell):
+            sell = sum(value or 0 for value in dealer_sell)
+    if net is None and buy is not None and sell is not None:
+        net = buy - sell
+    return None if net is None else {"buy": buy, "sell": sell, "net": net}
+
+
+async def fetch_twse_t86_latest(ticker: str, price: float | None, anchor: date | None = None) -> dict[str, Any]:
+    """Fetch the nearest official T86 trading day using one stable schema."""
+    end = anchor or date.today()
+    attempts: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0 AI-Stock-Research"}) as client:
+        for back in range(12):
+            day = end - timedelta(days=back)
+            if day.weekday() >= 5:
+                continue
+            try:
+                response = await client.get("https://www.twse.com.tw/rwd/zh/fund/T86", params={"date": day.strftime("%Y%m%d"), "selectType": "ALL", "response": "json"})
+                response.raise_for_status()
+                rows = _twse_rows(response.json())
+                row = next((item for item in rows if _twse_ticker_matches(item, ticker)), None)
+                attempts.append({"date": day.isoformat(), "rows": len(rows), "matched": bool(row)})
+                if not row:
+                    continue
+                institutional: dict[str, Any] = {}
+                flat: dict[str, Any] = {"last_date": day.isoformat()}
+                for participant in ("foreign", "trust", "dealer"):
+                    values = _t86_participant(row, participant)
+                    if not values:
+                        continue
+                    cash = {key: (value * price if value is not None and price else None) for key, value in values.items()}
+                    cash.update({"shares_net": values["net"], "days": 1})
+                    institutional[participant] = {"1": cash}
+                    flat[f"{participant}_1"] = cash["net"] if cash["net"] is not None else values["net"]
+                if institutional:
+                    return {"institutional": institutional, "flow": flat, "last_date": day.isoformat(), "source": "TWSE T86 official", "attempts": attempts}
+            except Exception as exc:
+                attempts.append({"date": day.isoformat(), "error": type(exc).__name__})
+    return {"institutional": {}, "flow": {}, "last_date": None, "source": "TWSE T86 official", "attempts": attempts}
 
 
 
@@ -2704,6 +2804,18 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         except Exception as e:
             errors.append(f"TWSEStockDayFallback: {type(e).__name__}")
     tech=calc_technical(prices); flow=calc_flow(inst,margin); revenue=calc_revenue(rev); perdata=calc_per(pers); financial=calc_financials(fin)
+    institutional_source = "FinMind TaiwanStockInstitutionalInvestorsBuySellWide"
+    institutional_payload: dict[str, Any] = {}
+    if not flow.get("last_date"):
+        try:
+            institutional_payload = await fetch_twse_t86_latest(ticker, tech.get("last"))
+            if institutional_payload.get("institutional"):
+                flow.update(institutional_payload.get("flow") or {})
+                institutional_source = institutional_payload["source"]
+            else:
+                errors.append("TWSET86: ticker unavailable on nearest official trading days")
+        except Exception as e:
+            errors.append(f"TWSET86: {type(e).__name__}")
     try:
         official_financial=await fetch_official_income_statement(ticker)
     except Exception as e:
@@ -2776,7 +2888,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     evidence_graph=build_evidence_graph(ticker,tech,revenue,flow,perdata,financial,eps_stack,research,company_events,financial_integrity,mcp_snapshot)
     source_status=[
         {"name":"股價","dataset":price_source,"as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日約 17:30"},
-        {"name":"三大法人","dataset":"TaiwanStockInstitutionalInvestorsBuySellWide","as_of":flow.get("last_date"),"status":"ok" if flow.get("last_date") else "missing","scheduled_update":"交易日約 20:00"},
+        {"name":"三大法人","dataset":institutional_source,"as_of":flow.get("last_date"),"status":"ok" if flow.get("last_date") else "missing","scheduled_update":"交易日約 20:00"},
         {"name":"融資融券","dataset":"TaiwanStockMarginPurchaseShortSale","as_of":flow.get("margin_last_date"),"status":"ok" if flow.get("margin_last_date") else "missing","scheduled_update":"交易日約 21:00"},
         {"name":"月營收","dataset":"TaiwanStockMonthRevenue","as_of":revenue.get("last_date") or revenue.get("revenue_period"),"status":"ok" if revenue else "missing","scheduled_update":"依公司公告"},
         {"name":"PER/PBR","dataset":"TaiwanStockPER","as_of":perdata.get("last_date"),"status":"ok" if perdata else "missing","scheduled_update":"交易日約 18:00"},
@@ -2796,6 +2908,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
           "source_status":source_status,"evidence_graph":evidence_graph,"research_pipeline":research_pipeline,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,"twstock_mcp":mcp_snapshot,
+          "cashflow":{"institutional":institutional_payload.get("institutional") or {},"institutional_source":institutional_source,"last_date":flow.get("last_date")},"version":APP_VERSION,
           "data_policy":"V5.4.1 Cross-Validation：所有資料先正規化為 Evidence Record，依官方性、新鮮度、期間與衝突檢查後才進研究模型；Fact、Derived Fact、Estimate 分層；TWStock MCP 僅作第二來源交叉驗證，不靜默覆蓋官方值。"}
     _CACHE[ticker]=(time.time(),data)
     return data
@@ -2830,8 +2943,17 @@ def report_html(d: dict[str, Any]) -> str:
     </body></html>"""
 
 
+@app.middleware("http")
+async def runtime_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["X-AI-Stock-Version"] = APP_VERSION
+    if request.url.path == "/" or request.url.path.endswith((".js", ".css", ".webmanifest")):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return response
+
+
 @app.get("/")
-async def home(): return FileResponse(ROOT / "index.html")
+async def home(): return FileResponse(ROOT / "index.html", headers={"Cache-Control":"no-store, no-cache, must-revalidate, max-age=0"})
 @app.get("/app.js")
 async def js(): return FileResponse(ROOT / "app.js", media_type="application/javascript", headers={"Cache-Control":"no-cache"})
 @app.get("/styles.css")
@@ -2873,6 +2995,10 @@ async def stock_api(ticker: str, refresh: bool = Query(False)):
 
 @app.get("/api/stock/{ticker}/pdf")
 async def stock_pdf(ticker: str, refresh: bool = Query(True)):
+    try:
+        from weasyprint import HTML
+    except (ImportError, OSError):
+        raise HTTPException(503,"PDF 引擎目前不可用；網頁研究報告仍可正常使用。")
     d=await build_stock(ticker.strip(), force_refresh=refresh)
     if d["price"] is None: raise HTTPException(503,"目前無法取得股價資料，為避免輸出錯誤報告，PDF 未產生。")
     stamp=datetime.now().strftime("%Y%m%d_%H%M")
@@ -2985,4 +3111,4 @@ async def provider_health(ticker: str):
     return JSONResponse(result,headers={"Cache-Control":"no-store"})
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":"5.4.4","mode":"cloud-mobile-hard-provider-isolation","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":True}
+async def health(): return {"status":"ok","version":APP_VERSION,"mode":"single-entrypoint-official-fallbacks","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":False}
