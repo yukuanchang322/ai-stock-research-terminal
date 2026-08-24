@@ -29,7 +29,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.15.9"
+APP_VERSION = "5.16.0"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -300,7 +300,7 @@ async def fetch_twse_t86_latest(ticker: str, price: float | None, anchor: date |
     return {"institutional": {}, "flow": {}, "last_date": None, "source": "TWSE T86 official", "attempts": attempts}
 
 
-OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.9"}
+OFFICIAL_JSON_HEADERS = {"User-Agent": f"Mozilla/5.0 AI-Stock-Research/{APP_VERSION}"}
 
 
 def _roc_date(raw: Any) -> str:
@@ -3283,6 +3283,23 @@ def require_numeric_taiwan_ticker(value: Any) -> str:
     return ticker
 
 
+def normalize_market_type(value: Any) -> str:
+    market = str(value or "").strip()
+    lowered = market.lower()
+    if lowered in {"tpex", "otc", "上櫃"}:
+        return "上櫃"
+    if lowered in {"twse", "tse", "上市"}:
+        return "上市"
+    return market
+
+
+def merge_market_rows_by_date(base: list[dict[str, Any]], official: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Preserve history while allowing the official row to win on the same date."""
+    merged = {str(row.get("date")): row for row in base if row.get("date")}
+    merged.update({str(row.get("date")): row for row in official if row.get("date")})
+    return [merged[key] for key in sorted(merged)]
+
+
 def parse_tpex_stock_day_payload(payload: dict[str, Any], ticker: str | None = None) -> list[dict[str, Any]]:
     if str(payload.get("stat") or "").lower() != "ok":
         raise RuntimeError(str(payload.get("stat") or "TPEx response is not ok"))
@@ -3494,16 +3511,20 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         cached = dict(_CACHE[ticker][1]); cached["cache"] = {"hit": True, "ttl_seconds": CACHE_TTL}; return cached
     today = date.today(); errors: list[str] = []
     async def grab(dataset: str, days: int):
-        if not FINMIND_TOKEN:
-            return []
+        # FinMind supports a bounded anonymous quota.  Render intentionally has
+        # no token, but skipping the provider entirely removed the only
+        # independent fallback when TPEx rejected the Render egress address.
+        # Keep the same request path in token and anonymous modes; failures are
+        # still isolated per dataset and never overwrite official rows.
         try: return await finmind(dataset, ticker, today - timedelta(days=days), today)
         except Exception as e: errors.append(f"{dataset}: {type(e).__name__}"); return []
     async def info_grab():
-        if not FINMIND_TOKEN:
-            return {}
         try:
-            infos = await finmind("TaiwanStockInfo")
-            return next((x for x in infos if str(x.get("stock_id")) == ticker), {})
+            infos = await finmind("TaiwanStockInfo", ticker)
+            info = next((x for x in infos if str(x.get("stock_id")) == ticker), {})
+            if info.get("type"):
+                info = {**info, "type": normalize_market_type(info.get("type"))}
+            return info
         except Exception as e: errors.append(f"TaiwanStockInfo: {type(e).__name__}"); return {}
 
     # Start every independent official chain together. On a free single-worker
@@ -3512,11 +3533,15 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     supplements_task = asyncio.create_task(asyncio.wait_for(fetch_official_market_supplements(ticker, today, history_days=0), timeout=16))
     official_financial_task = schedule_official_financial(ticker)
     async def official_market_context():
-        official_info, info_errors = await fetch_official_stock_info(ticker)
-        official_prices, provider, price_errors = await fetch_official_stock_day(ticker, official_info.get("type"))
+        # Company lookup and OHLC discovery do not depend on each other.  The
+        # former serial chain doubled the TPEx outage penalty on every new
+        # ticker and could hold an otherwise complete FinMind fallback for 55s.
+        (official_info, info_errors), (official_prices, provider, price_errors) = await asyncio.gather(
+            fetch_official_stock_info(ticker), fetch_official_stock_day(ticker)
+        )
         otc_supplements = await fetch_tpex_latest_supplements(ticker) if official_info.get("type") == "上櫃" else {}
         return official_info, official_prices, provider, info_errors + price_errors, otc_supplements
-    official_market_task = asyncio.create_task(asyncio.wait_for(official_market_context(), timeout=55))
+    official_market_task = asyncio.create_task(asyncio.wait_for(official_market_context(), timeout=24))
     info, prices, inst, margin, rev, pers, fin = await asyncio.gather(
         info_grab(),
         grab("TaiwanStockPrice",460),
@@ -3561,25 +3586,20 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         if history_data.get("revenue"):
             supplements["revenue"] = history_data["revenue"]
 
-    def merge_by_date(base: list[dict[str, Any]], official: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        merged = {str(row.get("date")): row for row in base if row.get("date")}
-        merged.update({str(row.get("date")): row for row in official if row.get("date")})
-        return [merged[key] for key in sorted(merged)]
-
     # TWSE is authoritative for market flows and the latest published figures.
     # FinMind history remains useful, but an official row wins on the same date.
     if supplements.get("institutional"):
-        inst = supplements["institutional"]
+        inst = merge_market_rows_by_date(inst, supplements["institutional"])
         if not info.get("stock_name"):
             official_name = next((row.get("_company_name") for row in reversed(inst) if row.get("_company_name")), None)
             if official_name:
                 info["stock_name"] = official_name
     if supplements.get("margin"):
-        margin = supplements["margin"]
+        margin = merge_market_rows_by_date(margin, supplements["margin"])
     if supplements.get("revenue"):
-        rev = merge_by_date(rev, supplements["revenue"])
+        rev = merge_market_rows_by_date(rev, supplements["revenue"])
     if supplements.get("valuation"):
-        pers = merge_by_date(pers, supplements["valuation"])
+        pers = merge_market_rows_by_date(pers, supplements["valuation"])
 
     tech=calc_technical(prices); flow=calc_flow(inst,margin,None,prices); revenue=calc_revenue(rev); perdata=calc_per(pers); financial=calc_financials(fin)
     flow["institutional_history_count"]=len({str(row.get("date")) for row in inst if row.get("date")})
@@ -3954,4 +3974,4 @@ async def provider_health(ticker: str):
     return JSONResponse(result,headers={"Cache-Control":"no-store"})
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":APP_VERSION,"mode":"single-entrypoint-official-fallbacks","finmind_token":bool(FINMIND_TOKEN),"cache_ttl_seconds":CACHE_TTL,"pwa":False}
+async def health(): return {"status":"ok","version":APP_VERSION,"mode":"single-entrypoint-official-fallbacks","finmind_token":bool(FINMIND_TOKEN),"finmind_mode":"token" if FINMIND_TOKEN else "anonymous-fallback","cache_ttl_seconds":CACHE_TTL,"pwa":False}
