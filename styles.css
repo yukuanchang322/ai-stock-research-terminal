@@ -124,6 +124,13 @@ html,body{max-width:100%;overflow-x:hidden}body{padding-bottom:calc(92px + env(s
 .section{padding:20px 14px}.section-title{align-items:flex-start;flex-wrap:wrap}.section-title h3{font-size:17px}.section-title .pill{display:none}.confidence{width:100%;padding-left:31px}
 .summary-grid .score-card{display:none}.summary-grid{gap:10px}.thesis-card,.target-card,.panel{padding:14px}.callout{display:grid;gap:5px}
 .metric-table{grid-template-columns:repeat(2,minmax(0,1fr))}.metric{min-width:0}.metric b,.metric em{overflow-wrap:anywhere}.levels{grid-template-columns:repeat(2,minmax(0,1fr))}
+
+/* V5.15.5: the mobile technical dashboard must size to all four charts. */
+.price-chart{height:auto;min-height:0;overflow:visible}
+.price-chart .candle-svg{height:250px}
+.price-chart .indicator-panel svg{height:92px}
+.levels{position:relative;margin-top:14px}
+#techAnalysis{position:relative;margin-top:14px}
 .flow-row{grid-template-columns:58px minmax(0,1fr) 78px}.flow-row b{text-align:right}.consensus-box{grid-template-columns:1fr auto}.consensus-box b{grid-row:auto}.consensus-box small{grid-column:1/-1}
 .table-scroll{overflow:visible;width:100%}.table-scroll table.clean-table{min-width:0;width:100%;display:block}.clean-table thead{display:none}.clean-table tbody{display:grid;gap:10px}.clean-table tr{display:grid;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:#0a171f}.clean-table td{display:grid;grid-template-columns:minmax(82px,.7fr) minmax(0,1.3fr);gap:10px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.06);overflow-wrap:anywhere}.clean-table td:last-child{border-bottom:0}.clean-table td::before{content:attr(data-label);color:var(--muted);font-size:10px;font-weight:600}.analyst-web-table a{max-width:100%;overflow-wrap:anywhere}
 .valuation-grid{gap:10px}.strategy-grid{grid-template-columns:1fr 1fr}.mobile-fold-toggle{display:inline-flex;align-items:center;justify-content:center;margin-left:auto;min-height:34px;padding:6px 11px;border:1px solid var(--line);background:#0a171f;color:var(--accent);font-size:11px}.mobile-fold.is-collapsed>:not(.section-title){display:none!important}.mobile-fold.is-collapsed{padding-bottom:12px}
