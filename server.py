@@ -2797,7 +2797,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     price_source="FinMind TaiwanStockPrice"
     if not prices:
         try:
-            prices=await fetch_twse_stock_day_history(ticker,13)
+            prices=await asyncio.wait_for(fetch_twse_stock_day_history(ticker,13), timeout=25)
             if prices:
                 price_source="TWSE STOCK_DAY fallback"
                 errors.append("TaiwanStockPrice: FinMind unavailable; TWSE fallback active")
@@ -2806,20 +2806,33 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     tech=calc_technical(prices); flow=calc_flow(inst,margin); revenue=calc_revenue(rev); perdata=calc_per(pers); financial=calc_financials(fin)
     institutional_source = "FinMind TaiwanStockInstitutionalInvestorsBuySellWide"
     institutional_payload: dict[str, Any] = {}
-    if not flow.get("last_date"):
+
+    async def official_financial_bounded():
         try:
-            institutional_payload = await fetch_twse_t86_latest(ticker, tech.get("last"))
-            if institutional_payload.get("institutional"):
-                flow.update(institutional_payload.get("flow") or {})
-                institutional_source = institutional_payload["source"]
-            else:
-                errors.append("TWSET86: ticker unavailable on nearest official trading days")
+            return await asyncio.wait_for(fetch_official_income_statement(ticker), timeout=28)
+        except Exception as e:
+            errors.append(f"OfficialFinancial: {type(e).__name__}")
+            return {"official":False,"errors":[type(e).__name__]}
+
+    async def institutional_bounded():
+        if flow.get("last_date"):
+            return {}
+        try:
+            return await asyncio.wait_for(fetch_twse_t86_latest(ticker, tech.get("last")), timeout=18)
         except Exception as e:
             errors.append(f"TWSET86: {type(e).__name__}")
-    try:
-        official_financial=await fetch_official_income_statement(ticker)
-    except Exception as e:
-        errors.append(f"OfficialFinancial: {type(e).__name__}"); official_financial={"official":False,"errors":[type(e).__name__]}
+            return {}
+
+    # Both official providers are independent; waiting for them serially made a
+    # free Render cold start exceed the browser/proxy request window.
+    official_financial, institutional_payload = await asyncio.gather(
+        official_financial_bounded(), institutional_bounded()
+    )
+    if institutional_payload.get("institutional"):
+        flow.update(institutional_payload.get("flow") or {})
+        institutional_source = institutional_payload["source"]
+    elif not flow.get("last_date"):
+        errors.append("TWSET86: ticker unavailable within provider budget")
     # V5.2.8 official mapping + EPS resolver guard: force the newest official MOPS quarter into the main payload.
     try:
         official_financial=await reconcile_official_financial_snapshot(ticker, official_financial)
@@ -2862,9 +2875,9 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
             return fb
 
     web_research, company_events, mcp_snapshot = await asyncio.gather(
-        _safe_provider("PublicWebResearch", fetch_public_research(ticker, company_name), {"rows":[],"errors":[]}),
-        _safe_provider("CompanyEvents", fetch_company_events(ticker, company_name), {"rows":[],"earnings_calls":[],"material_info":[],"errors":[]}),
-        _safe_provider("TWStockMCP", fetch_twstock_mcp_snapshot(ticker), {"provider":"TWStock MCP","status":"error","records":[]})
+        _safe_provider("PublicWebResearch", asyncio.wait_for(fetch_public_research(ticker, company_name), timeout=10), {"rows":[],"errors":[]}),
+        _safe_provider("CompanyEvents", asyncio.wait_for(fetch_company_events(ticker, company_name), timeout=10), {"rows":[],"earnings_calls":[],"material_info":[],"errors":[]}),
+        _safe_provider("TWStockMCP", asyncio.wait_for(fetch_twstock_mcp_snapshot(ticker), timeout=10), {"provider":"TWStock MCP","status":"error","records":[]})
     )
     # Final price rescue from MCP cross-check when both FinMind and TWSE history are unavailable.
     if not tech:
