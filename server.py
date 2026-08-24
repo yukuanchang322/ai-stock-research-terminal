@@ -28,7 +28,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.12.0"
+APP_VERSION = "5.13.0"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -289,6 +289,149 @@ async def fetch_twse_t86_latest(ticker: str, price: float | None, anchor: date |
             except Exception as exc:
                 attempts.append({"date": day.isoformat(), "error": type(exc).__name__})
     return {"institutional": {}, "flow": {}, "last_date": None, "source": "TWSE T86 official", "attempts": attempts}
+
+
+OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.13.0"}
+
+
+def _roc_date(raw: Any) -> str:
+    digits = "".join(c for c in str(raw or "") if c.isdigit())
+    if len(digits) == 7:
+        return f"{int(digits[:3]) + 1911:04d}-{digits[3:5]}-{digits[5:7]}"
+    if len(digits) == 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+    return ""
+
+
+def parse_twse_revenue_rows(payload: Any, ticker: str) -> list[dict[str, Any]]:
+    rows = payload if isinstance(payload, list) else []
+    hit = next((r for r in rows if str(r.get("公司代號") or "").strip() == ticker), None)
+    if not hit:
+        return []
+    digits = "".join(c for c in str(hit.get("資料年月") or "") if c.isdigit())
+    if len(digits) < 5:
+        return []
+    raw_year, month = int(digits[:-2]), int(digits[-2:])
+    year = raw_year + 1911 if raw_year < 1911 else raw_year
+    current = parse_num_text(hit.get("營業收入-當月營收") or hit.get("當月營收"))
+    prior = parse_num_text(hit.get("營業收入-去年當月營收") or hit.get("去年當月營收"))
+    # The MOPS OpenAPI reports revenue in NT$ thousands.
+    out = []
+    for y, value, source in ((year - 1, prior, "prior-year comparison"), (year, current, "current month")):
+        if value is not None:
+            out.append({"stock_id": ticker, "revenue_year": y, "revenue_month": month,
+                        "revenue": value * 1000, "date": f"{y:04d}-{month:02d}-01",
+                        "_source": f"TWSE/MOPS t187ap05_L {source}"})
+    return out
+
+
+def parse_twse_institutional_payload(payload: Any, ticker: str, day: str) -> list[dict[str, Any]]:
+    row = next((r for r in _twse_rows(payload) if _twse_ticker_matches(r, ticker)), None)
+    if not row:
+        return []
+    out = {"date": day, "stock_id": ticker, "_source": "TWSE T86 official"}
+    prefixes = {"foreign": "Foreign_Investor", "trust": "Investment_Trust", "dealer": "Dealer"}
+    for participant, prefix in prefixes.items():
+        values = _t86_participant(row, participant)
+        if values:
+            out[f"{prefix}_buy"] = values.get("buy")
+            out[f"{prefix}_sell"] = values.get("sell")
+    return [out] if len(out) > 3 else []
+
+
+def parse_twse_margin_payload(payload: Any, ticker: str, day: str) -> list[dict[str, Any]]:
+    tables = payload.get("tables") or [] if isinstance(payload, dict) else []
+    if not tables and isinstance(payload, dict) and payload.get("data"):
+        tables = [{"fields": payload.get("fields") or [], "data": payload.get("data") or []}]
+    for table in tables:
+        fields = table.get("fields") or []
+        for raw in table.get("data") or []:
+            row = dict(zip(fields, raw))
+            code = str(row.get("代號") or row.get("股票代號") or row.get("證券代號") or "").strip()
+            if code != ticker:
+                continue
+            # Some tables repeat generic balance headings: margin occupies the
+            # first block and short sale the second block.
+            if "今日餘額" in fields:
+                indexes = [i for i, field in enumerate(fields) if field == "今日餘額"]
+                margin = parse_num_text(raw[indexes[0]]) if indexes else None
+                short = parse_num_text(raw[indexes[1]]) if len(indexes) > 1 else None
+            else:
+                margin = _twse_number(row, ("融資", "今日餘額")) or _twse_number(row, ("融資", "餘額"))
+                short = _twse_number(row, ("融券", "今日餘額")) or _twse_number(row, ("融券", "餘額"))
+            if margin is not None or short is not None:
+                return [{"date": day, "stock_id": ticker, "MarginPurchaseTodayBalance": margin,
+                         "ShortSaleTodayBalance": short, "_source": "TWSE MI_MARGN official"}]
+    return []
+
+
+async def fetch_official_market_supplements(ticker: str, anchor: date | None = None) -> dict[str, Any]:
+    """Bounded official fallbacks for datasets that otherwise require FinMind."""
+    end = anchor or date.today()
+    async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=OFFICIAL_JSON_HEADERS) as client:
+        async def get_json(url: str, params: dict[str, Any] | None = None):
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            return response.json()
+
+        async def revenue():
+            return parse_twse_revenue_rows(await get_json("https://openapi.twse.com.tw/v1/opendata/t187ap05_L"), ticker)
+
+        async def valuation():
+            payload = await get_json("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL")
+            for row in payload if isinstance(payload, list) else []:
+                if str(row.get("Code") or row.get("證券代號") or "").strip() == ticker:
+                    return [{"date": _roc_date(row.get("Date") or row.get("日期")), "stock_id": ticker,
+                             "PER": parse_num_text(row.get("PEratio") or row.get("本益比")),
+                             "PBR": parse_num_text(row.get("PBratio") or row.get("股價淨值比")),
+                             "dividend_yield": parse_num_text(row.get("DividendYield") or row.get("殖利率")),
+                             "_source": "TWSE BWIBBU official"}]
+            return []
+
+        async def history(kind: str):
+            output = []
+            sem = asyncio.Semaphore(5)
+            async def one(day: date):
+                if day.weekday() >= 5:
+                    return []
+                path = "fund/T86" if kind == "institutional" else "marginTrading/MI_MARGN"
+                try:
+                    payload = await get_json(f"https://www.twse.com.tw/rwd/zh/{path}",
+                                             {"date": day.strftime("%Y%m%d"), "selectType": "ALL", "response": "json"})
+                    return (parse_twse_institutional_payload if kind == "institutional" else parse_twse_margin_payload)(payload, ticker, day.isoformat())
+                except Exception:
+                    return []
+            async def guarded(day: date):
+                async with sem:
+                    return await one(day)
+            # Resolve the newest trading day before launching history requests;
+            # this avoids a rate-limited batch silently making the data stale.
+            async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=OFFICIAL_JSON_HEADERS) as latest_client:
+                for i in range(12):
+                    day = end - timedelta(days=i)
+                    if day.weekday() >= 5:
+                        continue
+                    path = "fund/T86" if kind == "institutional" else "marginTrading/MI_MARGN"
+                    try:
+                        response = await latest_client.get(f"https://www.twse.com.tw/rwd/zh/{path}",
+                                                           params={"date": day.strftime("%Y%m%d"), "selectType": "ALL", "response": "json"})
+                        response.raise_for_status()
+                        parser = parse_twse_institutional_payload if kind == "institutional" else parse_twse_margin_payload
+                        latest = parser(response.json(), ticker, day.isoformat())
+                    except Exception:
+                        latest = []
+                    if latest:
+                        output.extend(latest)
+                        break
+            batches = await asyncio.gather(*(guarded(end - timedelta(days=i)) for i in range(45)))
+            for batch in batches:
+                output.extend(batch)
+            dedup = {row["date"]: row for row in output}
+            return [dedup[key] for key in sorted(dedup)][-21:]
+
+        results = await asyncio.gather(revenue(), valuation(), history("institutional"), history("margin"), return_exceptions=True)
+    keys = ("revenue", "valuation", "institutional", "margin")
+    return {key: ([] if isinstance(value, Exception) else value) for key, value in zip(keys, results)}
 
 
 
@@ -2149,7 +2292,7 @@ def calc_technical(prices: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]]) -> dict[str, Any]:
+def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]], lending: dict[str, Any] | None = None) -> dict[str, Any]:
     df=pd.DataFrame(rows)
     result: dict[str,Any]={}
     if not df.empty:
@@ -2157,34 +2300,49 @@ def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]]) -> 
             if c not in ("date","stock_id"):
                 df[c]=pd.to_numeric(df[c],errors="coerce").fillna(0)
         df=df.sort_values("date")
-        def net(prefix:str,n:int)->float:
+        def net(prefix:str,n:int)->float | None:
             buy=[c for c in df.columns if c.startswith(prefix) and c.endswith("_buy")]
             sell=[c for c in df.columns if c.startswith(prefix) and c.endswith("_sell")]
+            if len(df) < n or not (buy or sell):
+                return None
             tail=df.tail(n)
-            return float(tail[buy].sum().sum()-tail[sell].sum().sum()) if buy or sell else 0.0
-        result.update({
+            return float(tail[buy].sum().sum()-tail[sell].sum().sum())
+        values = {
             "foreign_1":net("Foreign_",1),"foreign_5":net("Foreign_",5),"foreign_20":net("Foreign_",20),
             "trust_1":net("Investment_Trust",1),"trust_5":net("Investment_Trust",5),"trust_20":net("Investment_Trust",20),
             "dealer_1":net("Dealer",1),"dealer_5":net("Dealer",5),"dealer_20":net("Dealer",20),
-            "last_date":str(df.iloc[-1]["date"]),
-        })
+        }
+        result.update(values)
+        if any(value is not None for value in values.values()):
+            result["last_date"] = str(df.iloc[-1]["date"])
 
     mdf=pd.DataFrame(margin_rows)
     if not mdf.empty and "MarginPurchaseTodayBalance" in mdf.columns:
         mdf["MarginPurchaseTodayBalance"]=pd.to_numeric(mdf["MarginPurchaseTodayBalance"],errors="coerce")
+        if "ShortSaleTodayBalance" in mdf.columns:
+            mdf["ShortSaleTodayBalance"]=pd.to_numeric(mdf["ShortSaleTodayBalance"],errors="coerce")
         mdf=mdf.sort_values("date").dropna(subset=["MarginPurchaseTodayBalance"])
         if not mdf.empty:
             latest=float(mdf.iloc[-1]["MarginPurchaseTodayBalance"])
-            def balance_change(n:int):
-                if len(mdf)<2: return None
-                idx=max(0,len(mdf)-1-n)
-                prior=float(mdf.iloc[idx]["MarginPurchaseTodayBalance"])
-                return ((latest/prior)-1)*100 if prior else None
+            def balance_change(n:int, column: str = "MarginPurchaseTodayBalance"):
+                if len(mdf)<=n or column not in mdf.columns: return None
+                prior=float(mdf.iloc[-1-n][column])
+                current=float(mdf.iloc[-1][column])
+                if pd.isna(prior) or pd.isna(current): return None
+                return ((current/prior)-1)*100 if prior else None
             result.update({
                 "margin_balance":latest,
                 "margin_1_pct":balance_change(1),"margin_5_pct":balance_change(5),"margin_20_pct":balance_change(20),
                 "margin_last_date":str(mdf.iloc[-1]["date"])
             })
+            if "ShortSaleTodayBalance" in mdf.columns and not pd.isna(mdf.iloc[-1]["ShortSaleTodayBalance"]):
+                short = float(mdf.iloc[-1]["ShortSaleTodayBalance"])
+                result.update({"short_balance": short, "short_1_pct": balance_change(1, "ShortSaleTodayBalance"),
+                               "short_5_pct": balance_change(5, "ShortSaleTodayBalance"),
+                               "short_20_pct": balance_change(20, "ShortSaleTodayBalance"),
+                               "short_margin_ratio_pct": (short / latest * 100) if latest else None})
+    if lending:
+        result.update(lending)
     return result
 
 
@@ -2785,6 +2943,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
             return next((x for x in infos if str(x.get("stock_id")) == ticker), {})
         except Exception as e: errors.append(f"TaiwanStockInfo: {type(e).__name__}"); return {}
 
+    supplements_task = asyncio.create_task(asyncio.wait_for(fetch_official_market_supplements(ticker, today), timeout=42))
     info, prices, inst, margin, rev, pers, fin = await asyncio.gather(
         info_grab(),
         grab("TaiwanStockPrice",460),
@@ -2804,8 +2963,30 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
                 errors.append("TaiwanStockPrice: FinMind unavailable; TWSE fallback active")
         except Exception as e:
             errors.append(f"TWSEStockDayFallback: {type(e).__name__}")
+    try:
+        supplements = await supplements_task
+    except Exception as e:
+        errors.append(f"OfficialMarketSupplements: {type(e).__name__}")
+        supplements = {"institutional": [], "margin": [], "revenue": [], "valuation": []}
+
+    def merge_by_date(base: list[dict[str, Any]], official: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged = {str(row.get("date")): row for row in base if row.get("date")}
+        merged.update({str(row.get("date")): row for row in official if row.get("date")})
+        return [merged[key] for key in sorted(merged)]
+
+    # TWSE is authoritative for market flows and the latest published figures.
+    # FinMind history remains useful, but an official row wins on the same date.
+    if supplements.get("institutional"):
+        inst = supplements["institutional"]
+    if supplements.get("margin"):
+        margin = supplements["margin"]
+    if supplements.get("revenue"):
+        rev = merge_by_date(rev, supplements["revenue"])
+    if supplements.get("valuation"):
+        pers = merge_by_date(pers, supplements["valuation"])
+
     tech=calc_technical(prices); flow=calc_flow(inst,margin); revenue=calc_revenue(rev); perdata=calc_per(pers); financial=calc_financials(fin)
-    institutional_source = "FinMind TaiwanStockInstitutionalInvestorsBuySellWide"
+    institutional_source = "TWSE T86 official history" if supplements.get("institutional") else "FinMind TaiwanStockInstitutionalInvestorsBuySellWide"
     institutional_payload: dict[str, Any] = {}
 
     async def official_financial_bounded():
@@ -2902,12 +3083,15 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     prev=tech.get("series",[])[-2]["close"] if len(tech.get("series",[]))>=2 else None
     change=((lp/prev-1)*100) if lp and prev else None
     evidence_graph=build_evidence_graph(ticker,tech,revenue,flow,perdata,financial,eps_stack,research,company_events,financial_integrity,mcp_snapshot)
+    margin_source = "TWSE MI_MARGN official history" if supplements.get("margin") else "FinMind TaiwanStockMarginPurchaseShortSale"
+    revenue_source = "TWSE/MOPS official latest + FinMind history" if supplements.get("revenue") else "FinMind TaiwanStockMonthRevenue"
+    valuation_source = "TWSE BWIBBU official latest + FinMind history" if supplements.get("valuation") else "FinMind TaiwanStockPER"
     source_status=[
         {"name":"股價","dataset":price_source,"as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日約 17:30"},
         {"name":"三大法人","dataset":institutional_source,"as_of":flow.get("last_date"),"status":"ok" if flow.get("last_date") else "missing","scheduled_update":"交易日約 20:00"},
-        {"name":"融資融券","dataset":"TaiwanStockMarginPurchaseShortSale","as_of":flow.get("margin_last_date"),"status":"ok" if flow.get("margin_last_date") else "missing","scheduled_update":"交易日約 21:00"},
-        {"name":"月營收","dataset":"TaiwanStockMonthRevenue","as_of":revenue.get("last_date") or revenue.get("revenue_period"),"status":"ok" if revenue else "missing","scheduled_update":"依公司公告"},
-        {"name":"PER/PBR","dataset":"TaiwanStockPER","as_of":perdata.get("last_date"),"status":"ok" if perdata else "missing","scheduled_update":"交易日約 18:00"},
+        {"name":"融資融券","dataset":margin_source,"as_of":flow.get("margin_last_date"),"status":"ok" if flow.get("margin_last_date") else "missing","scheduled_update":"交易日約 21:00"},
+        {"name":"月營收","dataset":revenue_source,"as_of":revenue.get("last_date") or revenue.get("revenue_period"),"status":"ok" if revenue else "missing","scheduled_update":"依公司公告"},
+        {"name":"PER/PBR","dataset":valuation_source,"as_of":perdata.get("last_date"),"status":"ok" if perdata else "missing","scheduled_update":"交易日約 18:00"},
         {"name":"財務報表","dataset":financial.get("source") or "FinMind TaiwanStockFinancialStatements","as_of":financial.get("period") or financial.get("statement_date"),"status":"ok" if financial_integrity.get("official_verified") else "stale","scheduled_update":"僅官方最新季度驗證通過才標示 OK"},
         {"name":"財報完整性閘門","dataset":"Official period gate","as_of":financial_integrity.get("official_period") or eps_stack.get("structured_api_period"),"status":"ok" if financial_integrity.get("core_financials_allowed") else "stale","scheduled_update":financial_integrity.get("message")},
         {"name":"公開法人研究","dataset":"Google News RSS + 公開網路引用","as_of":web_research.get("fetched_at"),"status":"ok" if web_research.get("rows") else "missing","scheduled_update":"每次強制刷新重新搜尋"},
