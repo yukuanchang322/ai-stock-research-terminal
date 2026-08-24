@@ -6,6 +6,7 @@ let currentTicker='';
 let stockRequestSequence=0;
 let marginHistoryRefreshTimer=null;
 const marginHistoryRefreshAttempts={};
+let candleViewState={ticker:'',size:0,end:0};
 
 function lineSvg(values){
   if(!values.length)return '<div class="empty">資料不足</div>';
@@ -104,7 +105,7 @@ function candleSvg(series){
   const dateIndexes=[0,.25,.5,.75,1].map(r=>Math.round(r*(data.length-1))).filter((v,i,a)=>a.indexOf(v)===i);
   const dateTicks=dateIndexes.map((i,j)=>{const xx=p+(i+.5)*xstep,anchor=j===0?'start':(j===dateIndexes.length-1?'end':'middle');return `<text class="candle-date" x="${xx}" y="${h-8}" text-anchor="${anchor}">${String(data[i]?.date||'').slice(0,10)}</text>`}).join('');
   const latest=data[data.length-1],previous=data[data.length-2],latestChange=previous?.close?((Number(latest.close)-Number(previous.close))/Number(previous.close)*100):null,latestY=y(latest.close);
-  return `<div class="candle-chart"><div class="tech-chart-title"><b>近一年日K</b><span>點選 K 棒，下方顯示日期與價位</span></div><svg class="candle-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="近一年日K，含日期與價格刻度">${priceTicks}<line class="axis" x1="${p}" y1="${h-p}" x2="${w-p}" y2="${h-p}"/>${candles}${p20}${p60}<line class="latest-price-line" x1="${p}" y1="${latestY}" x2="${w-p}" y2="${latestY}"/>${dateTicks}<g class="candle-crosshair" hidden><line class="crosshair-x" y1="${p}" y2="${h-p}"/><circle class="crosshair-dot" r="4"/></g><rect class="candle-hit" x="${p}" y="${p}" width="${w-2*p}" height="${h-2*p}"/></svg><div class="candle-details" aria-live="polite">${candleDetailsHtml(latest,latestChange)}</div><div class="chart-legend"><span>MA20</span><span>MA60</span></div></div>`;
+  return `<div class="candle-chart"><div class="tech-chart-title"><b>日K</b><span>點選價位 · 左右拖曳 · 雙指縮放</span></div><div class="candle-controls" aria-label="K線縮放控制"><button type="button" data-candle-action="zoom-in" aria-label="放大K線">＋</button><button type="button" data-candle-action="zoom-out" aria-label="縮小K線">－</button><button type="button" data-candle-action="reset">重設一年</button><span>${data.length} 個交易日</span></div><svg class="candle-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="日K，含日期與價格刻度，可縮放與左右移動">${priceTicks}<line class="axis" x1="${p}" y1="${h-p}" x2="${w-p}" y2="${h-p}"/>${candles}${p20}${p60}<line class="latest-price-line" x1="${p}" y1="${latestY}" x2="${w-p}" y2="${latestY}"/>${dateTicks}<g class="candle-crosshair" hidden><line class="crosshair-x" y1="${p}" y2="${h-p}"/><circle class="crosshair-dot" r="4"/></g><rect class="candle-hit" x="${p}" y="${p}" width="${w-2*p}" height="${h-2*p}"/></svg><div class="candle-details" aria-live="polite">${candleDetailsHtml(latest,latestChange)}</div><div class="chart-legend"><span>MA20</span><span>MA60</span></div></div>`;
 }
 function candleDetailsHtml(row,change){
   const changeText=change==null?'—':`${change>=0?'+':''}${fmt(change,2)}%`;
@@ -116,6 +117,28 @@ function bindCandleTooltip(series){
   const w=720,h=300,p=42,vals=rows.flatMap(x=>[x.high,x.low,x.ma20,x.ma60].filter(v=>v!=null).map(Number)),min=Math.min(...vals),max=Math.max(...vals),range=max-min||1,y=v=>h-p-(Number(v)-min)*(h-2*p)/range;
   const show=e=>{const rect=svg.getBoundingClientRect(),ratio=Math.max(0,Math.min(1,(e.clientX-rect.left)/rect.width)),idx=Math.min(rows.length-1,Math.floor(ratio*rows.length)),row=rows[idx],prev=idx?Number(rows[idx-1].close):null,change=prev?((Number(row.close)-prev)/prev*100):null,cx=p+(idx+.5)*(w-2*p)/rows.length,cy=y(row.close);crosshair.querySelector('.crosshair-x').setAttribute('x1',cx);crosshair.querySelector('.crosshair-x').setAttribute('x2',cx);crosshair.querySelector('.crosshair-dot').setAttribute('cx',cx);crosshair.querySelector('.crosshair-dot').setAttribute('cy',cy);crosshair.hidden=false;details.innerHTML=candleDetailsHtml(row,change);};
   svg.addEventListener('pointerdown',show);svg.addEventListener('pointermove',e=>{if(e.pointerType==='mouse'||e.buttons)show(e)});svg.addEventListener('pointerleave',e=>{if(e.pointerType==='mouse')crosshair.hidden=true});
+}
+function candleWindow(rows){
+  const total=rows.length,size=Math.max(1,Math.min(total,candleViewState.size||total)),end=Math.max(size,Math.min(total,candleViewState.end||total));
+  candleViewState.size=size;candleViewState.end=end;
+  return rows.slice(end-size,end);
+}
+function rerenderCandle(rows){
+  const host=document.querySelector('.candle-host');if(!host)return;
+  const visible=candleWindow(rows);host.innerHTML=candleSvg(visible);bindCandleTooltip(visible);bindCandleZoomPan(rows);
+}
+function bindCandleZoomPan(series){
+  const rows=(series||[]).filter(x=>[x.open,x.high,x.low,x.close].every(v=>v!=null&&Number.isFinite(Number(v)))),chart=document.querySelector('.candle-chart'),svg=chart?.querySelector('.candle-svg');
+  if(rows.length<2||!chart||!svg)return;
+  const clamp=(v,min,max)=>Math.max(min,Math.min(max,v)),apply=(size,end)=>{candleViewState.size=clamp(Math.round(size),Math.min(20,rows.length),rows.length);candleViewState.end=clamp(Math.round(end),candleViewState.size,rows.length);rerenderCandle(rows);};
+  chart.querySelector('[data-candle-action="zoom-in"]')?.addEventListener('click',()=>apply(candleViewState.size*.7,candleViewState.end));
+  chart.querySelector('[data-candle-action="zoom-out"]')?.addEventListener('click',()=>apply(candleViewState.size*1.4,candleViewState.end));
+  chart.querySelector('[data-candle-action="reset"]')?.addEventListener('click',()=>apply(rows.length,rows.length));
+  const points=new Map();let gesture=null;
+  svg.addEventListener('pointerdown',e=>{if(e.pointerType!=='touch')return;points.set(e.pointerId,{x:e.clientX,y:e.clientY});svg.setPointerCapture?.(e.pointerId);if(points.size===1)gesture={kind:'pan',startX:e.clientX,size:candleViewState.size,end:candleViewState.end};else if(points.size===2){const p=[...points.values()],distance=Math.hypot(p[0].x-p[1].x,p[0].y-p[1].y);gesture={kind:'pinch',distance,size:candleViewState.size,end:candleViewState.end,currentDistance:distance}}});
+  svg.addEventListener('pointermove',e=>{if(!points.has(e.pointerId))return;points.set(e.pointerId,{x:e.clientX,y:e.clientY});if(gesture?.kind==='pinch'&&points.size>=2){const p=[...points.values()];gesture.currentDistance=Math.hypot(p[0].x-p[1].x,p[0].y-p[1].y)}});
+  const finish=e=>{if(!points.has(e.pointerId))return;const point=points.get(e.pointerId);if(gesture?.kind==='pinch'){const distance=gesture.currentDistance||gesture.distance,center=gesture.end-gesture.size/2,newSize=gesture.size*gesture.distance/Math.max(1,distance);points.clear();gesture=null;apply(newSize,center+newSize/2);return}if(gesture?.kind==='pan'&&points.size===1){const dx=point.x-gesture.startX;if(Math.abs(dx)>12){const shift=-dx/svg.getBoundingClientRect().width*gesture.size;points.clear();const g=gesture;gesture=null;apply(g.size,g.end+shift);return}}points.delete(e.pointerId);if(!points.size)gesture=null;};
+  svg.addEventListener('pointerup',finish);svg.addEventListener('pointercancel',finish);
 }
 function oscillatorSvg(series,keys,title,minFixed=null,maxFixed=null,levels=[]){
   if(!series?.length)return '';
@@ -140,7 +163,7 @@ function macdSvg(series){
 }
 function technicalDashboard(t){
   const s=t.series||[];
-  return `<div class="technical-dashboard">${candleSvg(s)}${oscillatorSvg(s,['k','d'],'KD',0,100,[20,80])}${macdSvg(s)}${oscillatorSvg(s,['rsi14'],'RSI 14',0,100,[30,70])}</div>`;
+  return `<div class="technical-dashboard"><div class="candle-host">${candleSvg(candleWindow(s))}</div>${oscillatorSvg(s,['k','d'],'KD',0,100,[20,80])}${macdSvg(s)}${oscillatorSvg(s,['rsi14'],'RSI 14',0,100,[30,70])}</div>`;
 }
 function metric(k,v,note=''){return `<div class="metric"><span>${k}</span><b>${v}</b><em>${note}</em></div>`}
 function targetRow(x){return `<div class="target-row ${x.name==='悲觀'?'bear':x.name==='樂觀'?'bull':'base'}"><span>${x.name}</span><b>${fmt0(x.target)}</b></div>`}
@@ -273,8 +296,10 @@ function render(d){
   $('flowAnalysis').textContent=`法人籌碼金額以每日淨買賣股數乘當日收盤價估算；短線看1日、波段轉折看5日、中期方向看20日。外資20日 ${direction(fl.foreign_20_amount)}，投信20日 ${direction(fl.trust_20_amount)}。`;
 
   const t=d.technical||{}; $('techPill').textContent=t.trend||'資料不足';
+  if(candleViewState.ticker!==d.ticker){candleViewState={ticker:d.ticker,size:(t.series||[]).length,end:(t.series||[]).length}}
   $('priceChart').innerHTML=technicalDashboard(t);
-  bindCandleTooltip(t.series||[]);
+  bindCandleTooltip(candleWindow(t.series||[]));
+  bindCandleZoomPan(t.series||[]);
   $('levels').innerHTML=[['MA20',t.ma?.['20']],['MA60',t.ma?.['60']],['第一支撐',t.support1],['60日壓力',t.resistance],['KD K',t.k],['KD D',t.d],['RSI14',t.rsi14],['MACD Hist',t.macd_hist]].map(x=>`<div class="level"><span>${x[0]}</span><b>${fmt(x[1],x[0].includes('MACD')?2:1)}</b></div>`).join('');
   $('techAnalysis').textContent=`近一年日K；MA60 為中期趨勢核心。趨勢：${t.trend||'—'}；K/D ${fmt(t.k,1)}/${fmt(t.d,1)}；MACD Hist ${fmt(t.macd_hist,2)}；RSI14 ${fmt(t.rsi14,1)}。KD >80 / <20、RSI >70 / <30 僅代表動能極端，需搭配均線與量價確認。`;
 
