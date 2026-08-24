@@ -50,11 +50,11 @@ class EpsStackTests(unittest.IsolatedAsyncioTestCase):
             stack = await server.build_eps_stack("2454", [], official, {})
         self.assertEqual(stack["quarter_eps"], 15.27)
         self.assertEqual(stack["quarter_method"], "official_ytd_difference")
-        self.assertEqual(stack["quarter_method_label"], "🧮 H1－Q1 回推，非公司單季公告")
+        self.assertEqual(stack["quarter_method_label"], "◇ 官方累計值差額推導（非公司單季公告）")
         self.assertEqual(stack["prior_ytd_eps"], 15.17)
         self.assertEqual(stack["quarter_derivation_inputs"]["prior"]["source"], "MOPS historical income statement summary")
 
-    async def test_never_mixes_finmind_predecessor_into_official_q2(self):
+    async def test_marks_finmind_predecessor_as_provisional(self):
         official = {
             "official": True, "period": "2026 Q2", "fiscal_year": 2026,
             "fiscal_quarter": 2, "ytd_eps": 30.44,
@@ -63,7 +63,9 @@ class EpsStackTests(unittest.IsolatedAsyncioTestCase):
         finmind = [{"date": "2026-03-31", "type": "BasicEarningsPerShare", "value": 15.17}]
         with patch("server.fetch_official_eps_for_period", return_value=None):
             stack = await server.build_eps_stack("2454", finmind, official, {})
-        self.assertIsNone(stack["quarter_eps"])
+        self.assertEqual(stack["quarter_eps"], 15.27)
+        self.assertEqual(stack["quarter_status"], "provisional")
+        self.assertEqual(stack["quarter_badge"], "△")
         self.assertIsNone(stack["prior_ytd_eps"])
 
     async def test_latest_official_q1_remains_visible_when_q2_is_unavailable(self):

@@ -226,24 +226,24 @@ function render(d){
 
   const f=d.financial||{}, r=d.revenue||{}, p=d.per||{}, es=d.eps_stack||{}, fi=d.financial_integrity||{};
   const diagLink=`<a class="diagnostic-link" href="/api/diagnostics/financial/${encodeURIComponent(d.ticker)}" target="_blank" rel="noopener noreferrer">查看官方資料診斷</a>`;
-  const staleText=fi.official_verified ? `✅ ${fi.message||'官方最新財報期已驗證'}` : `⚠ ${fi.message||'財報最新季度尚未通過官方驗證'}`;
+  const staleText=fi.official_verified ? `✅ ${fi.message||'官方最新財報期已驗證'}` : `△ ${fi.message||'財報最新季度尚未通過官方驗證'}；目前缺口以備援暫估，重新查詢取得官方值後自動覆蓋`;
   const staleHtml=fi.official_verified?staleText:`${staleText} · ${diagLink}`;
   const perNote=fi.core_financials_allowed ? (p.last_date||'市場資料') : `${p.last_date||''} · 市場 PER 可顯示，但不代表財報已驗證`;
   $('fundamentalTable').innerHTML=[
     metric('最新月營收',fmt0(r.latest_revenue),r.revenue_period||''), metric('營收 YoY',pct(r.revenue_yoy),'年增率'),
     metric('單季 EPS',fmt(es.quarter_eps,2),`${es.quarter_period||'—'} · ${es.quarter_method_label||'資料不足'}`), metric('YTD EPS',fmt(es.ytd_eps,2),`${es.ytd_period||'—'} · ${es.ytd_method_label||''}`),
     metric('TTM EPS',fmt(es.ttm_eps,2),`${es.ttm_period||'—'} · ${es.ttm_method_label||''}`), metric('財報來源',f.source||es.source||'—',`${f.period||f.statement_date||''} · ${staleHtml}`),
-    metric('毛利率',pct(f.gross_margin),f.period||'最新財報期'), metric('營益率',pct(f.operating_margin),f.period||'最新財報期'), metric('PER / PBR',`${fmt(p.per,1)}x / ${fmt(p.pbr,1)}x`,perNote)
+    metric('毛利率',pct(f.gross_margin),`${f.display_badge||'—'} ${f.period||f.statement_date||'最新可得'}${f.margin_sanity==='blocked_invalid_values'?' · 異常值已攔截':''}`), metric('營益率',pct(f.operating_margin),`${f.display_badge||'—'} ${f.period||f.statement_date||'最新可得'}${f.margin_sanity==='blocked_invalid_values'?' · 異常值已攔截':''}`), metric('PER / PBR',`${fmt(p.per,1)}x / ${fmt(p.pbr,1)}x`,perNote)
   ].join('');
   const ledger=(es.evidence_ledger||[]);
-  const ledgerHtml=ledger.length?`<div class="eps-ledger"><h4>EPS Evidence Ledger</h4><div class="ledger-list">${ledger.map(x=>`<div class="ledger-row ${x.status==='usable'?'ok':'missing'}"><b>${x.period}</b><span>${x.quarter_eps_direct!=null?`單季 ${fmt(x.quarter_eps_direct,2)}`:(x.ytd_eps!=null?`YTD ${fmt(x.ytd_eps,2)}`:'缺資料')}</span><small>${x.source||x.missing_reason||'無官方證據'}${x.derived_quarter_eps!=null?` · 推導單季 ${fmt(x.derived_quarter_eps,2)}`:''}</small></div>`).join('')}</div></div>`:'';
+  const ledgerHtml=ledger.length?`<div class="eps-ledger"><h4>EPS Evidence Ledger</h4><div class="ledger-list">${ledger.map(x=>`<div class="ledger-row ${x.status==='usable'?'ok':(x.status==='provisional'?'':'missing')}"><b>${x.period}</b><span>${x.status==='provisional'?'△ ':''}${x.quarter_eps_direct!=null?`單季 ${fmt(x.quarter_eps_direct,2)}`:(x.ytd_eps!=null?`YTD ${fmt(x.ytd_eps,2)}`:(x.derived_quarter_eps!=null?`暫估單季 ${fmt(x.derived_quarter_eps,2)}`:'缺資料'))}</span><small>${x.source||x.missing_reason||'無官方證據'}${x.derived_quarter_eps!=null&&x.status!=='provisional'?` · 推導單季 ${fmt(x.derived_quarter_eps,2)}`:''}</small></div>`).join('')}</div></div>`:'';
   $('fundamentalTable').insertAdjacentHTML('afterend',ledgerHtml);
   const eg=d.evidence_graph||{}, esum=eg.summary||{};
   const evidenceHtml=`<div class="evidence-matrix"><h4>Multi-Source Evidence Matrix</h4><div class="evidence-stats"><div><span>Evidence</span><b>${esum.usable??0}</b></div><div><span>官方/驗證</span><b>${esum.official_or_verified??0}</b></div><div><span>Fact</span><b>${esum.facts??0}</b></div><div><span>Derived</span><b>${esum.derived_facts??0}</b></div><div><span>Estimate</span><b>${esum.estimates??0}</b></div><div><span>真正衝突</span><b>${esum.conflicts??0}</b></div><div><span>預估修正</span><b>${esum.estimate_revisions??0}</b></div><div><span>Evidence Score</span><b>${esum.evidence_score??0}</b></div></div>${(eg.conflicts||[]).length?`<div class="evidence-conflicts"><b>同定義來源衝突</b>${eg.conflicts.slice(0,4).map(c=>`<small>${c.metric} ${c.period||''} · spread ${c.spread_pct}%</small>`).join('')}</div>`:'<small class="evidence-ok">目前核心 Fact 未偵測到同期間、同定義的重大來源衝突。</small>'}${(eg.estimate_revisions||[]).length?`<div class="evidence-revisions"><b>Estimate Revision</b>${eg.estimate_revisions.slice(-4).map(r=>`<small>${r.metric} ${r.period||''} · ${r.revision_pct==null?'—':`${r.revision_pct>0?'+':''}${r.revision_pct}%`}</small>`).join('')}</div>`:''}<a class="diagnostic-link" href="/api/evidence/${encodeURIComponent(d.ticker)}" target="_blank" rel="noopener noreferrer">查看完整 Evidence JSON</a></div>`;
   document.querySelector('.eps-ledger')?.insertAdjacentHTML('afterend',evidenceHtml);
   $('fundChart').innerHTML=revenueBarSvg(r.series||[]);
   bindRevenueTooltip(r.series||[]);
-  $('fundAnalysis').textContent=r.revenue_yoy==null?`營收年增資料不足。${staleText}`:`最新月營收年增 ${pct(r.revenue_yoy)}；${fi.core_financials_allowed?`${es.quarter_period||'最新財報'} 單季 EPS ${fmt(es.quarter_eps,2)}、YTD EPS ${fmt(es.ytd_eps,2)}、TTM EPS ${fmt(es.ttm_eps,2)}。`:'財報 EPS 尚未通過最新季度閘門，不進核心估值。'} ${staleText}`;
+  $('fundAnalysis').textContent=r.revenue_yoy==null?`營收年增資料不足。${staleText}`:`最新月營收年增 ${pct(r.revenue_yoy)}；${fi.core_financials_allowed?`${es.quarter_period||'最新財報'} 單季 EPS ${fmt(es.quarter_eps,2)}、YTD EPS ${fmt(es.ytd_eps,2)}、TTM EPS ${fmt(es.ttm_eps,2)}。`:(es.quarter_eps!=null?`${es.quarter_method_label}單季 EPS ${fmt(es.quarter_eps,2)}，僅供暫時分析，不進核心估值。`:'財報 EPS 尚未通過最新季度閘門，不進核心估值。')} ${staleText}`;
 
   const fl=d.flow||{};
   $('flowTable').innerHTML=flowMatrix(fl);
