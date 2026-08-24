@@ -41,6 +41,7 @@
 .candle.up line,.candle.up rect{stroke:#ff7f7f;fill:#ff7f7f}.candle.down line,.candle.down rect{stroke:#4ce0b3;fill:#4ce0b3}
 .candle-svg .ma20,.candle-svg .ma60,.indicator-line{fill:none;stroke-width:1.6;vector-effect:non-scaling-stroke}
 .candle-svg .ma20{stroke:#f0c766}.candle-svg .ma60{stroke:#8da7ff}
+.candle-chart{position:relative}.candle-svg{touch-action:pan-y}.price-tick line{stroke:#263b47;stroke-width:.8}.price-tick text,.candle-date{fill:#9aabb5!important;font-size:9px!important}.latest-price-line{stroke:#4ce0b3;stroke-width:1;stroke-dasharray:4 3}.latest-price-label{fill:#4ce0b3!important;font-size:9px!important;font-weight:700}.candle-hit{fill:transparent;pointer-events:all}.candle-crosshair{pointer-events:none}.candle-crosshair .crosshair-x{stroke:#d7e4ea;stroke-width:1;stroke-dasharray:3 3}.crosshair-dot{fill:#07131c;stroke:#fff;stroke-width:2}.candle-tooltip{position:absolute;top:36px;z-index:2;min-width:168px;transform:translateX(-50%);padding:9px 10px;border:1px solid #667783;border-radius:9px;background:rgba(5,12,17,.96);box-shadow:0 8px 24px rgba(0,0,0,.38);pointer-events:none}.candle-tooltip b,.candle-tooltip span{display:block}.candle-tooltip b{font-size:11px;margin-bottom:4px}.candle-tooltip span{color:#d1dade;font-size:10px;line-height:1.5}
 .chart-legend{display:flex;gap:14px;color:var(--muted);font-size:9px;margin:5px 0 1px}
 .chart-legend span:first-child:before{content:"— ";color:#f0c766}.chart-legend span:last-child:before{content:"— ";color:#8da7ff}
 .indicator-panel{background:#08141b;border:1px solid #18313e;border-radius:9px;padding:8px}.indicator-panel svg{width:100%;height:105px;display:block}
@@ -128,6 +129,7 @@ html,body{max-width:100%;overflow-x:hidden}body{padding-bottom:calc(92px + env(s
 /* V5.15.5: the mobile technical dashboard must size to all four charts. */
 .price-chart{height:auto;min-height:0;overflow:visible}
 .price-chart .candle-svg{height:250px}
+.price-chart .candle-tooltip{min-width:178px}.price-chart .price-tick text,.price-chart .candle-date,.price-chart .latest-price-label{font-size:11px!important}
 .price-chart .indicator-panel svg{height:92px}
 .levels{position:relative;margin-top:14px}
 #techAnalysis{position:relative;margin-top:14px}
