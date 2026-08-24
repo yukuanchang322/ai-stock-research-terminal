@@ -29,7 +29,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.16.1"
+APP_VERSION = "5.16.2"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -1706,6 +1706,29 @@ def finmind_eps_history(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if y and q and val is not None: out.append({"date":str(dt),"year":y,"quarter":q,"ytd_eps":val,"source":"FinMind"})
     return sorted(out,key=lambda x:x["date"])
 
+def guarded_margin(numerator: Any, revenue: Any, metric: str) -> tuple[float | None, str | None]:
+    """Calculate a displayable margin only when units and magnitude are plausible."""
+    n=safe_num(numerator); r=safe_num(revenue)
+    if n is None or r is None or r <= 0: return None,"missing_or_invalid_amount"
+    value=n/r*100; lower=-100.0 if metric=="gross_margin" else -200.0
+    if not math.isfinite(value) or value < lower or value > 100.0:
+        return None,"unit_or_period_mismatch"
+    return value,None
+
+def apply_financial_sanity(financial: dict[str, Any], direct_margins: dict[str, Any] | None=None) -> dict[str, Any]:
+    """Reject impossible ratios before they reach cards, scores, or narrative."""
+    direct_margins=direct_margins or {}; warnings=[]
+    for metric,amount_key in (("gross_margin","gross_profit"),("operating_margin","operating_income"),("net_margin","net_income")):
+        direct=safe_num(direct_margins.get(metric)); lower=-100.0 if metric=="gross_margin" else -200.0
+        if direct is not None and math.isfinite(direct) and lower <= direct <= 100.0:
+            financial[metric]=direct; continue
+        value,reason=guarded_margin(financial.get(amount_key),financial.get("revenue"),metric)
+        financial[metric]=value
+        if reason: warnings.append({"metric":metric,"reason":reason})
+    financial["margin_sanity"]="passed" if not warnings else "blocked_invalid_values"
+    financial["margin_warnings"]=warnings
+    return financial
+
 def _best_period_snapshot(rows: list[dict[str, Any]], year: int, quarter: int) -> dict[str, Any] | None:
     candidates=[r for r in rows if r.get("official") and r.get("fiscal_year")==year and r.get("fiscal_quarter")==quarter]
     if not candidates: return None
@@ -1930,44 +1953,55 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
                 "quarter_eps_direct":row.get("quarter_eps_direct"),"eps_provenance":row.get("eps_provenance"),
                 "confidence":row.get("eps_confidence")})
 
-    # Third-party history may be shown diagnostically, but never used to derive an official quarter.
+    # Structured history remains lower-priority. It may fill a display gap only with a provisional label.
     fin_map={(x["year"],x["quarter"]):float(x["ytd_eps"]) for x in fin_hist}
 
-    def standalone(year:int, quarter:int):
+    def standalone(year:int, quarter:int, allow_backup: bool=False):
         key=(year,quarter)
         if key in direct_quarter:
             p=provenance.get(key,{})
             method="official_registry_verified" if p.get("method")=="official_registry_verified" else "official_direct"
             return direct_quarter[key], method, p
         cur=official_ytd.get(key)
+        if cur is None and allow_backup:
+            cur=fin_map.get(key)
+            if cur is not None:
+                if quarter==1: return cur,"structured_api_q1",{"source":"FinMind","confidence":55}
+                prior=fin_map.get((year,quarter-1))
+                if prior is not None: return cur-prior,"structured_api_difference",{"source":"FinMind","confidence":55}
         if cur is None: return None,None,None
         if quarter==1:
             p=provenance.get(key,{})
             return cur,"official_ytd_q1",p
         prev=official_ytd.get((year,quarter-1))
+        if prev is None and allow_backup:
+            prev=fin_map.get((year,quarter-1))
+            if prev is not None:
+                return round(cur-prev,4),"hybrid_ytd_difference",{"source":"官方當期 YTD + FinMind 前期 YTD","confidence":65}
         if prev is None: return None,None,None
         p=provenance.get(key,{})
-        return cur-prev,"official_ytd_difference",p
+        return round(cur-prev,4),"official_ytd_difference",p
 
     quarter_eps=None; quarter_method=None; quarter_meta=None
     if fy and fq:
         if official.get("official"):
-            quarter_eps,quarter_method,quarter_meta=standalone(fy,fq)
+            quarter_eps,quarter_method,quarter_meta=standalone(fy,fq,allow_backup=True)
         elif ytd is not None:
             # Structured fallback only when no official period exists.
             if fq==1: quarter_eps=ytd; quarter_method="structured_api_q1"
             elif (fy,fq-1) in fin_map: quarter_eps=ytd-fin_map[(fy,fq-1)]; quarter_method="structured_api_difference"
 
-    quarters=[]
+    quarters=[]; ttm_provisional=False
     if fy and fq and official.get("official"):
         y,q=fy,fq; last4=[]
         for _ in range(4):
             last4.append((y,q)); q-=1
             if q==0: y-=1; q=4
         for y,q in reversed(last4):
-            val,method,meta=standalone(y,q)
+            val,method,meta=standalone(y,q,allow_backup=True)
             if val is not None:
                 quarters.append({"year":y,"quarter":q,"eps":val,"period":f"{y} Q{q}","method":method,"source":(meta or {}).get("source")})
+                if method in {"hybrid_ytd_difference","structured_api_q1","structured_api_difference"}: ttm_provisional=True
     ttm=sum(x["eps"] for x in quarters) if len(quarters)==4 else None
 
     latest_period=f"{fy} Q{fq}" if fy and fq else fallback_financial.get("statement_date")
@@ -1988,9 +2022,10 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
         for ly,lq in ledger_periods:
             key=(ly,lq); p=provenance.get(key,{})
             direct=direct_quarter.get(key); cumulative=official_ytd.get(key)
-            single,method,_meta=standalone(ly,lq)
+            single,method,_meta=standalone(ly,lq,allow_backup=True)
             diag=diag_by_period.get(f"{ly} Q{lq}",{})
-            status="usable" if (direct is not None or cumulative is not None) else "missing"
+            provisional_single=single is not None and method in {"hybrid_ytd_difference","structured_api_q1","structured_api_difference"}
+            status="provisional" if provisional_single else ("usable" if (direct is not None or cumulative is not None) else "missing")
             if direct is not None:
                 evidence_type="quarter_eps_direct"
             elif cumulative is not None:
@@ -2001,24 +2036,39 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
                 "period":f"{ly} Q{lq}","year":ly,"quarter":lq,"status":status,
                 "evidence_type":evidence_type,"quarter_eps_direct":direct,"ytd_eps":cumulative,
                 "derived_quarter_eps":single,"derivation_method":method,
-                "source":p.get("source") or diag.get("source"),
+                "source":p.get("source") or (_meta or {}).get("source") or diag.get("source"),
                 "source_url":p.get("endpoint") or diag.get("endpoint"),
-                "confidence":p.get("confidence") or diag.get("confidence"),
+                "confidence":p.get("confidence") or (_meta or {}).get("confidence") or diag.get("confidence"),
                 "lookup_status":diag.get("status") or ("current" if key==(fy,fq) else "unknown"),
-                "missing_reason":None if status=="usable" else (diag.get("error") or diag.get("status") or "no_official_evidence"),
+                "missing_reason":None if status in {"usable","provisional"} else (diag.get("error") or diag.get("status") or "no_official_evidence"),
                 "registry_verified": bool(p.get("method")=="official_registry_verified"),
                 "evidence_url": p.get("endpoint") or diag.get("endpoint")
             })
 
-    q_label={"official_direct":"✅ 公司/官方單季值","official_registry_verified":"✅ 官方 EPS Registry","official_ytd_q1":"✅ 官方 Q1 累計=單季","official_ytd_difference":"🧮 官方累計值差額推導",
+    q_label={"official_direct":"✅ 公司/官方單季值","official_registry_verified":"✅ 官方 EPS Registry","official_ytd_q1":"✅ 官方 Q1 累計=單季","official_ytd_difference":"◇ 官方累計值差額推導（非公司單季公告）","hybrid_ytd_difference":"△ 官方當期＋備援前期暫估",
              "structured_api_q1":"△ 結構化 API","structured_api_difference":"△ 結構化 API 差額"}.get(quarter_method,"資料不足")
+    provisional=quarter_method in {"hybrid_ytd_difference","structured_api_q1","structured_api_difference"}
+    derivation_inputs=None
+    if fy and fq and quarter_method in {"official_ytd_difference","hybrid_ytd_difference"}:
+        prior_key=(fy,fq-1)
+        prior_value=official_ytd.get(prior_key)
+        prior_meta=provenance.get(prior_key,{})
+        if prior_value is None:
+            prior_value=fin_map.get(prior_key); prior_meta={"source":"FinMind","confidence":55}
+        derivation_inputs={"current":{"value":official_ytd.get((fy,fq)),"source":official.get("source"),"official":True},
+                           "prior":{"value":prior_value,"source":prior_meta.get("source"),"official":prior_key in official_ytd}}
     return {
         "quarter_eps":quarter_eps,"quarter_period":latest_period,"quarter_method":quarter_method,"quarter_method_label":q_label,
+        "quarter_status":"provisional" if provisional else ("official_derived" if quarter_method in {"official_ytd_q1","official_ytd_difference"} else ("official" if quarter_eps is not None else "missing")),
+        "quarter_badge":"△" if provisional else ("◇" if quarter_method in {"official_ytd_q1","official_ytd_difference"} else ("✅" if quarter_eps is not None else "—")),
         "quarter_source":(quarter_meta or {}).get("source") if quarter_meta else source,
         "quarter_source_url":(quarter_meta or {}).get("endpoint") if quarter_meta else None,
+        "quarter_derivation_inputs":derivation_inputs,
         "ytd_eps":ytd,"ytd_period":f"{fy} Q{fq} YTD" if fy and fq else latest_period,
         "ytd_method_label":"✅ 官方累計值" if official.get("official") and ytd is not None else ("△ 結構化 API" if ytd is not None else "資料不足"),
-        "ttm_eps":ttm,"ttm_period":latest_period,"ttm_method_label":"✅ 四個實際單季加總" if ttm is not None else "四季官方單季資料不足",
+        "ttm_eps":ttm,"ttm_period":latest_period,"ttm_method_label":(("△ 含備援資料的四季暫估" if ttm_provisional else "✅ 四個實際單季加總") if ttm is not None else "四季資料不足"),
+        "ttm_status":"provisional" if ttm is not None and ttm_provisional else ("official" if ttm is not None else "missing"),
+        "replacement_policy":"每次查詢優先重取官方同期間資料；取得後自動覆蓋備援暫估。",
         "source":source,"official_period":official.get("period"),"history":quarters,
         "quality":"multi_source_official_eps" if official.get("official") else "structured_api",
         "structured_api_stale":stale_api,"structured_api_period":f"{api_latest[0]} Q{api_latest[1]}" if api_latest[0] else None,
@@ -2030,12 +2080,13 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
         "historical_backfill":{
             "attempted_periods":[x.get("period") for x in evidence_ledger[1:]],
             "resolved_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")=="usable"],
-            "missing_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")!="usable"],
-            "policy":"official_registry_then_company_ir_then_official_disclosure; no third-party EPS for official derivation",
+            "provisional_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")=="provisional"],
+            "missing_periods":[x.get("period") for x in evidence_ledger[1:] if x.get("status")=="missing"],
+            "policy":"official sources first; marked structured backup may fill display gaps and is replaced by a later official fetch",
         },
         "evidence_ledger_version":"5.4.4",
         "blocked_mops_html_removed":True,
-        "note":"V5.3.1 Evidence Engine EPS takeover：歷史季度優先讀取可稽核的公司官方 Registry，再以公司 IR/官方揭露補抓。Registry 每筆保留官方來源 URL；缺資料才留白，第三方 EPS 不參與官方推導。"
+        "note":"V5.16.2：官方資料永遠優先；缺口可用明確標示的備援值暫估，重新查詢取得官方同期間資料後自動覆蓋。備援值不冒充官方值。"
     }
 
 
@@ -2734,12 +2785,12 @@ def calc_financials(rows: list[dict[str, Any]]) -> dict[str, Any]:
     op = pick(["OperatingIncome", "營業利益"])
     net = pick(["NetIncome", "本期淨利", "ProfitLoss"])
     eps = pick(["BasicEarningsPerShare", "EarningsPerShare", "基本每股盈餘"])
-    return {
+    result = {
         "statement_date": str(latest_date), "revenue": revenue, "gross_profit": gross, "operating_income": op, "net_income": net, "eps": eps,
-        "gross_margin": (gross / revenue * 100) if gross is not None and revenue else None,
-        "operating_margin": (op / revenue * 100) if op is not None and revenue else None,
-        "net_margin": (net / revenue * 100) if net is not None and revenue else None,
+        "source":"FinMind TaiwanStockFinancialStatements","official":False,"provisional":True,"display_badge":"△",
+        "replacement_policy":"每次查詢優先重取官方同期間資料；取得後自動覆蓋備援值。",
     }
+    return apply_financial_sanity(result)
 
 
 def load_research(ticker: str) -> list[dict[str, Any]]:
@@ -3737,18 +3788,14 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
             "operating_income":official_financial.get("operating_income_ytd") if official_financial.get("operating_income_ytd") is not None else financial.get("operating_income"),
             "net_income":official_financial.get("net_income_ytd") if official_financial.get("net_income_ytd") is not None else financial.get("net_income"),
         })
-        if financial.get("revenue"):
-            financial["gross_margin"]=(financial.get("gross_profit")/financial["revenue"]*100) if financial.get("gross_profit") is not None else financial.get("gross_margin")
-            financial["operating_margin"]=(financial.get("operating_income")/financial["revenue"]*100) if financial.get("operating_income") is not None else financial.get("operating_margin")
-            financial["net_margin"]=(financial.get("net_income")/financial["revenue"]*100) if financial.get("net_income") is not None else financial.get("net_margin")
-        if official_financial.get("gross_margin_direct") is not None:
-            financial["gross_margin"]=official_financial.get("gross_margin_direct")
-        if official_financial.get("operating_margin_direct") is not None:
-            financial["operating_margin"]=official_financial.get("operating_margin_direct")
+        apply_financial_sanity(financial,{"gross_margin":official_financial.get("gross_margin_direct"),"operating_margin":official_financial.get("operating_margin_direct")})
+        financial["provisional"]=False; financial["display_badge"]="✅"
+        financial["replacement_policy"]="官方同期間資料已覆蓋備援值。"
     if not financial_integrity.get("official_verified"):
         financial["official"]=False
         financial["source"]=(financial.get("source") or "FinMind") + "（未通過官方最新季度驗證）"
         financial["integrity_warning"]=financial_integrity.get("message")
+        financial["provisional"]=True; financial["display_badge"]="△"
     company_name=info.get("stock_name") or ticker
     async def _safe_provider(label, coro, fallback):
         try:
