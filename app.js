@@ -183,9 +183,11 @@ function render(d){
 
   const fl=d.flow||{};
   $('flowTable').innerHTML=flowMatrix(fl);
-  const flows={外資:fl.foreign_20||0,投信:fl.trust_20||0,自營商:fl.dealer_20||0}, mx=Math.max(1,...Object.values(flows).map(Math.abs));
-  $('flowBars').innerHTML=Object.entries(flows).map(([k,v])=>`<div class="flow-row"><span>${k} 20日</span><div class="flow-track"><div class="flow-fill ${v<0?'neg':''}" style="width:${Math.abs(v)/mx*100}%"></div></div><b>${v>0?'+':''}${fmt0(v)}</b></div>`).join('');
-  $('flowAnalysis').textContent=`法人籌碼以 1日 / 5日 / 20日三個時間尺度判讀；短線看1日、波段轉折看5日、中期方向看20日。外資20日 ${fl.foreign_20>=0?'偏買超':'偏賣超'}，投信20日 ${fl.trust_20>=0?'偏買超':'偏賣超'}。`;
+  const flows={外資:fl.foreign_20,投信:fl.trust_20,自營商:fl.dealer_20};
+  const available=Object.values(flows).filter(v=>v!=null), mx=Math.max(1,...available.map(Math.abs));
+  $('flowBars').innerHTML=Object.entries(flows).map(([k,v])=>`<div class="flow-row"><span>${k} 20日</span><div class="flow-track"><div class="flow-fill ${v!=null&&v<0?'neg':''}" style="width:${v==null?0:Math.abs(v)/mx*100}%"></div></div><b>${v==null?'—':`${v>0?'+':''}${fmt0(v)}`}</b></div>`).join('');
+  const direction=v=>v==null?'資料不足':(v>=0?'偏買超':'偏賣超');
+  $('flowAnalysis').textContent=`法人籌碼以實際交易日的 1日 / 5日 / 20日尺度判讀；短線看1日、波段轉折看5日、中期方向看20日。外資20日 ${direction(fl.foreign_20)}，投信20日 ${direction(fl.trust_20)}。`;
 
   const t=d.technical||{}; $('techPill').textContent=t.trend||'資料不足';
   $('priceChart').innerHTML=technicalDashboard(t);
