@@ -1,4 +1,5 @@
 import unittest
+import re
 from pathlib import Path
 
 
@@ -19,9 +20,9 @@ class MobileTechnicalLayoutV5155Tests(unittest.TestCase):
         self.assertIn(".price-chart .indicator-panel svg{height:92px}",self.css)
 
     def test_mobile_assets_are_cache_busted(self):
-        self.assertIn("V5.15.5",self.html)
-        self.assertIn("/static/styles.css?v=5.15.5",self.html)
-        self.assertIn("/static/app.js?v=5.15.5",self.html)
+        version=re.search(r"data-app-version>V([^<]+)",self.html).group(1)
+        self.assertIn(f"/static/styles.css?v={version}",self.html)
+        self.assertIn(f"/static/app.js?v={version}",self.html)
 
 
 if __name__ == "__main__":
