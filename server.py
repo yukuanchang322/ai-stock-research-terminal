@@ -28,7 +28,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.14.0"
+APP_VERSION = "5.14.1"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -293,7 +293,7 @@ async def fetch_twse_t86_latest(ticker: str, price: float | None, anchor: date |
     return {"institutional": {}, "flow": {}, "last_date": None, "source": "TWSE T86 official", "attempts": attempts}
 
 
-OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.14.0"}
+OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.14.1"}
 
 
 def _roc_date(raw: Any) -> str:
