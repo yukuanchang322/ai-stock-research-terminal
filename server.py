@@ -28,7 +28,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.15.6"
+APP_VERSION = "5.15.7"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -40,6 +40,7 @@ CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _OFFICIAL_HISTORY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _OFFICIAL_HISTORY_TASKS: dict[str, asyncio.Task] = {}
+_OFFICIAL_HISTORY_JOBS: dict[str, dict[str, dict[str, Any]]] = {}
 _MCP_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _MCP_TASKS: dict[str, asyncio.Task] = {}
 
@@ -295,7 +296,7 @@ async def fetch_twse_t86_latest(ticker: str, price: float | None, anchor: date |
     return {"institutional": {}, "flow": {}, "last_date": None, "source": "TWSE T86 official", "attempts": attempts}
 
 
-OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.6"}
+OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.7"}
 
 
 def _roc_date(raw: Any) -> str:
@@ -506,49 +507,142 @@ async def fetch_official_market_supplements(ticker: str, anchor: date | None = N
     return {key: ([] if isinstance(value, Exception) else value) for key, value in zip(keys, results)}
 
 
-async def _warm_official_history(ticker: str) -> None:
+def _history_job(ticker: str, provider: str) -> dict[str, Any]:
+    jobs = _OFFICIAL_HISTORY_JOBS.setdefault(ticker, {})
+    return jobs.setdefault(provider, {"status": "queued", "rows": 0, "attempted_days": 0,
+                                      "errors": 0, "last_error": None, "updated_at": None})
+
+
+def _save_official_history(ticker: str, provider: str, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    prior = _OFFICIAL_HISTORY_CACHE.get(ticker)
+    merged = dict(prior[1]) if prior else {}
+    existing = merged.get(provider) or []
+    by_date = {str(row.get("date")): row for row in existing if row.get("date")}
+    by_date.update({str(row.get("date")): row for row in rows if row.get("date")})
+    limit = 60 if provider == "margin" else 24 if provider == "revenue" else 21
+    merged[provider] = [by_date[key] for key in sorted(by_date)][-limit:]
+    _OFFICIAL_HISTORY_CACHE[ticker] = (time.time(), merged)
+    _CACHE.pop(ticker, None)
+
+
+async def _warm_market_provider(ticker: str, provider: str) -> None:
+    job = _history_job(ticker, provider)
+    job.update(status="running", rows=0, attempted_days=0, errors=0, last_error=None,
+               started_at=datetime.now().astimezone().isoformat(timespec="seconds"))
+    target = 21 if provider == "institutional" else 60
+    lookback = 60 if provider == "institutional" else 130
+    path = "fund/T86" if provider == "institutional" else "marginTrading/MI_MARGN"
+    parser = parse_twse_institutional_payload if provider == "institutional" else parse_twse_margin_payload
     try:
-        # Keep MOPS monthly revenue independent from the heavier T86/MI_MARGN
-        # batches. A timeout in one provider must not discard another
-        # provider's completed history.
-        async def market_history():
-            try:
-                return await asyncio.wait_for(
-                    fetch_official_market_supplements(ticker, history_days=45, include_revenue_history=False), timeout=48)
-            except Exception:
-                return {}
-
-        async def revenue_history():
-            try:
-                async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=OFFICIAL_JSON_HEADERS) as client:
-                    return await asyncio.wait_for(fetch_mops_monthly_revenue_history(client, ticker, date.today(), 24), timeout=36)
-            except Exception:
-                return []
-
-        data, revenue = await asyncio.gather(market_history(), revenue_history())
-        if revenue:
-            data["revenue"] = revenue
-        if data.get("institutional") or data.get("margin") or data.get("revenue"):
-            # Preserve independently successful providers across partial warmups.
-            prior = _OFFICIAL_HISTORY_CACHE.get(ticker)
-            merged = dict(prior[1]) if prior else {}
-            for key in ("institutional", "margin", "revenue", "valuation"):
-                if data.get(key):
-                    merged[key] = data[key]
-            _OFFICIAL_HISTORY_CACHE[ticker] = (time.time(), merged)
-            _CACHE.pop(ticker, None)
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=OFFICIAL_JSON_HEADERS) as client:
+            collected: list[dict[str, Any]] = []
+            for offset in range(lookback):
+                day = date.today() - timedelta(days=offset)
+                if day.weekday() >= 5:
+                    continue
+                job["attempted_days"] += 1
+                last_error = None
+                for attempt in range(3):
+                    try:
+                        response = await client.get(
+                            f"https://www.twse.com.tw/rwd/zh/{path}",
+                            params={"date": day.strftime("%Y%m%d"), "selectType": "ALL", "response": "json"},
+                        )
+                        response.raise_for_status()
+                        rows = parser(response.json(), ticker, day.isoformat())
+                        if rows:
+                            collected.extend(rows)
+                        last_error = None
+                        break
+                    except Exception as exc:
+                        last_error = f"{type(exc).__name__}: {str(exc)[:120]}"
+                        job["errors"] += 1
+                        if attempt < 2:
+                            await asyncio.sleep(0.8 * (attempt + 1))
+                if last_error:
+                    job["last_error"] = last_error
+                unique_count = len({row["date"] for row in collected})
+                if collected and (unique_count % 4 == 0 or unique_count >= target):
+                    _save_official_history(ticker, provider, collected)
+                    job["rows"] = unique_count
+                    job["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+                if unique_count >= target:
+                    break
+                await asyncio.sleep(0.15)
+            _save_official_history(ticker, provider, collected)
+            job["rows"] = len({row["date"] for row in collected})
+            job["status"] = "complete" if job["rows"] >= (20 if provider == "institutional" else 21) else "partial"
+    except asyncio.CancelledError:
+        job["status"] = "cancelled"
+        raise
+    except Exception as exc:
+        job.update(status="error", last_error=f"{type(exc).__name__}: {str(exc)[:160]}")
     finally:
-        _OFFICIAL_HISTORY_TASKS.pop(ticker, None)
+        job["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        _OFFICIAL_HISTORY_TASKS.pop(f"{ticker}:{provider}", None)
+
+
+async def _warm_revenue_provider(ticker: str) -> None:
+    provider = "revenue"
+    job = _history_job(ticker, provider)
+    job.update(status="running", rows=0, attempted_days=0, errors=0, last_error=None,
+               started_at=datetime.now().astimezone().isoformat(timespec="seconds"))
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=OFFICIAL_JSON_HEADERS) as client:
+            cursor = date(date.today().year, date.today().month, 1) - timedelta(days=1)
+            collected: list[dict[str, Any]] = []
+            for _ in range(24):
+                year, month = cursor.year, cursor.month
+                cursor = date(year, month, 1) - timedelta(days=1)
+                job["attempted_days"] += 1
+                found: list[dict[str, Any]] = []
+                for market in ("sii", "otc"):
+                    for partition in (0, 1):
+                        try:
+                            response = await client.get(
+                                f"https://mopsov.twse.com.tw/nas/t21/{market}/t21sc03_{year - 1911}_{month}_{partition}.html"
+                            )
+                            response.raise_for_status()
+                            found = parse_mops_monthly_revenue_html(response.content, ticker, year, month)
+                        except Exception as exc:
+                            job["errors"] += 1
+                            job["last_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+                        if found:
+                            break
+                    if found:
+                        break
+                if found:
+                    collected.extend(found)
+                    _save_official_history(ticker, provider, collected)
+                    job["rows"] = len({row["date"] for row in collected})
+                    job["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+                await asyncio.sleep(0.15)
+            job["status"] = "complete" if job["rows"] >= 20 else "partial"
+    except asyncio.CancelledError:
+        job["status"] = "cancelled"
+        raise
+    except Exception as exc:
+        job.update(status="error", last_error=f"{type(exc).__name__}: {str(exc)[:160]}")
+    finally:
+        job["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        _OFFICIAL_HISTORY_TASKS.pop(f"{ticker}:{provider}", None)
 
 
 def schedule_official_history(ticker: str) -> None:
-    cached = _OFFICIAL_HISTORY_CACHE.get(ticker)
-    if cached and time.time() - cached[0] < 3600:
-        return
-    task = _OFFICIAL_HISTORY_TASKS.get(ticker)
-    if task and not task.done():
-        return
-    _OFFICIAL_HISTORY_TASKS[ticker] = asyncio.create_task(_warm_official_history(ticker))
+    cached_at, cached = _OFFICIAL_HISTORY_CACHE.get(ticker) or (0, {})
+    cache_is_fresh = time.time() - cached_at < 3600
+    requirements = {"institutional": 20, "margin": 21, "revenue": 20}
+    for provider, required in requirements.items():
+        if cache_is_fresh and len(cached.get(provider) or []) >= required:
+            continue
+        key = f"{ticker}:{provider}"
+        task = _OFFICIAL_HISTORY_TASKS.get(key)
+        if task and not task.done():
+            continue
+        worker = _warm_revenue_provider(ticker) if provider == "revenue" else _warm_market_provider(ticker, provider)
+        _OFFICIAL_HISTORY_TASKS[key] = asyncio.create_task(worker)
 
 
 
@@ -3464,6 +3558,20 @@ async def stock_api(ticker: str, refresh: bool = Query(False)):
             status_code=503,headers={"Cache-Control":"no-store"}
         )
     return JSONResponse(d,headers={"Cache-Control":"no-store"})
+
+@app.get("/api/diagnostics/history/{ticker}")
+async def history_diagnostics(ticker: str):
+    ticker=ticker.strip()
+    if not ticker.isdigit() or len(ticker) not in (4,5,6):
+        raise HTTPException(400,"請輸入有效台股代號")
+    cached = (_OFFICIAL_HISTORY_CACHE.get(ticker) or (0, {}))[1]
+    return JSONResponse({
+        "ticker": ticker, "version": APP_VERSION,
+        "counts": {key: len(cached.get(key) or []) for key in ("institutional", "margin", "revenue")},
+        "jobs": _OFFICIAL_HISTORY_JOBS.get(ticker, {}),
+        "active": sorted(key.split(":",1)[1] for key, task in _OFFICIAL_HISTORY_TASKS.items()
+                         if key.startswith(f"{ticker}:") and not task.done()),
+    }, headers={"Cache-Control":"no-store"})
 
 @app.get("/api/stock/{ticker}/pdf")
 async def stock_pdf(ticker: str, refresh: bool = Query(True)):

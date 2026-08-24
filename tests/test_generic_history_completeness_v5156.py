@@ -42,7 +42,8 @@ class GenericHistoryCompletenessV5156Tests(unittest.TestCase):
     def test_client_rechecks_background_history_promptly(self):
         js=(ROOT/"app.js").read_text(encoding="utf-8")
         self.assertIn("institutionalLength>=20",js)
-        self.assertIn("},8000);",js)
+        self.assertIn("},10000);",js)
+        self.assertIn(">=20",js)
         self.assertNotIn("},55000);",js)
 
     def test_source_status_distinguishes_warming_from_complete(self):
