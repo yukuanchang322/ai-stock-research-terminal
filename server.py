@@ -28,7 +28,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.15.3"
+APP_VERSION = "5.15.4"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -40,6 +40,8 @@ CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _OFFICIAL_HISTORY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _OFFICIAL_HISTORY_TASKS: dict[str, asyncio.Task] = {}
+_MCP_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_MCP_TASKS: dict[str, asyncio.Task] = {}
 
 app = FastAPI(title="AI Stock Research Terminal", version=APP_VERSION)
 app.add_middleware(GZipMiddleware, minimum_size=800)
@@ -293,7 +295,7 @@ async def fetch_twse_t86_latest(ticker: str, price: float | None, anchor: date |
     return {"institutional": {}, "flow": {}, "last_date": None, "source": "TWSE T86 official", "attempts": attempts}
 
 
-OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.3"}
+OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.4"}
 
 
 def _roc_date(raw: Any) -> str:
@@ -2822,6 +2824,28 @@ def _mcp_text_payload(resp_json: Any) -> Any:
             except Exception: return joined
     return result
 
+def _mcp_response_json(response: httpx.Response) -> dict[str,Any]:
+    """Decode JSON-RPC carried as JSON or Streamable HTTP SSE."""
+    ctype=(response.headers.get("content-type") or "").lower()
+    if "text/event-stream" not in ctype:
+        payload=response.json()
+        if not isinstance(payload,dict): raise ValueError("MCP response is not an object")
+        return payload
+    messages=[]
+    for line in response.text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        raw=line[5:].strip()
+        if not raw or raw=="[DONE]":
+            continue
+        try:
+            item=json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(item,dict): messages.append(item)
+    if not messages: raise ValueError("MCP SSE response has no JSON-RPC message")
+    return messages[-1]
+
 def _walk_dict_values(obj: Any, prefix: str="") -> list[tuple[str,Any]]:
     out=[]
     if isinstance(obj,dict):
@@ -2835,6 +2859,12 @@ def _walk_dict_values(obj: Any, prefix: str="") -> list[tuple[str,Any]]:
     return out
 
 def _extract_mcp_metric(obj: Any, aliases: list[str]) -> tuple[float|None,str|None]:
+    if isinstance(obj,str):
+        for alias in aliases:
+            match=re.search(rf"{re.escape(alias)}\s*[:：]\s*(-?[\d,]+(?:\.\d+)?)",obj,re.I)
+            if match:
+                value=parse_num_text(match.group(1))
+                if value is not None: return value,f"text:{alias}"
     pairs=_walk_dict_values(obj)
     for path,v in pairs:
         p=re.sub(r"[^a-z0-9\u4e00-\u9fff]","",path.lower())
@@ -2844,6 +2874,9 @@ def _extract_mcp_metric(obj: Any, aliases: list[str]) -> tuple[float|None,str|No
     return None,None
 
 def _extract_mcp_date(obj: Any) -> str|None:
+    if isinstance(obj,str):
+        compact=re.search(r"\b(20\d{2})(\d{2})(\d{2})\b",obj)
+        if compact: return f"{compact.group(1)}-{compact.group(2)}-{compact.group(3)}"
     for path,v in _walk_dict_values(obj):
         pl=path.lower()
         if any(k in pl for k in ["date","time","日期","交易日","reportdate","period"]):
@@ -2861,11 +2894,16 @@ def _args_for_mcp_tool(tool: dict[str,Any], ticker:str) -> dict[str,Any]:
     props=schema.get("properties") or {}
     required=set(schema.get("required") or [])
     args={}
-    ticker_keys=["ticker","stock_id","stockid","symbol","code","stock_code","stockcode","co_id","company_code"]
+    ticker_keys=["ticker","stock_id","stockid","symbol","code","stock_code","stockcode","stock_no","stockno","co_id","company_code"]
     for k,meta in props.items():
         lk=k.lower().replace("-","_")
-        if lk in ticker_keys or any(x==lk for x in ticker_keys):
+        typ=(meta or {}).get("type")
+        if lk in {"stock_nos","stock_ids","symbols","codes"} and typ=="array":
+            args[k]=[ticker]
+        elif lk in ticker_keys:
             args[k]=ticker
+        elif lk in {"date","trade_date","query_date"}:
+            args[k]=date.today().strftime("%Y%m%d")
         elif lk in {"market","exchange"}:
             args[k]="TWSE"
         elif lk in {"days","limit","count","n"}:
@@ -2873,7 +2911,6 @@ def _args_for_mcp_tool(tool: dict[str,Any], ticker:str) -> dict[str,Any]:
         elif lk in {"period","timeframe","interval"}:
             args[k]="1d"
         elif k in required:
-            typ=(meta or {}).get("type")
             if typ=="string": args[k]=ticker
             elif typ=="integer": args[k]=20
             elif typ=="number": args[k]=20
@@ -2891,17 +2928,22 @@ async def fetch_twstock_mcp_snapshot(ticker:str) -> dict[str,Any]:
     headers={"Accept":"application/json, text/event-stream","Content-Type":"application/json"}
     try:
         async with httpx.AsyncClient(timeout=12,follow_redirects=True,headers=headers) as client:
-            init={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":"5.4.4"}}}
+            init={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ai-stock-research-terminal","version":APP_VERSION}}}
             ir=await client.post(TWSTOCK_MCP_URL,json=init)
             out["initialize_status"]=ir.status_code
-            if ir.status_code>=500:
+            if ir.status_code>=400:
                 out.update({"status":"error","error":f"initialize HTTP {ir.status_code}"}); return out
+            ij=_mcp_response_json(ir)
+            if ij.get("error"):
+                out.update({"status":"error","error":f"initialize RPC error: {ij['error']}"}); return out
 
             lr=await client.post(TWSTOCK_MCP_URL,json={"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
             out["tools_list_status"]=lr.status_code
             if lr.status_code>=400:
                 out.update({"status":"error","error":f"tools/list HTTP {lr.status_code}","preview":lr.text[:400]}); return out
-            lj=lr.json()
+            lj=_mcp_response_json(lr)
+            if lj.get("error"):
+                out.update({"status":"error","error":f"tools/list RPC error: {lj['error']}"}); return out
             tools=((lj.get("result") or {}).get("tools") if isinstance(lj,dict) else None) or []
             out["discovered_tools"]=[{"name":t.get("name"),"description":(t.get("description") or "")[:140]} for t in tools[:80]]
             out["tool_count"]=len(tools)
@@ -2919,33 +2961,36 @@ async def fetch_twstock_mcp_snapshot(ticker:str) -> dict[str,Any]:
                 ranked=sorted((( _tool_score(t,words),t) for t in tools),key=lambda x:x[0],reverse=True)
                 if ranked and ranked[0][0]>0: chosen[cat]=ranked[0][1]
 
-            call_id=10
             raw_by_cat={}
-            for cat,tool in chosen.items():
+            async def call_one(cat,tool,call_id):
                 args=_args_for_mcp_tool(tool,ticker)
                 payload={"jsonrpc":"2.0","id":call_id,"method":"tools/call","params":{"name":tool.get("name"),"arguments":args}}
-                call_id+=1
                 try:
                     rr=await client.post(TWSTOCK_MCP_URL,json=payload)
                     rec={"category":cat,"tool":tool.get("name"),"args":args,"http_status":rr.status_code}
                     if rr.status_code<400:
                         try:
-                            decoded=_mcp_text_payload(rr.json())
-                            raw_by_cat[cat]=decoded
+                            decoded=_mcp_text_payload(_mcp_response_json(rr))
                             rec["status"]="ok"; rec["preview"]=str(decoded)[:240]
+                            return rec,decoded
                         except Exception as e:
                             rec["status"]="parse_error"; rec["error"]=f"{type(e).__name__}: {e}"
                     else:
                         rec["status"]="http_error"; rec["preview"]=rr.text[:240]
-                    out["tool_calls"].append(rec)
+                    return rec,None
                 except Exception as e:
-                    out["tool_calls"].append({"category":cat,"tool":tool.get("name"),"args":args,"status":"error","error":f"{type(e).__name__}: {e}"})
+                    return {"category":cat,"tool":tool.get("name"),"args":args,"status":"error","error":f"{type(e).__name__}: {e}"},None
+
+            results=await asyncio.gather(*(call_one(cat,tool,10+i) for i,(cat,tool) in enumerate(chosen.items())))
+            for (cat,_),(rec,decoded) in zip(chosen.items(),results):
+                out["tool_calls"].append(rec)
+                if decoded is not None: raw_by_cat[cat]=decoded
 
         metric_specs=[
-            ("close","quote",["close","price","lastprice","成交價","收盤價"],"TWD","market_close"),
+            ("close","quote",["close","price","lastprice","成交價","收盤價","成交"],"TWD","market_close"),
             ("foreign_20d","institutional",["foreign20","foreign_net","外資","外陸資"],None,"institutional_net_20d"),
             ("margin_balance","margin",["marginbalance","margin_purchase_balance","融資餘額"],None,"margin_balance"),
-            ("monthly_revenue","revenue",["revenue","monthlyrevenue","營收"],"TWD","monthly_revenue"),
+            ("monthly_revenue","revenue",["revenue","monthlyrevenue","營業收入-當月營收","營收"],"TWD","monthly_revenue"),
             ("PER","valuation",["per","pe","本益比"],"x","price_earnings_ratio"),
             ("PBR","valuation",["pbr","pb","股價淨值比"],"x","price_book_ratio"),
             ("quarter_eps","financial",["eps","earningspershare","每股盈餘","基本每股盈餘"],"TWD/share","quarter_or_latest_eps"),
@@ -2956,18 +3001,44 @@ async def fetch_twstock_mcp_snapshot(ticker:str) -> dict[str,Any]:
             if obj is None: continue
             val,path=_extract_mcp_metric(obj,aliases)
             if val is None: continue
+            # MOPS monthly-revenue fields are reported in NT$ thousands.
+            if metric=="monthly_revenue" and path and "營業收入-當月營收" in path:
+                val*=1000
             records.append({"metric":metric,"value":val,"unit":unit,"period":_extract_mcp_date(obj),
                             "source":"TWStock MCP","source_type":"mcp_aggregator","confidence":76,
                             "definition":definition,"raw_path":path,"tool":chosen.get(cat,{}).get("name")})
         out["records"]=records
         ok_calls=sum(1 for x in out["tool_calls"] if x.get("status")=="ok")
-        out["status"]="ok" if ok_calls else "degraded"
+        out["status"]="ok" if records else ("degraded" if ok_calls else "error")
         out["successful_calls"]=ok_calls
         out["fetched_at"]=datetime.now().astimezone().isoformat(timespec="seconds")
         return out
     except Exception as e:
         out.update({"status":"error","error":f"{type(e).__name__}: {e}","fetched_at":datetime.now().astimezone().isoformat(timespec="seconds")})
         return out
+
+async def _warm_twstock_mcp(ticker:str) -> None:
+    try:
+        snap=await asyncio.wait_for(fetch_twstock_mcp_snapshot(ticker),timeout=45)
+        snap["optional"]=True
+        _MCP_CACHE[ticker]=(time.time(),snap)
+        _CACHE.pop(ticker,None)
+    except Exception:
+        pass
+    finally:
+        _MCP_TASKS.pop(ticker,None)
+
+def get_twstock_mcp_snapshot_cached(ticker:str) -> dict[str,Any]:
+    cached=_MCP_CACHE.get(ticker)
+    if cached and time.time()-cached[0]<600:
+        return {**cached[1],"cache":{"hit":True,"ttl_seconds":600}}
+    task=_MCP_TASKS.get(ticker)
+    if task is None or task.done():
+        _MCP_TASKS[ticker]=asyncio.create_task(_warm_twstock_mcp(ticker))
+    return {"provider":"TWStock MCP compatible adapter","enabled":TWSTOCK_MCP_ENABLED,
+            "url":TWSTOCK_MCP_URL,"mode":"secondary_crosscheck","status":"pending",
+            "optional":True,"records":[],"tool_calls":[],"discovered_tools":[],
+            "tool_count":0,"successful_calls":0,"message":"選用二次驗證正在背景準備，不影響官方核心資料。"}
 
 async def probe_twstock_mcp() -> dict[str,Any]:
     # Kept for diagnostics compatibility; live stock requests use fetch_twstock_mcp_snapshot().
@@ -2977,8 +3048,9 @@ async def probe_twstock_mcp() -> dict[str,Any]:
 
 
 def build_data_boundary(source_status, integrity, evidence_graph):
-    missing=[x for x in source_status if x.get("status")=="missing"]
-    stale=[x for x in source_status if x.get("status")=="stale"]
+    missing=[x for x in source_status if x.get("status")=="missing" and x.get("required",True)]
+    stale=[x for x in source_status if x.get("status")=="stale" and x.get("required",True)]
+    optional_unavailable=[x for x in source_status if not x.get("required",True) and x.get("status")!="ok"]
     conflicts=evidence_graph.get("conflicts") or []
     material=[]
     if not integrity.get("official_verified"): material.append("最新財報季度尚未通過官方驗證")
@@ -2987,6 +3059,7 @@ def build_data_boundary(source_status, integrity, evidence_graph):
     if stale and integrity.get("official_verified"): material.append("部分資料源存在時效落差")
     grade="A" if not material else ("B" if len(material)==1 else ("C" if len(material)<=3 else "D"))
     return {"grade":grade,"material_boundaries":material,"missing_count":len(missing),"stale_count":len(stale),
+            "optional_unavailable_count":len(optional_unavailable),
             "conflict_count":len(conflicts),"message":"；".join(material) if material else "目前未發現會改變核心結論的重大資料邊界。"}
 
 def build_research_pipeline(ticker,scores_map,narrative_map,evidence_graph,financial_integrity,expectation,valuation,source_status,technical,flow,revenue,research):
@@ -3243,11 +3316,11 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
             fb["fetched_at"]=datetime.now().astimezone().isoformat(timespec="seconds")
             return fb
 
-    web_research, company_events, mcp_snapshot = await asyncio.gather(
+    web_research, company_events = await asyncio.gather(
         _safe_provider("PublicWebResearch", asyncio.wait_for(fetch_public_research(ticker, company_name), timeout=10), {"rows":[],"errors":[]}),
-        _safe_provider("CompanyEvents", asyncio.wait_for(fetch_company_events(ticker, company_name), timeout=10), {"rows":[],"earnings_calls":[],"material_info":[],"errors":[]}),
-        _safe_provider("TWStockMCP", asyncio.wait_for(fetch_twstock_mcp_snapshot(ticker), timeout=10), {"provider":"TWStock MCP","status":"error","records":[]})
+        _safe_provider("CompanyEvents", asyncio.wait_for(fetch_company_events(ticker, company_name), timeout=10), {"rows":[],"earnings_calls":[],"material_info":[],"errors":[]})
     )
+    mcp_snapshot=get_twstock_mcp_snapshot_cached(ticker)
     # Final price rescue from MCP cross-check when both FinMind and TWSE history are unavailable.
     if not tech:
         mcp_close=next((r for r in (mcp_snapshot.get("records") or []) if r.get("metric")=="close" and r.get("value") is not None),None)
@@ -3282,8 +3355,8 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         {"name":"公開法人研究","dataset":"Google News RSS + 公開網路引用","as_of":web_research.get("fetched_at"),"status":"ok" if web_research.get("rows") else "missing","scheduled_update":"每次強制刷新重新搜尋"},
         {"name":"公司事件雷達","dataset":"公開新聞/法說/重大訊息引用","as_of":company_events.get("fetched_at"),"status":"ok" if company_events.get("rows") else "missing","scheduled_update":"每次強制刷新重新搜尋"},
     ]
-    source_status.append({"name":"TWStock MCP 二次驗證","dataset":"TWStock MCP live adapter","as_of":mcp_snapshot.get("fetched_at"),
-                          "status":"ok" if mcp_snapshot.get("status")=="ok" else ("stale" if mcp_snapshot.get("status")=="degraded" else "missing"),
+    source_status.append({"name":"TWStock MCP 二次驗證（選用）","dataset":"TWStock MCP live adapter","as_of":mcp_snapshot.get("fetched_at"),
+                          "status":"ok" if mcp_snapshot.get("status")=="ok" else "optional","required":False,
                           "scheduled_update":f"工具 {mcp_snapshot.get('tool_count',0)} / 成功呼叫 {mcp_snapshot.get('successful_calls',0)} / Evidence {len(mcp_snapshot.get('records') or [])}"})
     source_status.append({"name":"Evidence Engine","dataset":"Multi-Source Evidence Schema v1","as_of":evidence_graph.get("generated_at"),"status":"ok" if evidence_graph.get("summary",{}).get("usable") else "missing","scheduled_update":f"Fact {evidence_graph.get('summary',{}).get('facts',0)} / Derived {evidence_graph.get('summary',{}).get('derived_facts',0)} / Conflicts {evidence_graph.get('summary',{}).get('conflicts',0)}"})
     conf=calc_confidence(source_status,valuation,research)
@@ -3423,7 +3496,7 @@ async def eps_diagnostics(ticker: str):
                 "raw_trace_url":f"/api/diagnostics/eps-raw/{ticker}?year={y}&quarter={q}"
             })
     return {
-        "ticker":ticker,"version":"5.4.4",
+        "ticker":ticker,"version":APP_VERSION,
         "official_current":{k:official.get(k) for k in ("source","endpoint","period","fiscal_year","fiscal_quarter","ytd_eps","quarter_eps_direct","report_id")},
         "finmind_error":finmind_error,
         "eps_stack":stack,
@@ -3443,7 +3516,7 @@ async def eps_registry_diagnostics(ticker: str):
     reg=_load_official_eps_registry()
     rows=[r for r in reg.get("records",[]) if str(r.get("ticker"))==ticker]
     rows=sorted(rows,key=lambda r:(r.get("year") or 0,r.get("quarter") or 0),reverse=True)
-    return {"ticker":ticker,"version":"5.4.4","registry_schema_version":reg.get("schema_version"),
+    return {"ticker":ticker,"version":APP_VERSION,"registry_schema_version":reg.get("schema_version"),
             "updated_at":reg.get("updated_at"),"record_count":len(rows),"records":rows}
 
 @app.get("/api/evidence/{ticker}")
@@ -3458,13 +3531,18 @@ async def provider_diagnostics(ticker: str):
     ticker=ticker.strip().upper()
     d=await build_stock(ticker, False)
     mcp=await probe_twstock_mcp()
-    return {"version":"5.4.4","ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
+    return {"version":APP_VERSION,"ticker":ticker,"providers":PROVIDER_REGISTRY,"twstock_mcp":mcp,"source_status":d.get("source_status",[]),"evidence_summary":(d.get("evidence_graph") or {}).get("summary",{}),"conflicts":(d.get("evidence_graph") or {}).get("conflicts",[])}
 
 
 @app.get("/api/diagnostics/mcp/{ticker}")
 async def mcp_diagnostics(ticker: str):
-    ticker=validate_ticker(ticker)
-    snap=await fetch_twstock_mcp_snapshot(ticker)
+    ticker=ticker.strip().upper()
+    if not re.fullmatch(r"[0-9A-Z]{2,10}",ticker): raise HTTPException(400,"invalid ticker")
+    try:
+        snap=await asyncio.wait_for(fetch_twstock_mcp_snapshot(ticker),timeout=50)
+    except asyncio.TimeoutError:
+        snap={"provider":"TWStock MCP compatible adapter","status":"timeout","optional":True,
+              "records":[],"message":"選用二次驗證逾時，不影響官方核心資料。"}
     return snap
 
 
@@ -3473,7 +3551,7 @@ async def provider_health(ticker: str):
     ticker=ticker.strip()
     if not ticker.isdigit() or len(ticker) not in (4,5,6):
         return JSONResponse({"status":"error","message":"invalid ticker"},status_code=400)
-    result={"ticker":ticker,"version":"5.4.4","providers":{},"summary":{"ok":0,"degraded":0,"error":0}}
+    result={"ticker":ticker,"version":APP_VERSION,"providers":{},"summary":{"ok":0,"degraded":0,"error":0}}
     checks=[
         ("FinMind 股價", finmind("TaiwanStockPrice",ticker,date.today()-timedelta(days=10),date.today())),
         ("FinMind 法人", finmind("TaiwanStockInstitutionalInvestorsBuySellWide",ticker,date.today()-timedelta(days=30),date.today())),
