@@ -3,6 +3,8 @@ const fmt=(v,d=1)=>v==null?'—':Number(v).toLocaleString('zh-TW',{maximumFracti
 const fmt0=v=>v==null?'—':Number(v).toLocaleString('zh-TW',{maximumFractionDigits:0});
 const pct=(v,d=1)=>v==null?'—':`${v>=0?'+':''}${Number(v).toFixed(d)}%`;
 let currentTicker='';
+let marginHistoryRefreshTimer=null;
+const marginHistoryRefreshAttempts={};
 
 function lineSvg(values){
   if(!values.length)return '<div class="empty">資料不足</div>';
@@ -18,6 +20,42 @@ function flowMatrix(fl){
   const cards=rows.map(([label,key])=>`<section class="flow-card" aria-label="${label}淨買賣"><div class="flow-card-head"><b>${label}</b><small>淨買賣股數</small></div><div class="flow-periods">${periods.map(([n,period])=>{const v=fl[`${key}_${n}`];return `<div class="flow-period"><span>${period}</span><strong class="${v<0?'neg':'pos'}">${signed(v)}</strong></div>`}).join('')}</div></section>`).join('');
   const margin=`<section class="margin-card" aria-label="融資餘額變化"><div class="flow-card-head"><b>融資餘額變化</b><small>增減百分比</small></div><div class="flow-periods">${periods.map(([n,period])=>{const v=fl[`margin_${n}_pct`];return `<div class="flow-period"><span>${period}</span><strong class="${v>0?'neg':'pos'}">${v==null?'—':`${v>0?'+':''}${fmt(v,1)}%`}</strong></div>`}).join('')}</div></section>`;
   return `<div class="flow-cards">${cards}</div>${margin}`;
+}
+function signedLots(v){
+  if(v==null)return '—';
+  const lots=Number(v);
+  return `${lots>0?'+':''}${Number(lots).toLocaleString('zh-TW',{maximumFractionDigits:1})} 張`;
+}
+function creditHistoryChart(series,key,label){
+  const balanceKey=`${key}_balance`,changeKey=`${key}_change`;
+  const rows=series.filter(x=>x?.date&&x[balanceKey]!=null).slice(-60);
+  if(rows.length<2)return `<section class="credit-chart-card"><div class="credit-chart-head"><div><b>${label}</b><small>官方歷史準備中</small></div></div><div class="empty credit-chart-empty">正在背景補齊最近 60 個交易日…</div></section>`;
+  const w=640,h=224,left=54,right=596,top=48,bottom=178,zero=(top+bottom)/2,plotW=right-left;
+  const balances=rows.map(x=>Number(x[balanceKey])),changes=rows.map(x=>Number(x[changeKey]||0));
+  const maxChange=Math.max(1,...changes.map(Math.abs)),rawMin=Math.min(...balances),rawMax=Math.max(...balances),padding=Math.max(1,(rawMax-rawMin)*.08),minBalance=rawMin-padding,maxBalance=rawMax+padding,range=maxBalance-minBalance||1;
+  const x=i=>left+i*plotW/Math.max(1,rows.length-1),changeY=v=>zero-v*(bottom-top)/(2*maxChange),balanceY=v=>bottom-(v-minBalance)*(bottom-top)/range,barW=Math.max(2,Math.min(8,plotW/rows.length*.65));
+  const bars=changes.map((v,i)=>{const y=changeY(v),height=Math.max(1,Math.abs(y-zero));return `<rect class="credit-bar ${v<0?'down':'up'}" x="${x(i)-barW/2}" y="${Math.min(y,zero)}" width="${barW}" height="${height}"/>`}).join('');
+  const line=balances.map((v,i)=>`${x(i)},${balanceY(v)}`).join(' '),mid=Math.floor((rows.length-1)/2),latest=rows[rows.length-1],latestBalance=latest[balanceKey],latestChange=latest[changeKey];
+  const dateLabel=i=>String(rows[i].date).slice(0,10).replaceAll('-','/');
+  return `<section class="credit-chart-card"><div class="credit-chart-head"><div><b>${label}餘額 ${signedLots(latestBalance).replace('+','')}</b><small class="${latestChange<0?'pos':'neg'}">${latestChange==null?'今日增減 —':`${latestChange>0?'增加':'減少'} ${signedLots(Math.abs(latestChange)).replace('+','')}`}</small></div><span>柱：每日增減<br>線：餘額</span></div><div class="credit-chart" data-kind="${key}"><svg viewBox="0 0 ${w} ${h}" role="img" aria-label="${label}最近 ${rows.length} 個交易日餘額與每日增減"><line class="credit-grid" x1="${left}" y1="${top}" x2="${right}" y2="${top}"/><line class="credit-grid zero" x1="${left}" y1="${zero}" x2="${right}" y2="${zero}"/><line class="credit-grid" x1="${left}" y1="${bottom}" x2="${right}" y2="${bottom}"/>${bars}<polyline class="credit-balance-line" points="${line}"/><text class="credit-axis left top" x="${left-7}" y="${top+4}" text-anchor="end">${fmt0(maxChange)}</text><text class="credit-axis left" x="${left-7}" y="${zero+4}" text-anchor="end">0</text><text class="credit-axis left bottom" x="${left-7}" y="${bottom+4}" text-anchor="end">-${fmt0(maxChange)}</text><text class="credit-axis right top" x="${right+7}" y="${top+4}">${fmt0(maxBalance)}</text><text class="credit-axis right bottom" x="${right+7}" y="${bottom+4}">${fmt0(minBalance)}</text><text class="credit-date" x="${left}" y="${h-12}">${dateLabel(0)}</text><text class="credit-date" x="${x(mid)}" y="${h-12}" text-anchor="middle">${dateLabel(mid)}</text><text class="credit-date" x="${right}" y="${h-12}" text-anchor="end">${dateLabel(rows.length-1)}</text><rect class="credit-hit" x="${left}" y="${top}" width="${plotW}" height="${bottom-top}"/></svg><div class="credit-chart-tooltip" hidden></div></div></section>`;
+}
+function marginHistoryDashboard(fl){
+  const series=fl.margin_history||[];
+  return `${creditHistoryChart(series,'margin','融資')}${creditHistoryChart(series,'short','融券')}<small class="credit-chart-source">資料：${fl.margin_history_source||'TWSE MI_MARGN／FinMind fallback'} · 官方交易單位（張） · 截至 ${fl.margin_last_date||'—'}</small>`;
+}
+function bindCreditChartTooltips(series){
+  document.querySelectorAll('.credit-chart').forEach(chart=>{
+    const kind=chart.dataset.kind,rows=(series||[]).filter(x=>x?.date&&x[`${kind}_balance`]!=null).slice(-60),svg=chart.querySelector('svg'),tip=chart.querySelector('.credit-chart-tooltip');
+    if(!rows.length||!svg||!tip)return;
+    const show=e=>{const rect=svg.getBoundingClientRect(),ratio=Math.max(0,Math.min(1,(e.clientX-rect.left)/rect.width)),idx=Math.round(ratio*(rows.length-1)),row=rows[idx],balance=row[`${kind}_balance`],change=row[`${kind}_change`];tip.innerHTML=`<b>${String(row.date).slice(0,10)}</b><span>餘額 ${signedLots(balance).replace('+','')}</span><span>當日增減 ${signedLots(change)}</span>`;tip.hidden=false;tip.style.left=`${Math.max(16,Math.min(84,ratio*100))}%`;};
+    svg.addEventListener('pointerdown',show);svg.addEventListener('pointermove',e=>{if(e.pointerType==='mouse'||e.buttons)show(e)});svg.addEventListener('pointerleave',()=>{tip.hidden=true});
+  });
+}
+function scheduleMarginHistoryRefresh(ticker,seriesLength){
+  clearTimeout(marginHistoryRefreshTimer);
+  if(seriesLength>=2){delete marginHistoryRefreshAttempts[ticker];return;}
+  if((marginHistoryRefreshAttempts[ticker]||0)>=2)return;
+  marginHistoryRefreshTimer=setTimeout(async()=>{if(currentTicker!==ticker)return;marginHistoryRefreshAttempts[ticker]=(marginHistoryRefreshAttempts[ticker]||0)+1;try{const response=await fetch(`/api/stock/${encodeURIComponent(ticker)}`,{cache:'no-store'}),data=await readApiResponse(response);if(response.ok&&currentTicker===ticker)render(data)}catch(e){console.warn('margin history refresh pending',e)}},55000);
 }
 function _techLinePoints(series,key,w,h,p,min,max){
   const vals=series.map(x=>x[key]);
@@ -186,6 +224,9 @@ function render(d){
 
   const fl=d.flow||{};
   $('flowTable').innerHTML=flowMatrix(fl);
+  $('marginHistoryCharts').innerHTML=marginHistoryDashboard(fl);
+  bindCreditChartTooltips(fl.margin_history||[]);
+  scheduleMarginHistoryRefresh(d.ticker,(fl.margin_history||[]).length);
   const flows={外資:fl.foreign_20,投信:fl.trust_20,自營商:fl.dealer_20};
   const available=Object.values(flows).filter(v=>v!=null), mx=Math.max(1,...available.map(Math.abs));
   $('flowBars').innerHTML=Object.entries(flows).map(([k,v])=>`<div class="flow-row"><span>${k} 20日</span><div class="flow-track"><div class="flow-fill ${v!=null&&v<0?'neg':''}" style="width:${v==null?0:Math.abs(v)/mx*100}%"></div></div><b>${v==null?'—':`${v>0?'+':''}${fmt0(v)}`}</b></div>`).join('');

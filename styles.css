@@ -56,6 +56,14 @@
 .flow-period .pos{color:var(--accent)}.flow-period .neg{color:var(--red)}
 .margin-card{margin-bottom:14px;background:rgba(255,255,255,.015)}
 .margin-card .flow-period strong{font-size:15px}
+.margin-history-dashboard{display:grid;gap:12px;margin:16px 0 20px}
+.credit-chart-card{border:1px solid var(--line);border-radius:13px;background:#050b10;overflow:hidden}
+.credit-chart-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:11px 13px;background:#707274;color:#fff}
+.credit-chart-head b{display:block;font-size:15px}.credit-chart-head small{display:block;margin-top:3px;font-size:12px}.credit-chart-head small.pos{color:#65e3b9}.credit-chart-head small.neg{color:#ff8585}.credit-chart-head>span{text-align:right;font-size:9px;line-height:1.45;color:#e5e8e9}
+.credit-chart{position:relative;padding:5px 4px 0}.credit-chart svg{display:block;width:100%;height:auto;touch-action:pan-y}
+.credit-grid{stroke:#273039;stroke-width:1}.credit-grid.zero{stroke:#59636b;stroke-dasharray:3 3}.credit-bar.up{fill:#ff4242}.credit-bar.down{fill:#38bd5b}.credit-balance-line{fill:none;stroke:#ffb43c;stroke-width:2.6;vector-effect:non-scaling-stroke}.credit-axis,.credit-date{fill:#b7bec3;font-size:12px}.credit-axis.left.top{fill:#ff5b5b}.credit-axis.left.bottom{fill:#4bd079}.credit-hit{fill:transparent;pointer-events:all}
+.credit-chart-tooltip{position:absolute;top:12px;z-index:2;min-width:128px;transform:translateX(-50%);padding:8px 9px;border:1px solid #667783;border-radius:9px;background:rgba(5,12,17,.94);box-shadow:0 8px 24px rgba(0,0,0,.35);pointer-events:none}.credit-chart-tooltip b,.credit-chart-tooltip span{display:block}.credit-chart-tooltip b{font-size:11px;margin-bottom:3px}.credit-chart-tooltip span{font-size:10px;color:#d1dade;line-height:1.45}
+.credit-chart-source{display:block;color:var(--muted);font-size:9px;line-height:1.5}.credit-chart-empty{min-height:118px}
 .levels{grid-template-columns:repeat(4,1fr)}
 @media(max-width:600px){
   .candle-svg{height:250px}.indicator-panel svg{height:92px}
@@ -64,11 +72,13 @@
   .flow-card-head{padding:12px 13px}.flow-card-head b{font-size:16px}.flow-card-head small{font-size:10px}
   .flow-period{padding:12px 11px}.flow-period span{font-size:11px}.flow-period strong{font-size:18px;white-space:nowrap;letter-spacing:-.02em}
   .margin-card .flow-period strong{font-size:18px}
+  .margin-history-dashboard{margin-top:18px;gap:14px}.credit-chart-head{padding:12px}.credit-chart-head b{font-size:16px}.credit-chart-head small{font-size:13px}.credit-chart-card{border-radius:14px}.credit-chart{padding:4px 1px 0}.credit-axis,.credit-date{font-size:13px}
   .levels{grid-template-columns:repeat(2,1fr)}
 }
 @media print{
   .technical-dashboard{gap:6px}.candle-svg{height:230px}.indicator-panel svg{height:75px}
   .indicator-panel{background:#f5f8fa;border-color:#d8e0e5}
+  .credit-chart-card{background:#fff;border-color:#d8e0e5}.credit-chart-head{background:#eef2f4;color:#17242d}.credit-chart-tooltip{display:none}
 }
 
 .disclosure-grid{display:grid;grid-template-columns:1.25fr .9fr;gap:14px}

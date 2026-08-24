@@ -28,7 +28,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.14.1"
+APP_VERSION = "5.15.0"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -293,7 +293,7 @@ async def fetch_twse_t86_latest(ticker: str, price: float | None, anchor: date |
     return {"institutional": {}, "flow": {}, "last_date": None, "source": "TWSE T86 official", "attempts": attempts}
 
 
-OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.14.1"}
+OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.0"}
 
 
 def _roc_date(raw: Any) -> str:
@@ -427,11 +427,16 @@ async def fetch_official_market_supplements(ticker: str, anchor: date | None = N
                     if latest:
                         output.extend(latest)
                         break
-            batches = await asyncio.gather(*(guarded(end - timedelta(days=i)) for i in range(history_days)))
+            # Margin/short charts need roughly 60 trading sessions. Keep the
+            # institutional request bounded at its existing lookback while the
+            # background-only margin job covers about 90 calendar days.
+            lookback_days = max(history_days, 90) if kind == "margin" and history_days else history_days
+            batches = await asyncio.gather(*(guarded(end - timedelta(days=i)) for i in range(lookback_days)))
             for batch in batches:
                 output.extend(batch)
             dedup = {row["date"]: row for row in output}
-            return [dedup[key] for key in sorted(dedup)][-21:]
+            limit = 60 if kind == "margin" else 21
+            return [dedup[key] for key in sorted(dedup)][-limit:]
 
         results = await asyncio.gather(revenue(), valuation(), history("institutional"), history("margin"), return_exceptions=True)
     keys = ("revenue", "valuation", "institutional", "margin")
@@ -2347,6 +2352,7 @@ def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]], len
             mdf["ShortSaleTodayBalance"]=pd.to_numeric(mdf["ShortSaleTodayBalance"],errors="coerce")
         mdf=mdf.sort_values("date").dropna(subset=["MarginPurchaseTodayBalance"])
         if not mdf.empty:
+            mdf=mdf.drop_duplicates(subset=["date"],keep="last").tail(60)
             latest=float(mdf.iloc[-1]["MarginPurchaseTodayBalance"])
             def balance_change(n:int, column: str = "MarginPurchaseTodayBalance"):
                 if len(mdf)<=n or column not in mdf.columns: return None
@@ -2359,6 +2365,24 @@ def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]], len
                 "margin_1_pct":balance_change(1),"margin_5_pct":balance_change(5),"margin_20_pct":balance_change(20),
                 "margin_last_date":str(mdf.iloc[-1]["date"])
             })
+            history=[]
+            previous_margin=None
+            previous_short=None
+            for _, row in mdf.iterrows():
+                margin_balance=None if pd.isna(row.get("MarginPurchaseTodayBalance")) else float(row.get("MarginPurchaseTodayBalance"))
+                raw_short=row.get("ShortSaleTodayBalance")
+                short_balance=None if raw_short is None or pd.isna(raw_short) else float(raw_short)
+                history.append({
+                    "date":str(row.get("date")),
+                    "margin_balance":margin_balance,
+                    "margin_change":None if previous_margin is None or margin_balance is None else margin_balance-previous_margin,
+                    "short_balance":short_balance,
+                    "short_change":None if previous_short is None or short_balance is None else short_balance-previous_short,
+                })
+                if margin_balance is not None: previous_margin=margin_balance
+                if short_balance is not None: previous_short=short_balance
+            result["margin_history"]=history
+            result["margin_history_unit"]="trading_lots"
             if "ShortSaleTodayBalance" in mdf.columns and not pd.isna(mdf.iloc[-1]["ShortSaleTodayBalance"]):
                 short = float(mdf.iloc[-1]["ShortSaleTodayBalance"])
                 result.update({"short_balance": short, "short_1_pct": balance_change(1, "ShortSaleTodayBalance"),
@@ -3035,6 +3059,8 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
 
     tech=calc_technical(prices); flow=calc_flow(inst,margin); revenue=calc_revenue(rev); perdata=calc_per(pers); financial=calc_financials(fin)
     institutional_source = "TWSE T86 official history" if supplements.get("institutional") else "FinMind TaiwanStockInstitutionalInvestorsBuySellWide"
+    margin_source = "TWSE MI_MARGN official history" if supplements.get("margin") else "FinMind TaiwanStockMarginPurchaseShortSale"
+    flow["margin_history_source"] = margin_source
     institutional_payload: dict[str, Any] = {}
 
     async def official_financial_bounded():
