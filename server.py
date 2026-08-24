@@ -29,7 +29,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.17.0"
+APP_VERSION = "5.17.1"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -2087,7 +2087,7 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
         "blocked_mops_html_removed":True,
         "identity_verified":not identity_mismatch,
         "rejected_company_code":official_code if identity_mismatch else None,
-        "note":"V5.17.0：全股票共用官方累計差額與四季 TTM 規則；禁止官方累計值混搭第三方前期值。官方缺口只做明確標示的年化暫估，後續官方值自動覆蓋。"
+        "note":"V5.17.1：全股票共用官方 EPS/TTM 規則；估值分開呈現歷史回歸、Forward、法人目標與市場隱含口徑，公開研究需通過公司身分驗證。"
     }
 
 
@@ -2125,13 +2125,14 @@ def _extract_rating(text: str) -> str | None:
 
 def _extract_target(text: str) -> float | None:
     patterns=[
-        r"目標價(?:調升|上調|上看|調降|下調|降至|升至|至|為|看|[:：])?\s*(?:新台幣|NT\$?|TWD)?\s*([0-9]{2,5}(?:\.[0-9]+)?)",
+        r"目標價(?:調升|上調|上看|調降|下調|降至|升至|至|為|看|衝|喊到|[:：])?\s*(?:新台幣|NT\$?|TWD)?\s*([0-9][0-9,]{1,6}(?:\.[0-9]+)?)",
+        r"(?:喊|上看|調高到|升至)\s*(?:新台幣|NT\$?|TWD)?\s*([0-9][0-9,]{2,6}(?:\.[0-9]+)?)\s*元",
         r"target price(?: raised| lowered| to| of|[:：])?\s*(?:NT\$?|TWD)?\s*([0-9]{2,5}(?:\.[0-9]+)?)",
     ]
     for pat in patterns:
         m=re.search(pat,text,re.I)
         if m:
-            v=safe_num(m.group(1))
+            v=safe_num(m.group(1).replace(",",""))
             if v and 5 <= v <= 100000: return v
     return None
 
@@ -2140,6 +2141,8 @@ def _extract_eps(text: str) -> float | None:
     for pat in pats:
         m=re.search(pat,text,re.I)
         if m:
+            between=text[m.start():m.end()]
+            if "目標價" in between: continue
             v=safe_num(m.group(1))
             if v and 0 < v < 5000: return v
     return None
@@ -2156,6 +2159,16 @@ def _extract_eps_year(text: str) -> int | None:
 
 def _normalize_title(s: str) -> str:
     return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", s).lower()
+
+def _research_mentions_company(text: str, ticker: str, company_name: str) -> bool:
+    """Reject search-engine near matches before any number reaches valuation."""
+    normalized=_normalize_title(text)
+    company=_normalize_title(company_name)
+    if company and company != ticker and len(company) >= 2 and company in normalized:
+        return True
+    # A bare code can itself be a quoted target. Require a stock-code context
+    # when the official company name is unavailable.
+    return bool(re.search(rf"(?:股票|代號|上市|上櫃|\(|（)\s*{re.escape(ticker)}(?:\s*[)）]|\b)",text,re.I))
 
 async def google_news_rss(query: str) -> list[dict[str, Any]]:
     url=f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
@@ -2243,6 +2256,21 @@ def _classify_call_bullets(title: str, snippet: str) -> dict[str,list[str]]:
 def _call_group_key(row: dict[str,Any]) -> str:
     return str(row.get("quarter_hint") or (row.get("date") or "")[:10] or _normalize_title(row.get("title") or "")[:60])
 
+def _company_event_identity(ticker: str, company_name: str, title: str) -> tuple[bool,str]:
+    codes=set(re.findall(r"(?<!\d)(\d{4})(?!\d)",title or ""))
+    if any(code != ticker for code in codes):
+        return False,"different_ticker_in_title"
+    if ticker in codes:
+        return True,"ticker_in_title"
+    company=_normalize_title(company_name)
+    if company and company != ticker and company in _normalize_title(title):
+        return True,"company_name_in_title"
+    return False,"target_identity_missing"
+
+async def fetch_official_material_info(ticker: str) -> tuple[list[dict[str,Any]],list[str]]:
+    """Extension point for official material disclosures; empty is safer than cross-ticker news."""
+    return [],[]
+
 async def fetch_company_events(ticker: str, company_name: str) -> dict[str, Any]:
     queries=[
         f'"{company_name}" {ticker} site:twse.com.tw 法人說明會',
@@ -2254,12 +2282,15 @@ async def fetch_company_events(ticker: str, company_name: str) -> dict[str, Any]
         f'"{company_name}" {ticker} 接單 產能 客戶 訂單',
     ]
     results=await asyncio.gather(*(google_news_rss(q) for q in queries),return_exceptions=True)
+    official_rows,official_errors=await fetch_official_material_info(ticker)
     rows=[]; seen=set(); errors=[]
     for result in results:
         if isinstance(result,Exception):
             errors.append(type(result).__name__); continue
         for x in result:
             title=x.get("title") or ""; snippet=x.get("snippet") or ""
+            identity_ok,identity_reason=_company_event_identity(ticker,company_name,title)
+            if not identity_ok: continue
             key=_normalize_title(title)[:100]
             if not key or key in seen: continue
             seen.add(key)
@@ -2291,6 +2322,7 @@ async def fetch_company_events(ticker: str, company_name: str) -> dict[str, Any]
             quarter_hint=_event_quarter_hint(text,x.get("published_date"))
             info_density=sum(len(v) for v in classified.values())+len(tags)
             rows.append({
+                "ticker":ticker,"identity_verified":True,"identity_reason":identity_reason,
                 "date":x.get("published_date"),"title":title,"summary":snippet[:320],
                 "summary_bullets":summary_bullets[:5],
                 "financial_highlights":classified["financial"],
@@ -2305,6 +2337,9 @@ async def fetch_company_events(ticker: str, company_name: str) -> dict[str, Any]
                 "copyright_note":"僅整理公開標題與摘要；完整數字與原文以官方來源為準。"
             })
 
+    for row in official_rows:
+        rows.append({**row,"ticker":ticker,"identity_verified":True,"identity_reason":"official_exact_ticker","official_source":True})
+    errors.extend(official_errors)
     rows=sorted(rows,key=lambda z:(z.get("date") or "",z.get("source_priority") or 0,z.get("information_density") or 0),reverse=True)[:36]
     grouped={}
     for row in [r for r in rows if r.get("event_type")=="earnings_call"]:
@@ -2345,6 +2380,7 @@ async def fetch_public_research(ticker: str, company_name: str) -> dict[str, Any
             if not key or key in seen: continue
             seen.add(key)
             text=f"{x['title']} {x['snippet']}"
+            if not _research_mentions_company(text,ticker,company_name): continue
             inst=_extract_institution(text); target=_extract_target(text); rating=_extract_rating(text); eps=_extract_eps(text); eps_year=_extract_eps_year(text)
             if not any([inst,target,rating,eps]): continue
             score=35 + (25 if inst else 0) + (25 if target else 0) + (10 if rating else 0) + (5 if eps else 0)
@@ -2363,12 +2399,21 @@ def merge_research(imported: list[dict[str, Any]], web_rows: list[dict[str, Any]
         y=dict(x); y.setdefault('source_type','manual_import'); y.setdefault('confidence',95); rows.append(y)
     rows.extend(web_rows)
     rows=sorted(rows,key=lambda x:x.get('report_date',''),reverse=True)
-    targets=[safe_num(x.get('target_price')) for x in rows if safe_num(x.get('target_price')) is not None]
+    trusted_targets=[]; market_mentions=[]; target_seen=set()
+    for x in rows:
+        tp=safe_num(x.get('target_price')); inst=x.get('institution')
+        trusted=bool(tp is not None and (x.get('source_type')=='manual_import' or (inst and inst!='未辨識機構' and x.get('confidence',0)>=70)))
+        key=(inst,x.get('report_date'),tp)
+        if trusted:
+            if key in target_seen: continue
+            trusted_targets.append(tp); target_seen.add(key)
+        elif tp is not None:
+            market_mentions.append(tp)
     # Annual EPS consensus must have an explicit forecast year. Mixing quarterly/TTM/annual EPS is prohibited.
     eps_by_year: dict[int,list[float]]={}
     for x in rows:
         ep=safe_num(x.get('forward_eps')); ey=x.get('eps_year')
-        if ep is not None and isinstance(ey,int) and x.get('confidence',0)>=70:
+        if ep is not None and isinstance(ey,int) and x.get('confidence',0)>=60 and x.get('institution') not in (None,'未辨識機構'):
             eps_by_year.setdefault(ey,[]).append(ep)
     eps_consensus={str(y):median(vals) for y,vals in sorted(eps_by_year.items()) if vals}
     current_year=date.today().year
@@ -2393,8 +2438,9 @@ def merge_research(imported: list[dict[str, Any]], web_rows: list[dict[str, Any]
         vals=sorted(vals,reverse=True)
         if len(vals)>=2 and vals[1][1]: eps_revisions.append((vals[0][1]/vals[1][1]-1)*100)
     return {
-        "count":len(rows), "institution_count":len(institutions), "median_target":median(targets) if targets else None,
-        "average_target":sum(targets)/len(targets) if targets else None, "high_target":max(targets) if targets else None, "low_target":min(targets) if targets else None,
+        "count":len(rows), "institution_count":len(institutions), "median_target":median(trusted_targets) if trusted_targets else None,
+        "average_target":sum(trusted_targets)/len(trusted_targets) if trusted_targets else None, "high_target":max(trusted_targets) if trusted_targets else None, "low_target":min(trusted_targets) if trusted_targets else None,
+        "target_coverage":len(trusted_targets), "market_mention_count":len(market_mentions),
         "median_forward_eps":median(epss) if epss else None, "forward_eps_year":chosen_year, "forward_eps_by_year":eps_consensus, "eps_coverage":len(epss), "target_revision_pct":median(revisions) if revisions else None, "eps_revision_pct":median(eps_revisions) if eps_revisions else None,
         "ratings":ratings, "reports":rows, "public_web_count":sum(1 for x in rows if x.get('source_type')=='public_web_quote'),
         "manual_count":sum(1 for x in rows if x.get('source_type')=='manual_import'),
@@ -2831,12 +2877,12 @@ def model_valuation(price: float | None, perdata: dict[str, Any], eps_stack: dic
     ytd=safe_num(eps_stack.get("ytd_eps")) if allow_financial else None
     q=eps_stack.get("quarter_period")
     forward_valid=bool(consensus_eps and consensus_eps>0 and coverage>=2 and research.get("forward_eps_year"))
-    if ttm and ttm>0:
-        anchor_eps=ttm; eps_basis=f"TTM EPS {ttm:.2f}（截至 {q or 'latest'}；不使用單季×4）"; eps_conf=78
-        selected_model="trailing_ttm"
-    elif forward_valid:
+    if forward_valid:
         anchor_eps=consensus_eps; eps_basis=f"{research.get('forward_eps_year')}E EPS 中位數（{coverage} 筆明確年度可比預估）"; eps_conf=82
         selected_model="forward_consensus"
+    elif ttm and ttm>0:
+        anchor_eps=ttm; eps_basis=f"TTM EPS {ttm:.2f}（截至 {q or 'latest'}；不使用單季×4）"; eps_conf=78
+        selected_model="trailing_ttm"
     elif ytd and ytd>0:
         qm=re.search(r"Q([1-4])",str(q or eps_stack.get("ytd_period") or ""),re.I)
         elapsed=int(qm.group(1)) if qm else None
@@ -2857,12 +2903,22 @@ def model_valuation(price: float | None, perdata: dict[str, Any], eps_stack: dic
         for x in out: x["target"]=x["eps"]*x["pe"]; x["upside_pct"]=(x["target"]/price-1)*100
         return out
     trailing_scenarios=scenario_set(ttm)
-    forward_scenarios=scenario_set(consensus_eps if forward_valid else None)
+    forward_indicative=bool(consensus_eps and consensus_eps>0 and coverage>=1 and research.get("forward_eps_year"))
+    forward_scenarios=scenario_set(consensus_eps if forward_indicative else None)
     scenarios=scenario_set(anchor_eps)
     implied_pe=price/ttm if ttm and ttm>0 else safe_num(perdata.get("per"))
+    hist_median=safe_num(perdata.get("pe_median"))
+    pe_gap_ratio=(implied_pe/hist_median) if implied_pe and hist_median else None
+    regime_warning=bool(pe_gap_ratio and pe_gap_ratio>=1.6)
+    if regime_warning:
+        pe_conf=min(pe_conf,45)
     return {"eps_basis":eps_basis,"pe_basis":pe_basis,"confidence":round((eps_conf+pe_conf)/2),
             "anchor_eps":anchor_eps,"selected_model":selected_model,"scenarios":scenarios,
             "trailing_scenarios":trailing_scenarios,"forward_scenarios":forward_scenarios,
+            "forward_status":"consensus" if forward_valid else "single_source" if forward_indicative else "unavailable",
+            "analyst_consensus":{"median_target":safe_num(research.get("median_target")),"coverage":int(research.get("target_coverage") or 0),"status":"consensus" if int(research.get("target_coverage") or 0)>=2 else "single_source" if int(research.get("target_coverage") or 0)==1 else "unavailable"},
+            "historical_model_label":"TTM 歷史均值回歸價","regime_shift_warning":regime_warning,"pe_gap_ratio":pe_gap_ratio,
+            "valuation_warning":"目前市場本益比明顯高於歷史區間，歷史均值回歸價不可直接視為短期目標價。" if regime_warning else None,
             "market_implied":{"price":price,"ttm_eps":ttm,"implied_pe":implied_pe,
                               "official_market_pe":safe_num(perdata.get("per")),"official_market_pbr":safe_num(perdata.get("pbr")),
                               "as_of":perdata.get("last_date")}}
@@ -2898,9 +2954,10 @@ def scores(technical: dict[str, Any], revenue: dict[str, Any], flow: dict[str, A
 def calc_confidence(source_status: list[dict[str, Any]], valuation: dict[str, Any], research: dict[str, Any]) -> dict[str, Any]:
     available = sum(1 for x in source_status if x["status"] == "ok")
     completeness = round(available / len(source_status) * 100) if source_status else 0
-    research_bonus = 10 if research.get("count", 0) >= 3 else 5 if research.get("count", 0) else 0
+    trusted_coverage=int(research.get("target_coverage") or 0) + int(research.get("eps_coverage") or 0)
+    research_bonus = 8 if trusted_coverage >= 4 else 4 if trusted_coverage >= 2 else 1 if trusted_coverage else 0
     overall = round(completeness * .65 + valuation.get("confidence", 0) * .25 + research_bonus)
-    return {"data_completeness": completeness, "valuation_confidence": valuation.get("confidence", 0), "research_coverage": research.get("count", 0), "overall": min(100, overall)}
+    return {"data_completeness": completeness, "valuation_confidence": valuation.get("confidence", 0), "research_coverage": trusted_coverage, "raw_research_mentions": research.get("count", 0), "overall": min(100, overall)}
 
 
 def _iso_now() -> str:
