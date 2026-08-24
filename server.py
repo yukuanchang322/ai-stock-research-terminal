@@ -7,7 +7,7 @@ import math
 import os
 import time
 import unicodedata
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -29,7 +29,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.16.0"
+APP_VERSION = "5.16.1"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -47,6 +47,7 @@ _OFFICIAL_FINANCIAL_TASKS: dict[str, asyncio.Task] = {}
 _OFFICIAL_FINANCIAL_JOBS: dict[str, dict[str, Any]] = {}
 _MCP_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _MCP_TASKS: dict[str, asyncio.Task] = {}
+_PRICE_HISTORY_CACHE: dict[str, tuple[float, list[dict[str, Any]], str]] = {}
 
 app = FastAPI(title="AI Stock Research Terminal", version=APP_VERSION)
 app.add_middleware(GZipMiddleware, minimum_size=800)
@@ -168,6 +169,7 @@ PROVIDER_REGISTRY = [
     {"id":"eps_registry","name":"Official EPS Registry","tier":1,"authority":"verified_registry","role":"historical_backfill","enabled":True},
     {"id":"twstock_mcp","name":"TWStock MCP compatible adapter","tier":2,"authority":"aggregator","role":"secondary_crosscheck","enabled":TWSTOCK_MCP_ENABLED,"url":TWSTOCK_MCP_URL},
     {"id":"finmind","name":"FinMind","tier":3,"authority":"third_party","role":"fallback","enabled":True},
+    {"id":"yahoo","name":"Yahoo Finance chart API (yfinance-compatible)","tier":3,"authority":"third_party","role":"price_history_fallback","enabled":True},
     {"id":"public_web","name":"Public Web Research","tier":4,"authority":"public_web","role":"research_context","enabled":True},
 ]
 
@@ -3300,6 +3302,57 @@ def merge_market_rows_by_date(base: list[dict[str, Any]], official: list[dict[st
     return [merged[key] for key in sorted(merged)]
 
 
+def parse_yahoo_chart_payload(payload: dict[str, Any], ticker: str) -> list[dict[str, Any]]:
+    chart = payload.get("chart") if isinstance(payload, dict) else None
+    result = ((chart or {}).get("result") or [None])[0]
+    if not isinstance(result, dict):
+        return []
+    timestamps = result.get("timestamp") or []
+    quote = ((((result.get("indicators") or {}).get("quote") or [None])[0]) or {})
+    rows: list[dict[str, Any]] = []
+    for index, stamp in enumerate(timestamps):
+        try:
+            values = {key: (quote.get(key) or [])[index] for key in ("open", "high", "low", "close", "volume")}
+        except (IndexError, TypeError):
+            continue
+        close = safe_num(values.get("close"))
+        if close is None:
+            continue
+        rows.append({
+            "date": datetime.fromtimestamp(int(stamp), timezone.utc).date().isoformat(),
+            "stock_id": ticker,
+            "open": safe_num(values.get("open")), "max": safe_num(values.get("high")),
+            "min": safe_num(values.get("low")), "close": close,
+            "Trading_Volume": safe_num(values.get("volume")),
+            "_source": "Yahoo Finance chart API",
+        })
+    return rows
+
+
+async def fetch_yahoo_stock_history(ticker: str, market_hint: str | None = None) -> tuple[list[dict[str, Any]], str, list[str]]:
+    """Independent yfinance-compatible OHLC fallback; never supplies Taiwan flow data."""
+    ticker = require_numeric_taiwan_ticker(ticker)
+    market = normalize_market_type(market_hint)
+    suffixes = ["TWO", "TW"] if market == "上櫃" else ["TW", "TWO"]
+    errors: list[str] = []
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=headers) as client:
+        for suffix in suffixes:
+            symbol = f"{ticker}.{suffix}"
+            for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+                try:
+                    response = await client.get(f"https://{host}/v8/finance/chart/{symbol}",
+                                                params={"range": "18mo", "interval": "1d", "events": "history"})
+                    response.raise_for_status()
+                    rows = parse_yahoo_chart_payload(response.json(), ticker)
+                    if rows:
+                        return rows, f"Yahoo Finance {symbol}", errors
+                    errors.append(f"Yahoo {symbol}:no_rows")
+                except Exception as exc:
+                    errors.append(f"Yahoo {symbol}:{type(exc).__name__}")
+    return [], "Yahoo Finance unavailable", errors
+
+
 def parse_tpex_stock_day_payload(payload: dict[str, Any], ticker: str | None = None) -> list[dict[str, Any]]:
     if str(payload.get("stat") or "").lower() != "ok":
         raise RuntimeError(str(payload.get("stat") or "TPEx response is not ok"))
@@ -3558,13 +3611,24 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         official_info, official_prices, official_price_provider, official_market_errors, otc_supplements = await official_market_task
         if official_info:
             info = {**official_info, **{key:value for key,value in info.items() if value not in (None, "", "—")}}
-        if not prices and official_prices:
-            prices = official_prices
-            price_source = official_price_provider
-            errors.append(f"TaiwanStockPrice: FinMind unavailable; {official_price_provider} active")
+        if official_prices:
+            prices = merge_market_rows_by_date(prices, official_prices)
+            price_source = official_price_provider if len(official_prices) >= len(prices) else f"{official_price_provider} latest + FinMind history"
+        elif not prices:
+            yahoo_prices, yahoo_provider, yahoo_errors = await fetch_yahoo_stock_history(ticker, info.get("type"))
+            errors.extend(yahoo_errors)
+            if yahoo_prices:
+                prices = yahoo_prices
+                price_source = yahoo_provider
         errors.extend(official_market_errors)
     except Exception as e:
         errors.append(f"OfficialMarketRouting: {type(e).__name__}")
+        if not prices:
+            yahoo_prices, yahoo_provider, yahoo_errors = await fetch_yahoo_stock_history(ticker, info.get("type"))
+            errors.extend(yahoo_errors)
+            if yahoo_prices:
+                prices = yahoo_prices
+                price_source = yahoo_provider
     try:
         supplements = await supplements_task
     except Exception as e:
@@ -3600,6 +3664,15 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         rev = merge_market_rows_by_date(rev, supplements["revenue"])
     if supplements.get("valuation"):
         pers = merge_market_rows_by_date(pers, supplements["valuation"])
+
+    if prices:
+        _PRICE_HISTORY_CACHE[ticker] = (time.time(), list(prices), price_source)
+    else:
+        last_good = _PRICE_HISTORY_CACHE.get(ticker)
+        if last_good and time.time() - last_good[0] < 21600:
+            prices = list(last_good[1])
+            price_source = f"{last_good[2]} last-good cache"
+            errors.append("Price providers unavailable; preserved last successful history")
 
     tech=calc_technical(prices); flow=calc_flow(inst,margin,None,prices); revenue=calc_revenue(rev); perdata=calc_per(pers); financial=calc_financials(fin)
     flow["institutional_history_count"]=len({str(row.get("date")) for row in inst if row.get("date")})
@@ -3957,12 +4030,16 @@ async def provider_health(ticker: str):
         ("FinMind 融資融券", finmind("TaiwanStockMarginPurchaseShortSale",ticker,date.today()-timedelta(days=30),date.today())),
         ("FinMind 月營收", finmind("TaiwanStockMonthRevenue",ticker,date.today()-timedelta(days=400),date.today())),
         ("TWSE STOCK_DAY", fetch_twse_stock_day_history(ticker,1)),
+        ("Yahoo Finance OHLC", fetch_yahoo_stock_history(ticker)),
         ("TWStock MCP", fetch_twstock_mcp_snapshot(ticker)),
     ]
     async def run(name,coro):
         try:
             v=await coro
-            n=len(v) if isinstance(v,list) else len((v or {}).get("records") or [])
+            if isinstance(v, tuple):
+                n=len(v[0] or [])
+            else:
+                n=len(v) if isinstance(v,list) else len((v or {}).get("records") or [])
             status="ok" if n>0 else "degraded"
             return name,{"status":status,"records":n}
         except Exception as e:
@@ -3974,4 +4051,4 @@ async def provider_health(ticker: str):
     return JSONResponse(result,headers={"Cache-Control":"no-store"})
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":APP_VERSION,"mode":"single-entrypoint-official-fallbacks","finmind_token":bool(FINMIND_TOKEN),"finmind_mode":"token" if FINMIND_TOKEN else "anonymous-fallback","cache_ttl_seconds":CACHE_TTL,"pwa":False}
+async def health(): return {"status":"ok","version":APP_VERSION,"mode":"multi-source-official-first","finmind_token":bool(FINMIND_TOKEN),"finmind_mode":"token" if FINMIND_TOKEN else "anonymous-fallback","yahoo_price_fallback":True,"twstock_mcp_crosscheck":TWSTOCK_MCP_ENABLED,"cache_ttl_seconds":CACHE_TTL,"pwa":False}
