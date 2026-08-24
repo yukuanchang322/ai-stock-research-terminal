@@ -38,9 +38,9 @@ class StockSwitchCacheRaceTests(unittest.TestCase):
 
     def test_versioned_assets_match_runtime(self):
         html = (ROOT / "index.html").read_text()
-        self.assertEqual(server.APP_VERSION, "5.15.8")
-        self.assertNotIn("5.15.7", html)
-        self.assertGreaterEqual(html.count("5.15.8"), 4)
+        self.assertEqual(server.APP_VERSION, "5.15.9")
+        self.assertNotIn("5.15.8", html)
+        self.assertGreaterEqual(html.count("5.15.9"), 4)
 
 
 if __name__ == "__main__":
