@@ -29,7 +29,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.16.9"
+APP_VERSION = "5.17.0"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -696,9 +696,9 @@ def _official_row_to_snapshot(row: dict[str, Any], source: str, endpoint: str, m
     gross=parse_num_text(val("營業毛利（毛損）","營業毛利(毛損)") or _row_value(row,["營業毛利"],["百分比"]))
     op=parse_num_text(val("營業利益（損失）","營業利益(損失)","營業利益") or _row_value(row,["營業利益"],["百分比"]))
     net=parse_num_text(val("本期淨利（淨損）","本期淨利(淨損)","本期淨利","稅後淨利") or _row_value(row,["本期淨利"],["百分比"]) or _row_value(row,["稅後淨利"]))
-    year=val("年度") or _row_value(row,["年度"]) or _row_value(row,["年"])
+    year=val("年度","Year") or _row_value(row,["年度"]) or _row_value(row,["年"])
     quarter=val("季別") or _row_value(row,["季別"]) or _row_value(row,["季"])
-    out_date=val("出表日期","資料日期") or _row_value(row,["出表日期"]) or _row_value(row,["資料日期"])
+    out_date=val("出表日期","資料日期","Date") or _row_value(row,["出表日期"]) or _row_value(row,["資料日期"])
     try:
         y=int(str(year).strip()); y=y+1911 if y<1911 else y
     except Exception: y=None
@@ -1325,25 +1325,9 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
             rows=await openapi_json(base,path)
             row=next((x for x in rows if company_code(x)==ticker),None)
             if not row: return None
-            eps=parse_num_text(_row_value(row,["基本每股盈餘"]) or _row_value(row,["每股盈餘"]))
-            revenue=parse_num_text(_row_value(row,["營業收入"],["百分比"]))
-            gross=parse_num_text(_row_value(row,["營業毛利"],["百分比"]))
-            op=parse_num_text(_row_value(row,["營業利益"],["百分比"]))
-            net=parse_num_text(_row_value(row,["本期淨利"],["百分比"]) or _row_value(row,["本期稅後淨利"]))
-            year=_row_value(row,["年度"]) or _row_value(row,["年"])
-            quarter=_row_value(row,["季別"]) or _row_value(row,["季"])
-            out_date=_row_value(row,["出表日期"]) or _row_value(row,["資料日期"])
-            try:
-                y=int(str(year).strip()); y=y+1911 if y<1911 else y
-            except Exception: y=None
-            q=None; qm=re.search(r"([1-4])",str(quarter or "")); q=int(qm.group(1)) if qm else None
-            period=f"{y} Q{q}" if y and q else (roc_date_to_iso(out_date) or "latest")
-            return {"source":source,"market":market,"endpoint":path,"official":True,"period":period,
-                    "fiscal_year":y,"fiscal_quarter":q,"statement_date":roc_date_to_iso(out_date),
-                    "ytd_eps":eps,"revenue_ytd":revenue,"gross_profit_ytd":gross,
-                    "operating_income_ytd":op,"net_income_ytd":net,"raw_keys":list(row.keys())[:20],
-                    "feed_kind":kind,
-                    "completeness":sum(v is not None for v in (eps,revenue,gross,op,net))}
+            # One canonical parser for TWSE, TPEx and CSV rows. Keeping a second parser here
+            # previously caused TPEx's English Year/Date fields to lose the fiscal year.
+            return _official_row_to_snapshot(row,source,path,market,kind)
         except Exception as e:
             errors.append(f"{path}:{type(e).__name__}")
             return None
@@ -1885,6 +1869,12 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
     either (a) a direct company-official value, or (b) derived from two official cumulative values.
     TTM is reported only when four real quarters are available.
     """
+    official=dict(official or {})
+    official_code=str(official.get("company_code") or official.get("ticker") or "").strip()
+    identity_mismatch=bool(official_code and official_code != str(ticker))
+    if identity_mismatch:
+        official={"official":False,"identity_mismatch":True,"rejected_company_code":official_code,
+                  "errors":[f"financial_identity_mismatch:{official_code}!={ticker}"]}
     fin_hist=finmind_eps_history(fin_rows)
     fy=official.get("fiscal_year") if official.get("official") else None
     fq=official.get("fiscal_quarter") if official.get("official") else None
@@ -1990,23 +1980,27 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
     quarter_eps=None; quarter_method=None; quarter_meta=None
     if fy and fq:
         if official.get("official"):
-            quarter_eps,quarter_method,quarter_meta=standalone(fy,fq,allow_backup=True)
+            # Never mix an official current cumulative EPS with a third-party predecessor.
+            # If the prior official cumulative value is absent, leave single-quarter EPS missing;
+            # valuation may use an explicitly labelled YTD annualisation instead.
+            quarter_eps,quarter_method,quarter_meta=standalone(fy,fq,allow_backup=False)
         elif ytd is not None:
             # Structured fallback only when no official period exists.
             if fq==1: quarter_eps=ytd; quarter_method="structured_api_q1"
             elif (fy,fq-1) in fin_map: quarter_eps=ytd-fin_map[(fy,fq-1)]; quarter_method="structured_api_difference"
 
-    quarters=[]; ttm_provisional=False
+    quarters=[]
     if fy and fq and official.get("official"):
         y,q=fy,fq; last4=[]
         for _ in range(4):
             last4.append((y,q)); q-=1
             if q==0: y-=1; q=4
         for y,q in reversed(last4):
-            val,method,meta=standalone(y,q,allow_backup=True)
+            # TTM means four official standalone quarters. Structured/third-party history is
+            # display evidence only and must never be blended into an official TTM value.
+            val,method,meta=standalone(y,q,allow_backup=False)
             if val is not None:
                 quarters.append({"year":y,"quarter":q,"eps":val,"period":f"{y} Q{q}","method":method,"source":(meta or {}).get("source")})
-                if method in {"hybrid_ytd_difference","structured_api_q1","structured_api_difference"}: ttm_provisional=True
     ttm=sum(x["eps"] for x in quarters) if len(quarters)==4 else None
 
     latest_period=f"{fy} Q{fq}" if fy and fq else fallback_financial.get("statement_date")
@@ -2027,7 +2021,7 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
         for ly,lq in ledger_periods:
             key=(ly,lq); p=provenance.get(key,{})
             direct=direct_quarter.get(key); cumulative=official_ytd.get(key)
-            single,method,_meta=standalone(ly,lq,allow_backup=True)
+            single,method,_meta=standalone(ly,lq,allow_backup=False)
             diag=diag_by_period.get(f"{ly} Q{lq}",{})
             provisional_single=single is not None and method in {"hybrid_ytd_difference","structured_api_q1","structured_api_difference"}
             status="provisional" if provisional_single else ("usable" if (direct is not None or cumulative is not None) else "missing")
@@ -2071,8 +2065,8 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
         "quarter_derivation_inputs":derivation_inputs,
         "ytd_eps":ytd,"ytd_period":f"{fy} Q{fq} YTD" if fy and fq else latest_period,
         "ytd_method_label":"✅ 官方累計值" if official.get("official") and ytd is not None else ("△ 結構化 API" if ytd is not None else "資料不足"),
-        "ttm_eps":ttm,"ttm_period":latest_period,"ttm_method_label":(("△ 含備援資料的四季暫估" if ttm_provisional else "✅ 四個實際單季加總") if ttm is not None else "四季資料不足"),
-        "ttm_status":"provisional" if ttm is not None and ttm_provisional else ("official" if ttm is not None else "missing"),
+        "ttm_eps":ttm,"ttm_period":latest_period,"ttm_method_label":("✅ 四個官方單季加總" if ttm is not None else "四季官方資料不足"),
+        "ttm_status":"official" if ttm is not None else "missing",
         "replacement_policy":"每次查詢優先重取官方同期間資料；取得後自動覆蓋備援暫估。",
         "source":source,"official_period":official.get("period"),"history":quarters,
         "quality":"multi_source_official_eps" if official.get("official") else "structured_api",
@@ -2091,7 +2085,9 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
         },
         "evidence_ledger_version":"5.4.4",
         "blocked_mops_html_removed":True,
-        "note":"V5.16.2：官方資料永遠優先；缺口可用明確標示的備援值暫估，重新查詢取得官方同期間資料後自動覆蓋。備援值不冒充官方值。"
+        "identity_verified":not identity_mismatch,
+        "rejected_company_code":official_code if identity_mismatch else None,
+        "note":"V5.17.0：全股票共用官方累計差額與四季 TTM 規則；禁止官方累計值混搭第三方前期值。官方缺口只做明確標示的年化暫估，後續官方值自動覆蓋。"
     }
 
 
