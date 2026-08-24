@@ -91,7 +91,7 @@ function candleSvg(series){
   if(!series?.length)return '<div class="empty">K線資料不足</div>';
   const data=series.filter(x=>[x.open,x.high,x.low,x.close].every(v=>v!=null&&Number.isFinite(Number(v))));
   if(!data.length)return '<div class="empty">K線資料不足</div>';
-  const w=720,h=300,p=24, vals=data.flatMap(x=>[x.high,x.low,x.ma20,x.ma60].filter(v=>v!=null).map(Number));
+  const w=720,h=300,p=42, vals=data.flatMap(x=>[x.high,x.low,x.ma20,x.ma60].filter(v=>v!=null).map(Number));
   const min=Math.min(...vals),max=Math.max(...vals),range=max-min||1, xstep=(w-2*p)/Math.max(1,data.length);
   const y=v=>h-p-(Number(v)-min)*(h-2*p)/range;
   const body=Math.max(1,Math.min(5,xstep*.66));
@@ -100,8 +100,18 @@ function candleSvg(series){
     return `<g class="candle ${cls}"><line x1="${cx}" y1="${yh}" x2="${cx}" y2="${yl}"/><rect x="${cx-body/2}" y="${top}" width="${body}" height="${bh}"/></g>`}).join('');
   const p20=_techLinePoints(data,'ma20',w,h,p,min,max).map(points=>`<polyline class="ma20" points="${points}"/>`).join('');
   const p60=_techLinePoints(data,'ma60',w,h,p,min,max).map(points=>`<polyline class="ma60" points="${points}"/>`).join('');
-  const first=data[0]?.date||'', last=data[data.length-1]?.date||'';
-  return `<div class="tech-chart-title"><b>近一年日K</b><span>MA20 · MA60</span></div><svg class="candle-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><line class="axis" x1="${p}" y1="${h-p}" x2="${w-p}" y2="${h-p}"/>${candles}${p20}${p60}<text x="${p}" y="${h-5}">${first}</text><text x="${w-p}" y="${h-5}" text-anchor="end">${last}</text></svg><div class="chart-legend"><span>MA20</span><span>MA60</span></div>`;
+  const priceTicks=[max,(max+min)/2,min].map(v=>`<g class="price-tick"><line x1="${p}" y1="${y(v)}" x2="${w-p}" y2="${y(v)}"/><text x="${p-6}" y="${y(v)+3}" text-anchor="end">${fmt(v,1)}</text></g>`).join('');
+  const dateIndexes=[0,.25,.5,.75,1].map(r=>Math.round(r*(data.length-1))).filter((v,i,a)=>a.indexOf(v)===i);
+  const dateTicks=dateIndexes.map((i,j)=>{const xx=p+(i+.5)*xstep,anchor=j===0?'start':(j===dateIndexes.length-1?'end':'middle');return `<text class="candle-date" x="${xx}" y="${h-8}" text-anchor="${anchor}">${String(data[i]?.date||'').slice(0,10)}</text>`}).join('');
+  const latest=data[data.length-1],latestY=y(latest.close);
+  return `<div class="candle-chart"><div class="tech-chart-title"><b>近一年日K</b><span>點選 K 棒查看日期與價位</span></div><svg class="candle-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="近一年日K，含日期與價格刻度">${priceTicks}<line class="axis" x1="${p}" y1="${h-p}" x2="${w-p}" y2="${h-p}"/>${candles}${p20}${p60}<line class="latest-price-line" x1="${p}" y1="${latestY}" x2="${w-p}" y2="${latestY}"/><text class="latest-price-label" x="${w-p-3}" y="${latestY-4}" text-anchor="end">最新 ${fmt(latest.close,1)}</text>${dateTicks}<g class="candle-crosshair" hidden><line class="crosshair-x" y1="${p}" y2="${h-p}"/><circle class="crosshair-dot" r="4"/></g><rect class="candle-hit" x="${p}" y="${p}" width="${w-2*p}" height="${h-2*p}"/></svg><div class="candle-tooltip" hidden></div><div class="chart-legend"><span>MA20</span><span>MA60</span></div></div>`;
+}
+function bindCandleTooltip(series){
+  const rows=(series||[]).filter(x=>[x.open,x.high,x.low,x.close].every(v=>v!=null&&Number.isFinite(Number(v)))),chart=document.querySelector('.candle-chart'),svg=chart?.querySelector('.candle-svg'),tip=chart?.querySelector('.candle-tooltip'),crosshair=chart?.querySelector('.candle-crosshair');
+  if(!rows.length||!svg||!tip||!crosshair)return;
+  const w=720,h=300,p=42,vals=rows.flatMap(x=>[x.high,x.low,x.ma20,x.ma60].filter(v=>v!=null).map(Number)),min=Math.min(...vals),max=Math.max(...vals),range=max-min||1,y=v=>h-p-(Number(v)-min)*(h-2*p)/range;
+  const show=e=>{const rect=svg.getBoundingClientRect(),ratio=Math.max(0,Math.min(1,(e.clientX-rect.left)/rect.width)),idx=Math.min(rows.length-1,Math.floor(ratio*rows.length)),row=rows[idx],prev=idx?Number(rows[idx-1].close):null,change=prev?((Number(row.close)-prev)/prev*100):null,cx=p+(idx+.5)*(w-2*p)/rows.length,cy=y(row.close);crosshair.querySelector('.crosshair-x').setAttribute('x1',cx);crosshair.querySelector('.crosshair-x').setAttribute('x2',cx);crosshair.querySelector('.crosshair-dot').setAttribute('cx',cx);crosshair.querySelector('.crosshair-dot').setAttribute('cy',cy);crosshair.hidden=false;tip.innerHTML=`<b>${String(row.date||'').slice(0,10)}</b><span>開 ${fmt(row.open,1)}　高 ${fmt(row.high,1)}</span><span>低 ${fmt(row.low,1)}　收 ${fmt(row.close,1)}</span><span>漲跌 ${change==null?'—':`${change>=0?'+':''}${fmt(change,2)}%`}</span><span>MA20 ${fmt(row.ma20,1)}　MA60 ${fmt(row.ma60,1)}</span>`;tip.hidden=false;tip.style.left=`${Math.max(23,Math.min(77,ratio*100))}%`;};
+  svg.addEventListener('pointerdown',show);svg.addEventListener('pointermove',e=>{if(e.pointerType==='mouse'||e.buttons)show(e)});svg.addEventListener('pointerleave',e=>{if(e.pointerType==='mouse'){tip.hidden=true;crosshair.hidden=true}});
 }
 function oscillatorSvg(series,keys,title,minFixed=null,maxFixed=null,levels=[]){
   if(!series?.length)return '';
@@ -260,6 +270,7 @@ function render(d){
 
   const t=d.technical||{}; $('techPill').textContent=t.trend||'資料不足';
   $('priceChart').innerHTML=technicalDashboard(t);
+  bindCandleTooltip(t.series||[]);
   $('levels').innerHTML=[['MA20',t.ma?.['20']],['MA60',t.ma?.['60']],['第一支撐',t.support1],['60日壓力',t.resistance],['KD K',t.k],['KD D',t.d],['RSI14',t.rsi14],['MACD Hist',t.macd_hist]].map(x=>`<div class="level"><span>${x[0]}</span><b>${fmt(x[1],x[0].includes('MACD')?2:1)}</b></div>`).join('');
   $('techAnalysis').textContent=`近一年日K；MA60 為中期趨勢核心。趨勢：${t.trend||'—'}；K/D ${fmt(t.k,1)}/${fmt(t.d,1)}；MACD Hist ${fmt(t.macd_hist,2)}；RSI14 ${fmt(t.rsi14,1)}。KD >80 / <20、RSI >70 / <30 僅代表動能極端，需搭配均線與量價確認。`;
 
