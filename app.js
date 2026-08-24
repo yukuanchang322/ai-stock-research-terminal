@@ -366,6 +366,13 @@ const ex=d.expectation_gap||{};
   if($('invalidationConditions')) $('invalidationConditions').innerHTML=(rp.invalidation_conditions||[]).map(x=>`<div class="condition-row invalid"><b>${x}</b></div>`).join('');
   $('valuationBody').innerHTML=scenarios.length?scenarios.map(x=>`<tr><td>${x.name}</td><td>${fmt(x.eps,2)}</td><td>${fmt(x.pe,1)}x</td><td><b>${fmt0(x.target)}</b></td><td>${pct(x.upside_pct)}</td></tr>`).join(''):'<tr><td colspan="5">估值資料不足</td></tr>';
   $('assumptions').innerHTML=`<div class="assumption-row"><b>EPS Basis</b><span>${d.valuation.eps_basis||'—'}</span></div><div class="assumption-row"><b>PE Basis</b><span>${d.valuation.pe_basis||'—'}</span></div><div class="assumption-row"><b>估值信心</b><span>${d.valuation.confidence||0}/100</span></div><div class="assumption-row"><b>模型原則</b><span>Bear/Base/Bull 對 EPS 與 PE 同時做情境化，而非單點預測。</span></div>`; $('peBand').innerHTML=`歷史 PER：P25 <b>${fmt(d.per?.pe_p25,1)}x</b> · Median <b>${fmt(d.per?.pe_median,1)}x</b> · P75 <b>${fmt(d.per?.pe_p75,1)}x</b>`;
+  const valuationBase=xs=>(xs||[]).find(x=>x.name==='基準');
+  const trailingBase=valuationBase(d.valuation.trailing_scenarios), forwardBase=valuationBase(d.valuation.forward_scenarios), implied=d.valuation.market_implied||{};
+  $('valuationCompare').innerHTML=`<h4>三種估值交叉檢查</h4><div class="valuation-compare-grid">
+    <div><span>TTM 歷史估值</span><b>${trailingBase?fmt0(trailingBase.target):'—'}</b><small>${trailingBase?`TTM EPS ${fmt(implied.ttm_eps,2)} × 歷史中位 PER`:'四季 EPS 尚未齊全'}</small>${d.valuation.selected_model==='trailing_ttm'?'<em>目前採用</em>':''}</div>
+    <div><span>Forward EPS 估值</span><b>${forwardBase?fmt0(forwardBase.target):'—'}</b><small>${forwardBase?'至少 2 筆同年度法人預估':'缺乏 2 筆同年度可比預估'}</small>${d.valuation.selected_model==='forward_consensus'?'<em>目前採用</em>':''}</div>
+    <div><span>市場隱含估值</span><b>${implied.implied_pe!=null?`${fmt(implied.implied_pe,1)}x`:'—'}</b><small>現價 ÷ TTM EPS${implied.as_of?` · ${implied.as_of}`:''}</small>${d.valuation.selected_model==='market_implied'?'<em>降級採用</em>':''}</div>
+  </div>`;
 
   const base=scenarios.find(x=>x.name==='基準');
   $('strategyGrid').innerHTML=[
