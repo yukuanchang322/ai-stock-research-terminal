@@ -19,7 +19,7 @@ class CandleZoomPanTests(unittest.TestCase):
     def test_zoom_slices_data_and_recalculates_chart(self):
         self.assertIn('function candleWindow(rows)', self.js)
         self.assertIn('rows.slice(end-size,end)', self.js)
-        self.assertIn('host.innerHTML=candleSvg(visible)', self.js)
+        self.assertIn('host.innerHTML=candleSvg(visible,candlePeriodState)', self.js)
 
     def test_touch_pan_and_pinch_are_supported_without_blocking_vertical_scroll(self):
         self.assertIn("gesture={kind:'pan'", self.js)
@@ -28,7 +28,7 @@ class CandleZoomPanTests(unittest.TestCase):
         self.assertIn("touch-action:pan-y", self.css)
 
     def test_stock_change_resets_viewport(self):
-        self.assertIn("if(candleViewState.ticker!==d.ticker)", self.js)
+        self.assertIn("if(candlePeriodState.ticker!==d.ticker)", self.js)
         self.assertIn("ticker:d.ticker", self.js)
 
 
