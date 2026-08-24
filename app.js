@@ -289,10 +289,37 @@ window.addEventListener('load',()=>{const q=new URLSearchParams(location.search)
 let deferredInstallPrompt = null;
 function wrapWideTables(){
   document.querySelectorAll('.clean-table').forEach(table=>{
+    const labels=Array.from(table.querySelectorAll('thead th')).map(x=>x.textContent.trim());
+    table.querySelectorAll('tbody tr').forEach(row=>Array.from(row.children).forEach((cell,index)=>{
+      if(cell.tagName==='TD' && labels[index]) cell.dataset.label=labels[index];
+    }));
     if(!table.parentElement.classList.contains('table-scroll')){
       const wrap=document.createElement('div'); wrap.className='table-scroll';
       table.parentNode.insertBefore(wrap,table); wrap.appendChild(table);
     }
+  });
+  setupMobileFolds();
+  setupMobileDetails();
+}
+function setupMobileFolds(){
+  document.querySelectorAll('.company-disclosure-section,.expectation-section,.research-pipeline-section,.valuation-section,.strategy-section,.source-section').forEach(section=>{
+    if(section.dataset.foldReady)return;
+    section.dataset.foldReady='1'; section.classList.add('mobile-fold','is-collapsed');
+    const title=section.querySelector(':scope > .section-title');
+    if(!title)return;
+    const button=document.createElement('button');
+    button.type='button'; button.className='mobile-fold-toggle'; button.setAttribute('aria-expanded','false'); button.textContent='展開';
+    button.onclick=()=>{const collapsed=section.classList.toggle('is-collapsed');button.textContent=collapsed?'展開':'收合';button.setAttribute('aria-expanded',String(!collapsed));};
+    title.appendChild(button);
+  });
+}
+function setupMobileDetails(){
+  [['#analystTable','公開法人研究明細'],['.eps-ledger','EPS 證據明細'],['.evidence-matrix','Evidence 矩陣']].forEach(([selector,label])=>{
+    const detail=document.querySelector(selector); if(!detail||detail.dataset.mobileDetailReady)return;
+    detail.dataset.mobileDetailReady='1'; detail.classList.add('mobile-detail','is-collapsed');
+    const button=document.createElement('button'); button.type='button'; button.className='mobile-detail-toggle'; button.textContent=`展開${label}`; button.setAttribute('aria-expanded','false');
+    button.onclick=()=>{const collapsed=detail.classList.toggle('is-collapsed');button.textContent=`${collapsed?'展開':'收合'}${label}`;button.setAttribute('aria-expanded',String(!collapsed));};
+    detail.parentNode.insertBefore(button,detail);
   });
 }
 async function checkCloud(){
@@ -301,7 +328,7 @@ async function checkCloud(){
     const r=await fetch('/health',{cache:'no-store'}); const j=await r.json();
     if(!r.ok) throw new Error();
     dot?.classList.remove('offline'); dot?.classList.add('online');
-    $('cloudStatus').textContent=`雲端服務正常 · V${j.version||'5'}`;
+    $('cloudStatus').textContent='雲端服務正常';
   }catch(e){
     dot?.classList.remove('online'); dot?.classList.add('offline');
     $('cloudStatus').textContent='雲端服務目前無法連線';
