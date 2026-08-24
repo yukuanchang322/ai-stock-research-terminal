@@ -232,9 +232,9 @@ def _t86_participant(row: dict[str, Any], participant: str) -> dict[str, float |
         "trust": (("投信",),),
         "dealer": (("自營商",),),
     }[participant]
-    # The official foreign fields contain the phrase "不含外資自營商"; excluding
-    # every key containing 自營商 incorrectly removes the desired row itself.
-    excludes: tuple[str, ...] = ()
+    # Foreign columns contain "不含外資自營商", while dealer matching must not
+    # interpret that phrase as the domestic dealer column.
+    excludes: tuple[str, ...] = ("外陸資", "外資及陸資", "外資") if participant == "dealer" else ()
 
     def find(kind: str) -> float | None:
         for token_set in tokens:
@@ -284,7 +284,8 @@ async def fetch_twse_t86_latest(ticker: str, price: float | None, anchor: date |
                     institutional[participant] = {"1": cash}
                     flat[f"{participant}_1"] = cash["net"] if cash["net"] is not None else values["net"]
                 if institutional:
-                    return {"institutional": institutional, "flow": flat, "last_date": day.isoformat(), "source": "TWSE T86 official", "attempts": attempts}
+                    company_name = next((str(value).strip() for key, value in row.items() if "證券名稱" in _normalized_key(key) and str(value).strip()), None)
+                    return {"institutional": institutional, "flow": flat, "last_date": day.isoformat(), "source": "TWSE T86 official", "company_name": company_name, "attempts": attempts}
             except Exception as exc:
                 attempts.append({"date": day.isoformat(), "error": type(exc).__name__})
     return {"institutional": {}, "flow": {}, "last_date": None, "source": "TWSE T86 official", "attempts": attempts}
@@ -2831,6 +2832,8 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     if institutional_payload.get("institutional"):
         flow.update(institutional_payload.get("flow") or {})
         institutional_source = institutional_payload["source"]
+        if not info.get("stock_name") and institutional_payload.get("company_name"):
+            info["stock_name"] = institutional_payload["company_name"]
     elif not flow.get("last_date"):
         errors.append("TWSET86: ticker unavailable within provider budget")
     # V5.2.8 official mapping + EPS resolver guard: force the newest official MOPS quarter into the main payload.
