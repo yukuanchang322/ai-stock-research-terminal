@@ -1,14 +1,16 @@
-const CACHE="ai-stock-v5.10.1";
+const CACHE="ai-stock-v5.10.2";
 const SHELL=[
-  '/static/styles.css?v=5.10.1',
-  '/static/app.js?v=5.10.1',
-  '/static/v5101_hotfix.js?v=5.10.1',
-  '/static/manifest.webmanifest?v=5.10.1'
+  '/static/styles.css?v=5.10.2',
+  '/static/app.js?v=5.10.2',
+  '/static/v5101_hotfix.js?v=5.10.2',
+  '/static/manifest.webmanifest?v=5.10.2'
 ];
 
 self.addEventListener('install',event=>{
   event.waitUntil(
-    caches.open(CACHE)
+    caches.keys()
+      .then(keys=>Promise.all(keys.map(k=>caches.delete(k))))
+      .then(()=>caches.open(CACHE))
       .then(cache=>Promise.allSettled(SHELL.map(url=>cache.add(url))))
       .then(()=>self.skipWaiting())
   );
@@ -31,11 +33,14 @@ self.addEventListener('fetch',event=>{
     return;
   }
 
-  if(url.pathname.startsWith('/static/')||url.pathname==='/sw.js'){
+  if(url.pathname.startsWith('/static/')||url.pathname==='/sw.js'||url.pathname==='/app.js'){
     event.respondWith(
       fetch(event.request,{cache:'reload'})
         .then(resp=>{
-          if(resp.ok){const copy=resp.clone();caches.open(CACHE).then(cache=>cache.put(event.request,copy));}
+          if(resp.ok&&url.pathname.startsWith('/static/')){
+            const copy=resp.clone();
+            caches.open(CACHE).then(cache=>cache.put(event.request,copy));
+          }
           return resp;
         })
         .catch(()=>caches.match(event.request))
