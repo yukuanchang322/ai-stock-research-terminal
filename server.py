@@ -28,7 +28,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.15.2"
+APP_VERSION = "5.15.3"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -293,7 +293,7 @@ async def fetch_twse_t86_latest(ticker: str, price: float | None, anchor: date |
     return {"institutional": {}, "flow": {}, "last_date": None, "source": "TWSE T86 official", "attempts": attempts}
 
 
-OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.2"}
+OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.3"}
 
 
 def _roc_date(raw: Any) -> str:
@@ -316,13 +316,17 @@ def parse_twse_revenue_rows(payload: Any, ticker: str) -> list[dict[str, Any]]:
     raw_year, month = int(digits[:-2]), int(digits[-2:])
     year = raw_year + 1911 if raw_year < 1911 else raw_year
     current = parse_num_text(hit.get("營業收入-當月營收") or hit.get("當月營收"))
+    previous_month = parse_num_text(hit.get("營業收入-上月營收") or hit.get("上月營收"))
     prior = parse_num_text(hit.get("營業收入-去年當月營收") or hit.get("去年當月營收"))
+    previous_year, previous_month_number = (year - 1, 12) if month == 1 else (year, month - 1)
     # The MOPS OpenAPI reports revenue in NT$ thousands.
     out = []
-    for y, value, source in ((year - 1, prior, "prior-year comparison"), (year, current, "current month")):
+    for y, m, value, source in ((year - 1, month, prior, "prior-year comparison"),
+                                (previous_year, previous_month_number, previous_month, "previous month"),
+                                (year, month, current, "current month")):
         if value is not None:
-            out.append({"stock_id": ticker, "revenue_year": y, "revenue_month": month,
-                        "revenue": value * 1000, "date": f"{y:04d}-{month:02d}-01",
+            out.append({"stock_id": ticker, "revenue_year": y, "revenue_month": m,
+                        "revenue": value * 1000, "date": f"{y:04d}-{m:02d}-01",
                         "_source": f"TWSE/MOPS t187ap05_L {source}"})
     return out
 

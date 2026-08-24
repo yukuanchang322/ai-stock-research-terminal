@@ -35,9 +35,10 @@ class OfficialSupplementalFallbackTests(unittest.TestCase):
         self.assertEqual(margin_rows[0]["ShortSaleTodayBalance"],59)
 
     def test_parses_official_revenue_in_ntd_with_prior_year_comparison(self):
-        payload=[{"資料年月":"11507","公司代號":"3661","營業收入-當月營收":"7433152","營業收入-去年當月營收":"5359000"}]
+        payload=[{"資料年月":"11507","公司代號":"3661","營業收入-當月營收":"7433152","營業收入-上月營收":"7000000","營業收入-去年當月營收":"5359000"}]
         rows=server.parse_twse_revenue_rows(payload,"3661")
-        self.assertEqual([row["revenue_year"] for row in rows],[2025,2026])
+        self.assertEqual([(row["revenue_year"],row["revenue_month"]) for row in rows],[(2025,7),(2026,6),(2026,7)])
+        self.assertEqual(rows[1]["revenue"],7000000000)
         self.assertEqual(rows[-1]["revenue"],7433152000)
         revenue=server.calc_revenue(rows)
         self.assertEqual(revenue["revenue_period"],"2026-07")
