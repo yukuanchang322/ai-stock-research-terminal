@@ -71,11 +71,11 @@ function bindCreditChartTooltips(series){
     svg.addEventListener('pointerdown',show);svg.addEventListener('pointermove',e=>{if(e.pointerType==='mouse'||e.buttons)show(e)});svg.addEventListener('pointerleave',()=>{tip.hidden=true});
   });
 }
-function scheduleMarginHistoryRefresh(ticker,seriesLength,revenueLength){
+function scheduleMarginHistoryRefresh(ticker,seriesLength,revenueLength,institutionalLength){
   clearTimeout(marginHistoryRefreshTimer);
-  if(seriesLength>=2&&revenueLength>=24){delete marginHistoryRefreshAttempts[ticker];return;}
-  if((marginHistoryRefreshAttempts[ticker]||0)>=2)return;
-  marginHistoryRefreshTimer=setTimeout(async()=>{if(currentTicker!==ticker)return;marginHistoryRefreshAttempts[ticker]=(marginHistoryRefreshAttempts[ticker]||0)+1;try{const response=await fetch(`/api/stock/${encodeURIComponent(ticker)}`,{cache:'no-store'}),data=await readApiResponse(response);if(response.ok&&currentTicker===ticker)render(data)}catch(e){console.warn('margin history refresh pending',e)}},55000);
+  if(seriesLength>=21&&revenueLength>=24&&institutionalLength>=20){delete marginHistoryRefreshAttempts[ticker];return;}
+  if((marginHistoryRefreshAttempts[ticker]||0)>=3)return;
+  marginHistoryRefreshTimer=setTimeout(async()=>{if(currentTicker!==ticker)return;marginHistoryRefreshAttempts[ticker]=(marginHistoryRefreshAttempts[ticker]||0)+1;try{const response=await fetch(`/api/stock/${encodeURIComponent(ticker)}`,{cache:'no-store'}),data=await readApiResponse(response);if(response.ok&&currentTicker===ticker)render(data)}catch(e){console.warn('official history refresh pending',e)}},8000);
 }
 function _techLinePoints(series,key,w,h,p,min,max){
   const vals=series.map(x=>x[key]);
@@ -247,7 +247,7 @@ function render(d){
   $('flowTable').innerHTML=flowMatrix(fl);
   $('marginHistoryCharts').innerHTML=marginHistoryDashboard(fl);
   bindCreditChartTooltips(fl.margin_history||[]);
-  scheduleMarginHistoryRefresh(d.ticker,(fl.margin_history||[]).length,(r.series||[]).length);
+  scheduleMarginHistoryRefresh(d.ticker,(fl.margin_history||[]).length,(r.series||[]).length,fl.institutional_history_count||0);
   const flows={外資:fl.foreign_20_amount,投信:fl.trust_20_amount,自營商:fl.dealer_20_amount};
   const available=Object.values(flows).filter(v=>v!=null), mx=Math.max(1,...available.map(Math.abs));
   $('flowBars').innerHTML=Object.entries(flows).map(([k,v])=>`<div class="flow-row"><span>${k} 20日</span><div class="flow-track"><div class="flow-fill ${v!=null&&v<0?'neg':''}" style="width:${v==null?0:Math.abs(v)/mx*100}%"></div></div><b>${money(v)}</b></div>`).join('');
@@ -304,7 +304,7 @@ const ex=d.expectation_gap||{};
 
   $('catalystList').innerHTML=(d.catalysts||[]).map(x=>`<li>${x}</li>`).join(''); $('riskList').innerHTML=(d.risks||[]).map(x=>`<li>${x}</li>`).join('');
   $('freshnessStrip').innerHTML=d.source_status.map(x=>`<div class="fresh ${x.status}"><span>${x.name}</span><b>${x.as_of||'缺資料'}</b></div>`).join('');
-  $('sourceTable').innerHTML=`<table class="clean-table"><thead><tr><th>資料</th><th>Dataset</th><th>最新資料日</th><th>預定更新</th><th>狀態</th></tr></thead><tbody>${d.source_status.map(x=>`<tr><td>${x.name}</td><td>${x.dataset}</td><td>${x.as_of||'—'}</td><td>${x.scheduled_update}</td><td>${x.status==='ok'?'可用':x.status==='stale'?'STALE / 已降權':x.status==='optional'?'選用 / 不影響評級':'缺資料'}</td></tr>`).join('')}</tbody></table>`;
+  $('sourceTable').innerHTML=`<table class="clean-table"><thead><tr><th>資料</th><th>Dataset</th><th>最新資料日</th><th>預定更新</th><th>狀態</th></tr></thead><tbody>${d.source_status.map(x=>`<tr><td>${x.name}</td><td>${x.dataset}</td><td>${x.as_of||'—'}</td><td>${x.scheduled_update}</td><td>${x.status==='ok'?'可用':x.status==='warming'?'歷史補齊中':x.status==='stale'?'STALE / 已降權':x.status==='optional'?'選用 / 不影響評級':'缺資料'}</td></tr>`).join('')}</tbody></table>`;
   wrapWideTables();
 }
 

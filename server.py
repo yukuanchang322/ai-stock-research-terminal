@@ -28,7 +28,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.15.5"
+APP_VERSION = "5.15.6"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -295,7 +295,7 @@ async def fetch_twse_t86_latest(ticker: str, price: float | None, anchor: date |
     return {"institutional": {}, "flow": {}, "last_date": None, "source": "TWSE T86 official", "attempts": attempts}
 
 
-OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.5"}
+OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.6"}
 
 
 def _roc_date(raw: Any) -> str:
@@ -365,15 +365,18 @@ async def fetch_mops_monthly_revenue_history(client: httpx.AsyncClient, ticker: 
     async def one(year: int, month: int) -> list[dict[str, Any]]:
         roc_year = year - 1911
         async with sem:
+            # MOPS splits some issuers (including KY companies) into the _1
+            # report. Query both official partitions instead of assuming _0.
             for market in ("sii", "otc"):
-                try:
-                    response = await client.get(f"https://mopsov.twse.com.tw/nas/t21/{market}/t21sc03_{roc_year}_{month}_0.html")
-                    response.raise_for_status()
-                    parsed = parse_mops_monthly_revenue_html(response.content, ticker, year, month)
-                    if parsed:
-                        return parsed
-                except Exception:
-                    continue
+                for partition in (0, 1):
+                    try:
+                        response = await client.get(f"https://mopsov.twse.com.tw/nas/t21/{market}/t21sc03_{roc_year}_{month}_{partition}.html")
+                        response.raise_for_status()
+                        parsed = parse_mops_monthly_revenue_html(response.content, ticker, year, month)
+                        if parsed:
+                            return parsed
+                    except Exception:
+                        continue
         return []
 
     batches = await asyncio.gather(*(one(year, month) for year, month in targets))
@@ -526,7 +529,13 @@ async def _warm_official_history(ticker: str) -> None:
         if revenue:
             data["revenue"] = revenue
         if data.get("institutional") or data.get("margin") or data.get("revenue"):
-            _OFFICIAL_HISTORY_CACHE[ticker] = (time.time(), data)
+            # Preserve independently successful providers across partial warmups.
+            prior = _OFFICIAL_HISTORY_CACHE.get(ticker)
+            merged = dict(prior[1]) if prior else {}
+            for key in ("institutional", "margin", "revenue", "valuation"):
+                if data.get(key):
+                    merged[key] = data[key]
+            _OFFICIAL_HISTORY_CACHE[ticker] = (time.time(), merged)
             _CACHE.pop(ticker, None)
     finally:
         _OFFICIAL_HISTORY_TASKS.pop(ticker, None)
@@ -3242,6 +3251,10 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         pers = merge_by_date(pers, supplements["valuation"])
 
     tech=calc_technical(prices); flow=calc_flow(inst,margin,None,prices); revenue=calc_revenue(rev); perdata=calc_per(pers); financial=calc_financials(fin)
+    flow["institutional_history_count"]=len({str(row.get("date")) for row in inst if row.get("date")})
+    flow["institutional_history_required"]=20
+    flow["margin_history_required"]=21
+    flow["history_complete"]=(flow["institutional_history_count"]>=20 and len(flow.get("margin_history") or [])>=21)
     institutional_source = "TWSE T86 official history" if supplements.get("institutional") else "FinMind TaiwanStockInstitutionalInvestorsBuySellWide"
     margin_source = "TWSE MI_MARGN official history" if supplements.get("margin") else "FinMind TaiwanStockMarginPurchaseShortSale"
     flow["margin_history_source"] = margin_source
@@ -3346,8 +3359,8 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     valuation_source = "TWSE BWIBBU official latest + FinMind history" if supplements.get("valuation") else "FinMind TaiwanStockPER"
     source_status=[
         {"name":"股價","dataset":price_source,"as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日約 17:30"},
-        {"name":"三大法人","dataset":institutional_source,"as_of":flow.get("last_date"),"status":"ok" if flow.get("last_date") else "missing","scheduled_update":"交易日約 20:00"},
-        {"name":"融資融券","dataset":margin_source,"as_of":flow.get("margin_last_date"),"status":"ok" if flow.get("margin_last_date") else "missing","scheduled_update":"交易日約 21:00"},
+        {"name":"三大法人","dataset":institutional_source,"as_of":flow.get("last_date"),"status":"ok" if flow.get("foreign_20") is not None else ("warming" if flow.get("last_date") else "missing"),"scheduled_update":"交易日約 20:00；需 20 個交易日才完成"},
+        {"name":"融資融券","dataset":margin_source,"as_of":flow.get("margin_last_date"),"status":"ok" if len(flow.get("margin_history") or [])>=21 else ("warming" if flow.get("margin_last_date") else "missing"),"scheduled_update":"交易日約 21:00；需 21 個交易日才完成"},
         {"name":"月營收","dataset":revenue_source,"as_of":revenue.get("last_date") or revenue.get("revenue_period"),"status":"ok" if revenue else "missing","scheduled_update":"依公司公告"},
         {"name":"PER/PBR","dataset":valuation_source,"as_of":perdata.get("last_date"),"status":"ok" if perdata else "missing","scheduled_update":"交易日約 18:00"},
         {"name":"財務報表","dataset":financial.get("source") or "FinMind TaiwanStockFinancialStatements","as_of":financial.get("period") or financial.get("statement_date"),"status":"ok" if financial_integrity.get("official_verified") else "stale","scheduled_update":"僅官方最新季度驗證通過才標示 OK"},
