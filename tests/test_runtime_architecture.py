@@ -38,6 +38,18 @@ class RuntimeArchitectureTests(unittest.TestCase):
         }
         self.assertEqual(server._t86_participant(row, "foreign")["net"], 5_795_046)
 
+    def test_t86_dealer_does_not_match_foreign_self_dealer_phrase(self):
+        row = {
+            "證券代號": "2330",
+            "外陸資買賣超股數(不含外資自營商)": "5,795,046",
+            "自營商買賣超股數": "456,923",
+            "自營商買進股數(自行買賣)": "488,720",
+            "自營商賣出股數(自行買賣)": "81,357",
+            "自營商買進股數(避險)": "251,419",
+            "自營商賣出股數(避險)": "201,859",
+        }
+        self.assertEqual(server._t86_participant(row, "dealer")["net"], 456_923)
+
 
 if __name__ == "__main__":
     unittest.main()
