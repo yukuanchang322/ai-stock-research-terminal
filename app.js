@@ -14,7 +14,10 @@ function lineSvg(values){
 function flowMatrix(fl){
   const rows=[['外資','foreign'],['投信','trust'],['自營商','dealer']];
   const signed=v=>v==null?'—':`${Number(v)>0?'+':''}${fmt0(v)}`;
-  return `<div class="flow-matrix"><div class="flow-head"><b>法人</b><b>1日</b><b>5日</b><b>20日</b></div>${rows.map(([label,key])=>`<div class="flow-matrix-row"><b>${label}</b>${[1,5,20].map(n=>{const v=fl[`${key}_${n}`];return `<span class="${v<0?'neg':'pos'}">${signed(v)}</span>`}).join('')}</div>`).join('')}<div class="flow-matrix-row margin-row"><b>融資%</b>${[1,5,20].map(n=>{const v=fl[`margin_${n}_pct`];return `<span class="${v>0?'neg':'pos'}">${v==null?'—':`${v>0?'+':''}${fmt(v,1)}%`}</span>`}).join('')}</div></div>`;
+  const periods=[[1,'今日'],[5,'近 5 日'],[20,'近 20 日']];
+  const cards=rows.map(([label,key])=>`<section class="flow-card" aria-label="${label}淨買賣"><div class="flow-card-head"><b>${label}</b><small>淨買賣股數</small></div><div class="flow-periods">${periods.map(([n,period])=>{const v=fl[`${key}_${n}`];return `<div class="flow-period"><span>${period}</span><strong class="${v<0?'neg':'pos'}">${signed(v)}</strong></div>`}).join('')}</div></section>`).join('');
+  const margin=`<section class="margin-card" aria-label="融資餘額變化"><div class="flow-card-head"><b>融資餘額變化</b><small>增減百分比</small></div><div class="flow-periods">${periods.map(([n,period])=>{const v=fl[`margin_${n}_pct`];return `<div class="flow-period"><span>${period}</span><strong class="${v>0?'neg':'pos'}">${v==null?'—':`${v>0?'+':''}${fmt(v,1)}%`}</strong></div>`}).join('')}</div></section>`;
+  return `<div class="flow-cards">${cards}</div>${margin}`;
 }
 function _techLinePoints(series,key,w,h,p,min,max){
   const vals=series.map(x=>x[key]);

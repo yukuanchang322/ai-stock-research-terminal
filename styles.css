@@ -46,14 +46,24 @@
 .indicator-panel{background:#08141b;border:1px solid #18313e;border-radius:9px;padding:8px}.indicator-panel svg{width:100%;height:105px;display:block}
 .indicator-line.line0{stroke:#f0c766}.indicator-line.line1{stroke:#8da7ff}.indicator-line.line2{stroke:#4ce0b3}
 .macd-bar{fill:#ff7f7f;opacity:.75}.macd-bar.neg{fill:#4ce0b3}
-.flow-matrix{display:grid;gap:0;border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-bottom:12px}
-.flow-head,.flow-matrix-row{display:grid;grid-template-columns:1.05fr repeat(3,1fr);gap:5px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--line);font-size:11px}
-.flow-head{background:#0a171f;color:var(--muted)}.flow-matrix-row:last-child{border-bottom:0}.flow-matrix-row span{text-align:right;font-weight:700}
-.flow-matrix-row .pos{color:var(--accent)}.flow-matrix-row .neg{color:var(--red)}.margin-row{background:rgba(255,255,255,.015)}
+.flow-cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:10px}
+.flow-card,.margin-card{border:1px solid var(--line);border-radius:12px;background:#0a171f;overflow:hidden}
+.flow-card-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px;padding:11px 12px;border-bottom:1px solid var(--line)}
+.flow-card-head b{font-size:14px}.flow-card-head small{color:var(--muted);font-size:9px}
+.flow-periods{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))}
+.flow-period{min-width:0;padding:11px 9px;border-right:1px solid var(--line)}.flow-period:last-child{border-right:0}
+.flow-period span{display:block;margin-bottom:5px;color:var(--muted);font-size:10px}.flow-period strong{display:block;font-size:13px;line-height:1.25;overflow-wrap:anywhere}
+.flow-period .pos{color:var(--accent)}.flow-period .neg{color:var(--red)}
+.margin-card{margin-bottom:14px;background:rgba(255,255,255,.015)}
+.margin-card .flow-period strong{font-size:15px}
 .levels{grid-template-columns:repeat(4,1fr)}
 @media(max-width:600px){
   .candle-svg{height:250px}.indicator-panel svg{height:92px}
-  .flow-head,.flow-matrix-row{padding:9px 8px;font-size:10px}
+  .flow-cards{grid-template-columns:1fr;gap:11px}
+  .flow-card,.margin-card{border-radius:13px}
+  .flow-card-head{padding:12px 13px}.flow-card-head b{font-size:16px}.flow-card-head small{font-size:10px}
+  .flow-period{padding:12px 11px}.flow-period span{font-size:11px}.flow-period strong{font-size:18px;white-space:nowrap;letter-spacing:-.02em}
+  .margin-card .flow-period strong{font-size:18px}
   .levels{grid-template-columns:repeat(2,1fr)}
 }
 @media print{
