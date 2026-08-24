@@ -7,7 +7,7 @@ let stockRequestSequence=0;
 let marginHistoryRefreshTimer=null;
 const marginHistoryRefreshAttempts={};
 let candleViewState={ticker:'',size:0,end:0};
-let candlePeriodState={ticker:'',interval:'day',daily:[],series:[],source:'研究報告日線資料',asOf:'',requestId:0};
+let candlePeriodState={ticker:'',interval:'day',daily:[],dailyTechnical:null,series:[],technical:null,source:'研究報告日線資料',asOf:'',requestId:0};
 const candlePeriodCache=new Map();
 
 function lineSvg(values){
@@ -129,6 +129,8 @@ function candleWindow(rows){
 function rerenderCandle(rows){
   const host=document.querySelector('.candle-host');if(!host)return;
   const visible=candleWindow(rows);host.innerHTML=candleSvg(visible,candlePeriodState);bindCandleTooltip(visible);bindCandleZoomPan(rows);bindCandlePeriods();
+  const indicators=document.querySelector('.period-indicators');if(indicators)indicators.innerHTML=periodIndicatorHtml(visible,candlePeriodState.interval);
+  const note=document.querySelector('.period-indicator-note');if(note)note.textContent=`下方 MA／KD／MACD／RSI 已切換為${periodLabel(candlePeriodState.interval)}指標`;
 }
 function bindCandleZoomPan(series){
   const rows=(series||[]).filter(x=>[x.open,x.high,x.low,x.close].every(v=>v!=null&&Number.isFinite(Number(v)))),chart=document.querySelector('.candle-chart'),svg=chart?.querySelector('.candle-svg');
@@ -150,19 +152,19 @@ async function switchCandlePeriod(interval){
   if(!['day','week','month'].includes(interval)||!candlePeriodState.ticker||interval===candlePeriodState.interval)return;
   const ticker=candlePeriodState.ticker,requestId=++candlePeriodState.requestId;
   if(interval==='day'){
-    candlePeriodState={...candlePeriodState,interval,series:candlePeriodState.daily,source:'研究報告日線資料',asOf:candlePeriodState.daily[candlePeriodState.daily.length-1]?.date||'',requestId};
-    candleViewState={ticker:`${ticker}:day`,size:candlePeriodState.series.length,end:candlePeriodState.series.length};rerenderCandle(candlePeriodState.series);return;
+    candlePeriodState={...candlePeriodState,interval,series:candlePeriodState.daily,technical:candlePeriodState.dailyTechnical,source:'研究報告日線資料',asOf:candlePeriodState.daily[candlePeriodState.daily.length-1]?.date||'',requestId};
+    candleViewState={ticker:`${ticker}:day`,size:candlePeriodState.series.length,end:candlePeriodState.series.length};rerenderCandle(candlePeriodState.series);renderTechnicalSummary(candlePeriodState.technical,interval);return;
   }
   const key=`${ticker}:${interval}`,host=document.querySelector('.candle-host'),cached=candlePeriodCache.get(key);
-  if(cached){candlePeriodState={...candlePeriodState,...cached,interval,requestId};candleViewState={ticker:key,size:cached.series.length,end:cached.series.length};rerenderCandle(cached.series);return;}
+  if(cached){candlePeriodState={...candlePeriodState,...cached,interval,requestId};candleViewState={ticker:key,size:cached.series.length,end:cached.series.length};rerenderCandle(cached.series);renderTechnicalSummary(cached.technical,interval);return;}
   if(host)host.innerHTML=`<div class="candle-loading">正在載入近 10 年${interval==='week'?'週線':'月線'}…</div>`;
   try{
     const response=await fetch(`/api/history/${encodeURIComponent(ticker)}?interval=${interval}`,{headers:{Accept:'application/json'}}),data=await readApiResponse(response);
     if(!response.ok)throw new Error(data.detail||'長週期資料暫時無法取得');
     if(currentTicker!==ticker||requestId!==candlePeriodState.requestId)return;
-    const next={series:data.series||[],source:data.source||'長週期價格資料',asOf:data.as_of||'',fallback:Boolean(data.fallback)};candlePeriodCache.set(key,next);
-    candlePeriodState={...candlePeriodState,...next,interval,requestId};candleViewState={ticker:key,size:next.series.length,end:next.series.length};rerenderCandle(next.series);
-  }catch(error){if(currentTicker!==ticker||requestId!==candlePeriodState.requestId)return;candlePeriodState={...candlePeriodState,interval:'day',series:candlePeriodState.daily,source:'研究報告日線資料'};candleViewState={ticker:`${ticker}:day`,size:candlePeriodState.daily.length,end:candlePeriodState.daily.length};rerenderCandle(candlePeriodState.daily);const source=document.querySelector('.candle-source');if(source)source.textContent=`週／月線載入失敗：${error.message}`;}
+    const next={series:data.series||[],technical:data.technical||null,source:data.source||'長週期價格資料',asOf:data.as_of||'',fallback:Boolean(data.fallback)};candlePeriodCache.set(key,next);
+    candlePeriodState={...candlePeriodState,...next,interval,requestId};candleViewState={ticker:key,size:next.series.length,end:next.series.length};rerenderCandle(next.series);renderTechnicalSummary(next.technical,interval);
+  }catch(error){if(currentTicker!==ticker||requestId!==candlePeriodState.requestId)return;candlePeriodState={...candlePeriodState,interval:'day',series:candlePeriodState.daily,technical:candlePeriodState.dailyTechnical,source:'研究報告日線資料'};candleViewState={ticker:`${ticker}:day`,size:candlePeriodState.daily.length,end:candlePeriodState.daily.length};rerenderCandle(candlePeriodState.daily);renderTechnicalSummary(candlePeriodState.dailyTechnical,'day');const source=document.querySelector('.candle-source');if(source)source.textContent=`週／月線載入失敗：${error.message}`;}
 }
 function oscillatorSvg(series,keys,title,minFixed=null,maxFixed=null,levels=[]){
   if(!series?.length)return '';
@@ -185,10 +187,18 @@ function macdSvg(series){
   const sig=_techLinePoints(series,'macd_signal',w,h,p,min,max).map(points=>`<polyline class="indicator-line line1" points="${points}"/>`).join('');
   return `<div class="indicator-panel"><div class="indicator-title"><b>MACD</b><span>DIF / Signal / Histogram</span></div><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><line class="guide" x1="${p}" y1="${zero}" x2="${w-p}" y2="${zero}"/>${bars}${dif}${sig}</svg></div>`;
 }
+function periodLabel(interval){return {day:'日線',week:'週線',month:'月線'}[interval]||'日線'}
+function periodIndicatorHtml(series,interval){const label=periodLabel(interval);return `${oscillatorSvg(series,['k','d'],`${label} KD`,0,100,[20,80])}${macdSvg(series).replace('<b>MACD</b>',`<b>${label} MACD</b>`)}${oscillatorSvg(series,['rsi14'],`${label} RSI 14`,0,100,[30,70])}`}
+function renderTechnicalSummary(t,interval){
+  const x=t||{},label=periodLabel(interval),unit=interval==='week'?'週':interval==='month'?'月':'日';
+  $('techPill').textContent=`${label} · ${x.trend||'資料不足'}`;
+  const caption=document.querySelector('.tech-caption');if(caption)caption.textContent=`${label}${interval==='day'?'近一年':'近 10 年'} · MA20 / MA60 · KD / MACD / RSI`;
+  $('levels').innerHTML=[[`MA20（${unit}）`,x.ma?.['20']], [`MA60（${unit}）`,x.ma?.['60']], [`第一支撐（${unit}）`,x.support1], [`60${unit}壓力`,x.resistance], [`${label} KD K`,x.k], [`${label} KD D`,x.d], [`${label} RSI14`,x.rsi14], [`${label} MACD Hist`,x.macd_hist]].map(v=>`<div class="level"><span>${v[0]}</span><b>${fmt(v[1],v[0].includes('MACD')?2:1)}</b></div>`).join('');
+  $('techAnalysis').textContent=`${label}${interval==='day'?'近一年':'近 10 年'}；MA60 為${label}中期趨勢核心。趨勢：${x.trend||'—'}；K/D ${fmt(x.k,1)}/${fmt(x.d,1)}；MACD Hist ${fmt(x.macd_hist,2)}；RSI14 ${fmt(x.rsi14,1)}。所有數值均由目前選取的${label} OHLC 重新計算。`;
+}
 function technicalDashboard(t){
-  const s=t.series||[];
-  const chartSeries=candlePeriodState.series||s;
-  return `<div class="technical-dashboard"><div class="candle-host">${candleSvg(candleWindow(chartSeries),candlePeriodState)}</div><small class="daily-indicator-note">下方 KD／MACD／RSI 維持日線指標</small>${oscillatorSvg(s,['k','d'],'KD',0,100,[20,80])}${macdSvg(s)}${oscillatorSvg(s,['rsi14'],'RSI 14',0,100,[30,70])}</div>`;
+  const s=t.series||[],chartSeries=candlePeriodState.series||s,visible=candleWindow(chartSeries);
+  return `<div class="technical-dashboard"><div class="candle-host">${candleSvg(visible,candlePeriodState)}</div><small class="period-indicator-note">下方 MA／KD／MACD／RSI 已切換為${periodLabel(candlePeriodState.interval)}指標</small><div class="period-indicators">${periodIndicatorHtml(visible,candlePeriodState.interval)}</div></div>`;
 }
 function metric(k,v,note=''){return `<div class="metric"><span>${k}</span><b>${v}</b><em>${note}</em></div>`}
 function targetRow(x){return `<div class="target-row ${x.name==='悲觀'?'bear':x.name==='樂觀'?'bull':'base'}"><span>${x.name}</span><b>${fmt0(x.target)}</b></div>`}
@@ -324,14 +334,13 @@ function render(d){
   const direction=v=>v==null?'資料不足':(v>=0?'偏買超':'偏賣超');
   $('flowAnalysis').textContent=`法人籌碼金額以每日淨買賣股數乘當日收盤價估算；短線看1日、波段轉折看5日、中期方向看20日。外資20日 ${direction(fl.foreign_20_amount)}，投信20日 ${direction(fl.trust_20_amount)}。`;
 
-  const t=d.technical||{}; $('techPill').textContent=t.trend||'資料不足';
-  if(candlePeriodState.ticker!==d.ticker){const daily=t.series||[];candlePeriodState={ticker:d.ticker,interval:'day',daily,series:daily,source:'研究報告日線資料',asOf:daily[daily.length-1]?.date||'',requestId:candlePeriodState.requestId+1};candleViewState={ticker:`${d.ticker}:day`,size:daily.length,end:daily.length}}else{candlePeriodState.daily=t.series||[];if(candlePeriodState.interval==='day')candlePeriodState.series=t.series||[]}
+  const t=d.technical||{};
+  if(candlePeriodState.ticker!==d.ticker){const daily=t.series||[];candlePeriodState={ticker:d.ticker,interval:'day',daily,dailyTechnical:t,series:daily,technical:t,source:'研究報告日線資料',asOf:daily[daily.length-1]?.date||'',requestId:candlePeriodState.requestId+1};candleViewState={ticker:`${d.ticker}:day`,size:daily.length,end:daily.length}}else{candlePeriodState.daily=t.series||[];candlePeriodState.dailyTechnical=t;if(candlePeriodState.interval==='day'){candlePeriodState.series=t.series||[];candlePeriodState.technical=t}}
   $('priceChart').innerHTML=technicalDashboard(t);
   bindCandleTooltip(candleWindow(candlePeriodState.series||[]));
   bindCandleZoomPan(candlePeriodState.series||[]);
   bindCandlePeriods();
-  $('levels').innerHTML=[['MA20',t.ma?.['20']],['MA60',t.ma?.['60']],['第一支撐',t.support1],['60日壓力',t.resistance],['KD K',t.k],['KD D',t.d],['RSI14',t.rsi14],['MACD Hist',t.macd_hist]].map(x=>`<div class="level"><span>${x[0]}</span><b>${fmt(x[1],x[0].includes('MACD')?2:1)}</b></div>`).join('');
-  $('techAnalysis').textContent=`近一年日K；MA60 為中期趨勢核心。趨勢：${t.trend||'—'}；K/D ${fmt(t.k,1)}/${fmt(t.d,1)}；MACD Hist ${fmt(t.macd_hist,2)}；RSI14 ${fmt(t.rsi14,1)}。KD >80 / <20、RSI >70 / <30 僅代表動能極端，需搭配均線與量價確認。`;
+  renderTechnicalSummary(candlePeriodState.technical||t,candlePeriodState.interval);
 
   const rr=d.research||{}; $('reportCount').textContent=rr.count||0; $('consensusText').textContent=rr.median_target?`${rr.target_coverage>=2?'法人目標價中位數':'單一已辨識機構目標'} ${fmt0(rr.median_target)}${rr.target_coverage>=2?` · ${rr.target_coverage} 筆`:' · 尚未形成共識'}`:'目前尚無通過公司與機構驗證的法人目標價'; $('revisionText').textContent=rr.forward_eps_year?`${rr.forward_eps_year}E EPS ${rr.eps_coverage>=2?'中位數':'單一來源'} ${fmt(rr.median_forward_eps,2)}（${rr.eps_coverage||0} 筆明確年度預估${rr.eps_coverage<2?'，不作法人共識':''}）`:(rr.target_revision_pct!=null?`同機構目標價修正中位數 ${pct(rr.target_revision_pct)}`:'Forward EPS：缺乏可比年度標註，不納入估值');
   if($('consensusStats')) $('consensusStats').innerHTML=[['法人機構',rr.institution_count||0],['最高目標',fmt0(rr.high_target)],['最低目標',fmt0(rr.low_target)],['買進/正向',rr.ratings?.['買進']||0],['中立',rr.ratings?.['中立']||0],['公開網路',rr.public_web_count||0]].map(x=>`<div><span>${x[0]}</span><b>${x[1]}</b></div>`).join('');

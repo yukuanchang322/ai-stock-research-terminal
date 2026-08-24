@@ -29,7 +29,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.17.1"
+APP_VERSION = "5.17.2"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -4122,7 +4122,8 @@ async def long_price_history(ticker: str, interval: str = Query("week")):
     technical = calc_technical(aggregated, view_limit=None, chart_period=f"近10年{label}")
     payload = {
         "ticker": ticker, "interval": interval, "label": label, "years": 10,
-        "series": technical.get("series") or [], "source": source,
+        "series": technical.get("series") or [],
+        "technical": {key:value for key,value in technical.items() if key != "series"}, "source": source,
         "as_of": technical.get("last_date"), "version": APP_VERSION,
         "fallback": "Yahoo Finance" in source, "errors": _compact_error_payload(errors),
     }
