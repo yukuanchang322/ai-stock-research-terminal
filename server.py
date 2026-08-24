@@ -29,7 +29,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.16.7"
+APP_VERSION = "5.16.8"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -48,6 +48,7 @@ _OFFICIAL_FINANCIAL_JOBS: dict[str, dict[str, Any]] = {}
 _MCP_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _MCP_TASKS: dict[str, asyncio.Task] = {}
 _PRICE_HISTORY_CACHE: dict[str, tuple[float, list[dict[str, Any]], str]] = {}
+_LONG_PRICE_HISTORY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 app = FastAPI(title="AI Stock Research Terminal", version=APP_VERSION)
 app.add_middleware(GZipMiddleware, minimum_size=800)
@@ -2518,7 +2519,8 @@ def macd(series: pd.Series) -> tuple[float | None, float | None, float | None]:
     return safe_num(m.iloc[-1]), safe_num(sig.iloc[-1]), safe_num(hist.iloc[-1])
 
 
-def calc_technical(prices: list[dict[str, Any]]) -> dict[str, Any]:
+def calc_technical(prices: list[dict[str, Any]], view_limit: int | None = 252,
+                   chart_period: str = "近一年日K") -> dict[str, Any]:
     df = pd.DataFrame(prices)
     if df.empty or "close" not in df.columns:
         return {}
@@ -2588,9 +2590,9 @@ def calc_technical(prices: list[dict[str, Any]]) -> dict[str, Any]:
     returns20=(last/float(close.iloc[-21])-1)*100 if len(close)>=21 else None
     returns60=(last/float(close.iloc[-61])-1)*100 if len(close)>=61 else None
 
-    # One trading year. Every row carries OHLC + MA + oscillators so the browser can render
-    # a real daily K chart and aligned KD / MACD / RSI panels.
-    view=df.tail(252)
+    # Every row carries OHLC + MA + oscillators. The main report keeps one trading year;
+    # the independent weekly/monthly endpoint requests the full aggregated range.
+    view=df if view_limit is None else df.tail(view_limit)
     series=[]
     for idx,row in view.iterrows():
         def num(v):
@@ -2611,7 +2613,7 @@ def calc_technical(prices: list[dict[str, Any]]) -> dict[str, Any]:
         "macd":num(dif.iloc[-1]),"macd_signal":num(dea.iloc[-1]),"macd_hist":num(macd_hist.iloc[-1]),
         "support1":support1,"support2":support2,"resistance":high60,
         "trend":trend,"volume_ratio_20":vol_ratio,"return_20d":returns20,"return_60d":returns60,
-        "series":series,"series_days":len(series),"chart_period":"近一年日K",
+        "series":series,"series_days":len(series),"chart_period":chart_period,
         "high_52w":float(close.tail(252).max()),"low_52w":float(close.tail(252).min()),
     }
 
@@ -3404,6 +3406,68 @@ async def fetch_yahoo_stock_history(ticker: str, market_hint: str | None = None)
     return [], "Yahoo Finance unavailable", errors
 
 
+async def fetch_yahoo_long_history(ticker: str, market_hint: str | None = None) -> tuple[list[dict[str, Any]], str, list[str]]:
+    """Ten-year daily OHLC fallback used only by the independent long-period chart route."""
+    ticker = require_numeric_taiwan_ticker(ticker)
+    market = normalize_market_type(market_hint)
+    suffixes = ["TWO", "TW"] if market == "上櫃" else ["TW", "TWO"]
+    errors: list[str] = []
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as client:
+        for suffix in suffixes:
+            symbol = f"{ticker}.{suffix}"
+            for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+                try:
+                    response = await client.get(f"https://{host}/v8/finance/chart/{symbol}",
+                                                params={"range": "10y", "interval": "1d", "events": "history"})
+                    response.raise_for_status()
+                    rows = parse_yahoo_chart_payload(response.json(), ticker)
+                    if rows:
+                        return rows, f"Yahoo Finance {symbol} 10y", errors
+                    errors.append(f"Yahoo {symbol}:no_rows")
+                except Exception as exc:
+                    errors.append(f"Yahoo {symbol}:{type(exc).__name__}")
+    return [], "Yahoo Finance unavailable", errors
+
+
+def aggregate_price_history(rows: list[dict[str, Any]], interval: str) -> list[dict[str, Any]]:
+    """Aggregate normalized daily OHLC rows into calendar weeks or months."""
+    if interval not in {"week", "month"}:
+        raise ValueError("interval must be week or month")
+    normalized: list[tuple[date, dict[str, Any]]] = []
+    for row in rows:
+        try:
+            day = date.fromisoformat(str(row.get("date"))[:10])
+        except ValueError:
+            continue
+        if safe_num(row.get("close")) is not None:
+            normalized.append((day, row))
+    normalized.sort(key=lambda item: item[0])
+    groups: dict[str, list[tuple[date, dict[str, Any]]]] = {}
+    for day, row in normalized:
+        iso = day.isocalendar()
+        key = f"{iso.year:04d}-W{iso.week:02d}" if interval == "week" else day.strftime("%Y-%m")
+        groups.setdefault(key, []).append((day, row))
+    output: list[dict[str, Any]] = []
+    for period_rows in groups.values():
+        _, first = period_rows[0]
+        last_day, last = period_rows[-1]
+        highs = [safe_num(row.get("max") if row.get("max") is not None else row.get("high")) for _, row in period_rows]
+        lows = [safe_num(row.get("min") if row.get("min") is not None else row.get("low")) for _, row in period_rows]
+        volumes = [safe_num(row.get("Trading_Volume") if row.get("Trading_Volume") is not None else row.get("volume")) for _, row in period_rows]
+        valid_highs = [value for value in highs if value is not None]
+        valid_lows = [value for value in lows if value is not None]
+        closes = [safe_num(row.get("close")) for _, row in period_rows]
+        output.append({
+            "date": last_day.isoformat(), "stock_id": last.get("stock_id"),
+            "open": safe_num(first.get("open")) or safe_num(first.get("close")),
+            "max": max(valid_highs or closes), "min": min(valid_lows or closes),
+            "close": safe_num(last.get("close")),
+            "Trading_Volume": sum(value for value in volumes if value is not None),
+        })
+    return output
+
+
 def parse_tpex_stock_day_payload(payload: dict[str, Any], ticker: str | None = None) -> list[dict[str, Any]]:
     if str(payload.get("stat") or "").lower() != "ok":
         raise RuntimeError(str(payload.get("stat") or "TPEx response is not ok"))
@@ -3951,6 +4015,39 @@ async def stock_api(ticker: str, refresh: bool = Query(False)):
             status_code=503,headers={"Cache-Control":"no-store"}
         )
     return JSONResponse(d,headers={"Cache-Control":"no-store"})
+
+@app.get("/api/history/{ticker}")
+async def long_price_history(ticker: str, interval: str = Query("week")):
+    ticker = ticker.strip()
+    if not ticker.isdigit() or len(ticker) not in (4, 5, 6):
+        raise HTTPException(400, "請輸入有效台股代號")
+    if interval not in {"week", "month"}:
+        raise HTTPException(400, "interval 僅支援 week 或 month")
+    key = f"{ticker}:{interval}"
+    cached = _LONG_PRICE_HISTORY_CACHE.get(key)
+    if cached and time.time() - cached[0] < 21600:
+        return JSONResponse(cached[1], headers={"Cache-Control": "public, max-age=300"})
+    stock_cache = (_CACHE.get(ticker) or (0, {}))[1]
+    market_type = stock_cache.get("market_type") or stock_cache.get("market")
+    daily, source, errors = await fetch_yahoo_long_history(ticker, market_type)
+    recent = _PRICE_HISTORY_CACHE.get(ticker)
+    if recent and recent[1]:
+        daily = merge_market_rows_by_date(daily, recent[1])
+        source = f"{source}；近期資料以 {recent[2]} 覆蓋"
+    if not daily:
+        raise HTTPException(503, "近十年價格資料目前無法取得")
+    aggregated = aggregate_price_history(daily, interval)
+    label = "週線" if interval == "week" else "月線"
+    technical = calc_technical(aggregated, view_limit=None, chart_period=f"近10年{label}")
+    payload = {
+        "ticker": ticker, "interval": interval, "label": label, "years": 10,
+        "series": technical.get("series") or [], "source": source,
+        "as_of": technical.get("last_date"), "version": APP_VERSION,
+        "fallback": "Yahoo Finance" in source, "errors": _compact_error_payload(errors),
+    }
+    _LONG_PRICE_HISTORY_CACHE[key] = (time.time(), payload)
+    return JSONResponse(payload, headers={"Cache-Control": "public, max-age=300"})
+
 
 @app.get("/api/diagnostics/history/{ticker}")
 async def history_diagnostics(ticker: str):

@@ -19,7 +19,7 @@ class CandleLabelsTests(unittest.TestCase):
     def test_touch_detail_is_bound_after_each_render(self):
         self.assertIn("function bindCandleTooltip(series)", self.js)
         render_at = self.js.index("$('priceChart').innerHTML=technicalDashboard(t)")
-        bind_at = self.js.index("bindCandleTooltip(candleWindow(t.series||[]))", render_at)
+        bind_at = self.js.index("bindCandleTooltip(candleWindow(candlePeriodState.series||[]))", render_at)
         self.assertLess(render_at, bind_at)
 
     def test_tooltip_contains_ohlc_date_and_moving_averages(self):
