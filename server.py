@@ -6,6 +6,7 @@ import json
 import math
 import os
 import time
+import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from statistics import median
@@ -28,7 +29,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.15.8"
+APP_VERSION = "5.15.9"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -299,7 +300,7 @@ async def fetch_twse_t86_latest(ticker: str, price: float | None, anchor: date |
     return {"institutional": {}, "flow": {}, "last_date": None, "source": "TWSE T86 official", "attempts": attempts}
 
 
-OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.8"}
+OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.9"}
 
 
 def _roc_date(raw: Any) -> str:
@@ -3271,6 +3272,170 @@ def narrative(s: dict[str, int], tech: dict[str, Any], revenue: dict[str, Any], 
 
 
 
+def normalize_ticker(value: Any) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).strip().upper()
+
+
+def require_numeric_taiwan_ticker(value: Any) -> str:
+    ticker = normalize_ticker(value)
+    if not ticker.isdigit() or len(ticker) not in (4, 5, 6):
+        raise ValueError("invalid Taiwan ticker")
+    return ticker
+
+
+def parse_tpex_stock_day_payload(payload: dict[str, Any], ticker: str | None = None) -> list[dict[str, Any]]:
+    if str(payload.get("stat") or "").lower() != "ok":
+        raise RuntimeError(str(payload.get("stat") or "TPEx response is not ok"))
+    table = next((x for x in payload.get("tables") or [] if x.get("data")), None)
+    if not table:
+        return []
+    rows: list[dict[str, Any]] = []
+    for raw in table.get("data") or []:
+        if len(raw) < 7:
+            continue
+        dm = re.match(r"(\d{3})/(\d{2})/(\d{2})", str(raw[0]).strip())
+        if not dm:
+            continue
+        def number(value: Any) -> float | None:
+            return safe_num(str(value).replace(",", "").replace("--", ""))
+        rows.append({
+            "date": f"{int(dm.group(1)) + 1911:04d}-{int(dm.group(2)):02d}-{int(dm.group(3)):02d}",
+            **({"stock_id": ticker} if ticker else {}),
+            "Trading_Volume": (number(raw[1]) or 0) * 1000,
+            "open": number(raw[3]), "max": number(raw[4]), "min": number(raw[5]), "close": number(raw[6]),
+            **({"_source": "TPEx afterTrading/tradingStock"} if ticker else {}),
+        })
+    return rows
+
+
+async def fetch_tpex_stock_day(ticker: str, months: int = 13) -> tuple[list[dict[str, Any]], list[str]]:
+    ticker = require_numeric_taiwan_ticker(ticker)
+    cursor = date(date.today().year, date.today().month, 1)
+    periods: list[date] = []
+    for _ in range(months):
+        periods.append(cursor)
+        cursor = (cursor - timedelta(days=1)).replace(day=1)
+    errors: list[str] = []
+    semaphore = asyncio.Semaphore(4)
+    async with httpx.AsyncClient(timeout=18, follow_redirects=True, headers=OFFICIAL_JSON_HEADERS) as client:
+        async def one_month(month: date) -> list[dict[str, Any]]:
+            async with semaphore:
+                try:
+                    response = await client.get(
+                        "https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock",
+                        params={"date": month.strftime("%Y/%m/01"), "code": ticker, "response": "json"},
+                    )
+                    response.raise_for_status()
+                    return parse_tpex_stock_day_payload(response.json(), ticker)
+                except Exception as exc:
+                    errors.append(f"{month:%Y-%m}: {type(exc).__name__}")
+                    return []
+        batches = await asyncio.gather(*(one_month(month) for month in periods))
+    dedup = {row["date"]: row for batch in batches for row in batch}
+    return [dedup[key] for key in sorted(dedup)], errors
+
+
+async def fetch_twse_stock_day(ticker: str, months: int = 13) -> tuple[list[dict[str, Any]], list[str]]:
+    rows = await fetch_twse_stock_day_history(ticker, months)
+    return rows, ([] if rows else ["TWSE STOCK_DAY:no_rows"])
+
+
+async def fetch_official_stock_day(ticker: str, market_hint: str | None = None) -> tuple[list[dict[str, Any]], str, list[str]]:
+    market = str(market_hint or "")
+    if "上櫃" in market or "OTC" in market.upper():
+        rows, errors = await fetch_tpex_stock_day(ticker, 13)
+        return rows, "TPEx afterTrading/tradingStock", errors
+    twse_rows, twse_errors = await fetch_twse_stock_day(ticker, 13)
+    if twse_rows:
+        return twse_rows, "TWSE STOCK_DAY", twse_errors
+    tpex_rows, tpex_errors = await fetch_tpex_stock_day(ticker, 13)
+    if tpex_rows:
+        return tpex_rows, "TPEx afterTrading/tradingStock", twse_errors + tpex_errors
+    return [], "official price unavailable", twse_errors + tpex_errors
+
+
+async def _official_info_feed(base: str, path: str, ticker: str, market_type: str) -> tuple[dict[str, Any], list[str]]:
+    try:
+        async with httpx.AsyncClient(timeout=18, follow_redirects=True, headers=OFFICIAL_JSON_HEADERS) as client:
+            response = await client.get(f"{base}{path}")
+            response.raise_for_status()
+            rows = response.json()
+        for row in rows if isinstance(rows, list) else []:
+            code = normalize_ticker(row.get("SecuritiesCompanyCode") or row.get("公司代號"))
+            if code != ticker:
+                continue
+            return {
+                "stock_id": ticker,
+                "stock_name": row.get("CompanyAbbreviation") or row.get("CompanyName") or row.get("公司簡稱") or row.get("公司名稱"),
+                "industry_category": row.get("SecuritiesIndustryCode") or row.get("產業別"),
+                "type": market_type,
+            }, []
+        return {}, [f"{market_type} company info:no_match"]
+    except Exception as exc:
+        return {}, [f"{market_type} company info:{type(exc).__name__}"]
+
+
+async def fetch_twse_stock_info(ticker: str) -> tuple[dict[str, Any], list[str]]:
+    return await _official_info_feed("https://openapi.twse.com.tw/v1", "/opendata/t187ap03_L", ticker, "上市")
+
+
+async def fetch_tpex_stock_info(ticker: str) -> tuple[dict[str, Any], list[str]]:
+    return await _official_info_feed(TPEX_OPENAPI, "/mopsfin_t187ap03_O", ticker, "上櫃")
+
+
+async def fetch_official_stock_info(ticker: str) -> tuple[dict[str, Any], list[str]]:
+    ticker = require_numeric_taiwan_ticker(ticker)
+    twse, twse_errors = await fetch_twse_stock_info(ticker)
+    if twse:
+        return twse, twse_errors
+    tpex, tpex_errors = await fetch_tpex_stock_info(ticker)
+    return tpex, ([] if tpex else twse_errors + tpex_errors)
+
+
+async def fetch_tpex_latest_supplements(ticker: str) -> dict[str, list[dict[str, Any]]]:
+    """Latest official OTC flow rows; history workers may extend them later."""
+    endpoints = ("tpex_3insti_daily_trading", "tpex_mainboard_margin_balance")
+    async with httpx.AsyncClient(timeout=18, follow_redirects=True, headers=OFFICIAL_JSON_HEADERS) as client:
+        async def fetch(endpoint: str) -> list[dict[str, Any]]:
+            try:
+                response = await client.get(f"{TPEX_OPENAPI}/{endpoint}")
+                response.raise_for_status()
+                payload = response.json()
+                return payload if isinstance(payload, list) else []
+            except Exception:
+                return []
+        institutional_rows, margin_rows = await asyncio.gather(*(fetch(endpoint) for endpoint in endpoints))
+    institutional_hit = next((row for row in institutional_rows if normalize_ticker(row.get("SecuritiesCompanyCode")) == ticker), None)
+    margin_hit = next((row for row in margin_rows if normalize_ticker(row.get("SecuritiesCompanyCode")) == ticker), None)
+    institutional: list[dict[str, Any]] = []
+    margin: list[dict[str, Any]] = []
+    if institutional_hit:
+        institutional.append({
+            "date": _roc_date(institutional_hit.get("Date")), "stock_id": ticker,
+            "Foreign_Investor_buy": safe_num(institutional_hit.get("ForeignInvestorsIncludeMainlandAreaInvestors-TotalBuy")),
+            "Foreign_Investor_sell": safe_num(institutional_hit.get("ForeignInvestorsIncludeMainlandAreaInvestors-TotalSell")),
+            "Investment_Trust_buy": safe_num(institutional_hit.get("SecuritiesInvestmentTrustCompanies-TotalBuy")),
+            "Investment_Trust_sell": safe_num(institutional_hit.get("SecuritiesInvestmentTrustCompanies-TotalSell")),
+            "Dealer_buy": safe_num(institutional_hit.get("Dealers-TotalBuy")),
+            "Dealer_sell": safe_num(institutional_hit.get("Dealers-TotalSell") or institutional_hit.get("Dealers -TotalSell")),
+            "_company_name": institutional_hit.get("CompanyName"), "_source": "TPEx 3insti official",
+        })
+    if margin_hit:
+        margin.append({
+            "date": _roc_date(margin_hit.get("Date")), "stock_id": ticker,
+            "MarginPurchaseBuy": safe_num(margin_hit.get("MarginPurchase")),
+            "MarginPurchaseSell": safe_num(margin_hit.get("MarginSales")),
+            "MarginPurchaseCashRepayment": safe_num(margin_hit.get("CashRedemption")),
+            "MarginPurchaseTodayBalance": safe_num(margin_hit.get("MarginPurchaseBalance")),
+            "ShortSaleBuy": safe_num(margin_hit.get("ShortSale")),
+            "ShortSaleSell": safe_num(margin_hit.get("ShortConvering")),
+            "ShortSaleCashRepayment": safe_num(margin_hit.get("StockRedemption")),
+            "ShortSaleTodayBalance": safe_num(margin_hit.get("ShortSaleBalance")),
+            "_source": "TPEx margin official",
+        })
+    return {"institutional": institutional, "margin": margin}
+
+
 async def fetch_twse_stock_day_history(ticker: str, months: int = 13) -> list[dict[str,Any]]:
     """Official TWSE STOCK_DAY fallback for OHLC when FinMind price is unavailable.
     Fetches up to ~13 calendar months and normalizes into the existing price schema.
@@ -3346,7 +3511,12 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     # browser/proxy timeout even when each provider is healthy.
     supplements_task = asyncio.create_task(asyncio.wait_for(fetch_official_market_supplements(ticker, today, history_days=0), timeout=16))
     official_financial_task = schedule_official_financial(ticker)
-    official_price_task = asyncio.create_task(asyncio.wait_for(fetch_twse_stock_day_history(ticker,13), timeout=25))
+    async def official_market_context():
+        official_info, info_errors = await fetch_official_stock_info(ticker)
+        official_prices, provider, price_errors = await fetch_official_stock_day(ticker, official_info.get("type"))
+        otc_supplements = await fetch_tpex_latest_supplements(ticker) if official_info.get("type") == "上櫃" else {}
+        return official_info, official_prices, provider, info_errors + price_errors, otc_supplements
+    official_market_task = asyncio.create_task(asyncio.wait_for(official_market_context(), timeout=55))
     info, prices, inst, margin, rev, pers, fin = await asyncio.gather(
         info_grab(),
         grab("TaiwanStockPrice",460),
@@ -3358,21 +3528,27 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         return_exceptions=False
     )
     price_source="FinMind TaiwanStockPrice"
-    if not prices:
-        try:
-            prices=await official_price_task
-            if prices:
-                price_source="TWSE STOCK_DAY fallback"
-                errors.append("TaiwanStockPrice: FinMind unavailable; TWSE fallback active")
-        except Exception as e:
-            errors.append(f"TWSEStockDayFallback: {type(e).__name__}")
-    elif not official_price_task.done():
-        official_price_task.cancel()
+    otc_supplements: dict[str, list[dict[str, Any]]] = {}
+    try:
+        official_info, official_prices, official_price_provider, official_market_errors, otc_supplements = await official_market_task
+        if official_info:
+            info = {**official_info, **{key:value for key,value in info.items() if value not in (None, "", "—")}}
+        if not prices and official_prices:
+            prices = official_prices
+            price_source = official_price_provider
+            errors.append(f"TaiwanStockPrice: FinMind unavailable; {official_price_provider} active")
+        errors.extend(official_market_errors)
+    except Exception as e:
+        errors.append(f"OfficialMarketRouting: {type(e).__name__}")
     try:
         supplements = await supplements_task
     except Exception as e:
         errors.append(f"OfficialMarketSupplements: {type(e).__name__}")
         supplements = {"institutional": [], "margin": [], "revenue": [], "valuation": []}
+    if otc_supplements.get("institutional"):
+        supplements["institutional"] = otc_supplements["institutional"]
+    if otc_supplements.get("margin"):
+        supplements["margin"] = otc_supplements["margin"]
 
     cached_history = _OFFICIAL_HISTORY_CACHE.get(ticker)
     history_cache_at_used = cached_history[0] if cached_history and time.time() - cached_history[0] < 3600 else 0
@@ -3410,8 +3586,11 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     flow["institutional_history_required"]=20
     flow["margin_history_required"]=21
     flow["history_complete"]=(flow["institutional_history_count"]>=20 and len(flow.get("margin_history") or [])>=21)
-    institutional_source = "TWSE T86 official history" if supplements.get("institutional") else "FinMind TaiwanStockInstitutionalInvestorsBuySellWide"
-    margin_source = "TWSE MI_MARGN official history" if supplements.get("margin") else "FinMind TaiwanStockMarginPurchaseShortSale"
+    is_otc = info.get("type") == "上櫃"
+    institutional_source = (("TPEx 3insti official" if is_otc else "TWSE T86 official history")
+                            if supplements.get("institutional") else "FinMind TaiwanStockInstitutionalInvestorsBuySellWide")
+    margin_source = (("TPEx margin official" if is_otc else "TWSE MI_MARGN official history")
+                     if supplements.get("margin") else "FinMind TaiwanStockMarginPurchaseShortSale")
     flow["margin_history_source"] = margin_source
     institutional_payload: dict[str, Any] = {}
 
@@ -3513,7 +3692,8 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     prev=tech.get("series",[])[-2]["close"] if len(tech.get("series",[]))>=2 else None
     change=((lp/prev-1)*100) if lp and prev else None
     evidence_graph=build_evidence_graph(ticker,tech,revenue,flow,perdata,financial,eps_stack,research,company_events,financial_integrity,mcp_snapshot)
-    margin_source = "TWSE MI_MARGN official history" if supplements.get("margin") else "FinMind TaiwanStockMarginPurchaseShortSale"
+    margin_source = (("TPEx margin official" if is_otc else "TWSE MI_MARGN official history")
+                     if supplements.get("margin") else "FinMind TaiwanStockMarginPurchaseShortSale")
     revenue_source = "TWSE/MOPS official current + historical monthly revenue" if supplements.get("revenue") else "FinMind TaiwanStockMonthRevenue"
     valuation_source = "TWSE BWIBBU official latest + FinMind history" if supplements.get("valuation") else "FinMind TaiwanStockPER"
     source_status=[
