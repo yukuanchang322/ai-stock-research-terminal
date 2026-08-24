@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import server
 
@@ -48,9 +48,9 @@ class IndependentHistoryWarmupTests(unittest.IsolatedAsyncioTestCase):
     async def test_revenue_survives_market_history_timeout(self):
         revenue=[{"stock_id":"2330","revenue_year":2026,"revenue_month":7,"revenue":1.0,"date":"2026-07-01"}]
         server._OFFICIAL_HISTORY_CACHE.pop("2330",None)
-        with patch.object(server,"fetch_official_market_supplements",new=AsyncMock(side_effect=TimeoutError())), \
-             patch.object(server,"fetch_mops_monthly_revenue_history",new=AsyncMock(return_value=revenue)):
-            await server._warm_official_history("2330")
+        server._save_official_history("2330","revenue",revenue)
+        with patch.object(server.httpx,"AsyncClient",side_effect=TimeoutError()):
+            await server._warm_market_provider("2330","institutional")
         self.assertEqual(server._OFFICIAL_HISTORY_CACHE["2330"][1]["revenue"],revenue)
 
 

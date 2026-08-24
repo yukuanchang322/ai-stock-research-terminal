@@ -74,8 +74,8 @@ function bindCreditChartTooltips(series){
 function scheduleMarginHistoryRefresh(ticker,seriesLength,revenueLength,institutionalLength){
   clearTimeout(marginHistoryRefreshTimer);
   if(seriesLength>=21&&revenueLength>=24&&institutionalLength>=20){delete marginHistoryRefreshAttempts[ticker];return;}
-  if((marginHistoryRefreshAttempts[ticker]||0)>=3)return;
-  marginHistoryRefreshTimer=setTimeout(async()=>{if(currentTicker!==ticker)return;marginHistoryRefreshAttempts[ticker]=(marginHistoryRefreshAttempts[ticker]||0)+1;try{const response=await fetch(`/api/stock/${encodeURIComponent(ticker)}`,{cache:'no-store'}),data=await readApiResponse(response);if(response.ok&&currentTicker===ticker)render(data)}catch(e){console.warn('official history refresh pending',e)}},8000);
+  if((marginHistoryRefreshAttempts[ticker]||0)>=20)return;
+  marginHistoryRefreshTimer=setTimeout(async()=>{if(currentTicker!==ticker)return;marginHistoryRefreshAttempts[ticker]=(marginHistoryRefreshAttempts[ticker]||0)+1;try{const response=await fetch(`/api/stock/${encodeURIComponent(ticker)}`,{cache:'no-store'}),data=await readApiResponse(response);if(response.ok&&currentTicker===ticker)render(data)}catch(e){console.warn('official history refresh pending',e)}},10000);
 }
 function _techLinePoints(series,key,w,h,p,min,max){
   const vals=series.map(x=>x[key]);
@@ -396,6 +396,7 @@ async function checkCloud(){
     if(!r.ok) throw new Error();
     dot?.classList.remove('offline'); dot?.classList.add('online');
     $('cloudStatus').textContent='雲端服務正常';
+    if(j.version) document.querySelectorAll('[data-app-version]').forEach(el=>{el.textContent=`V${j.version}`});
   }catch(e){
     dot?.classList.remove('online'); dot?.classList.add('offline');
     $('cloudStatus').textContent='雲端服務目前無法連線';
