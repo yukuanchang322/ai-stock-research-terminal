@@ -13,13 +13,33 @@ function lineSvg(values){
   return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><line x1="${p}" y1="${h-p}" x2="${w-p}" y2="${h-p}" stroke="#304653"/><polyline points="${pts}" fill="none" stroke="#4ce0b3" stroke-width="3" vector-effect="non-scaling-stroke"/></svg>`;
 }
 
+function revenueBarSvg(series){
+  const rows=(series||[]).filter(x=>x?.period&&x.revenue!=null).slice(-24);
+  if(!rows.length)return '<div class="empty">營收資料不足</div>';
+  const w=640,h=230,left=54,right=624,top=22,bottom=184,plotW=right-left,max=Math.max(1,...rows.map(x=>Number(x.revenue))),step=plotW/rows.length,barW=Math.max(5,step*.66);
+  const bars=rows.map((row,i)=>{const value=Number(row.revenue),height=value/max*(bottom-top),x=left+i*step+(step-barW)/2,y=bottom-height;return `<rect class="revenue-bar" x="${x}" y="${y}" width="${barW}" height="${height}" data-index="${i}"/>`}).join('');
+  const ticks=[0,Math.floor((rows.length-1)/2),rows.length-1],labels=ticks.map(i=>`<text class="revenue-date" x="${left+(i+.5)*step}" y="${h-12}" text-anchor="middle">${rows[i].period.replace('-','/')}</text>`).join('');
+  return `<div class="revenue-chart"><svg viewBox="0 0 ${w} ${h}" role="img" aria-label="近 ${rows.length} 個月實際營收柱狀圖"><line class="revenue-grid" x1="${left}" y1="${top}" x2="${right}" y2="${top}"/><line class="revenue-grid" x1="${left}" y1="${bottom}" x2="${right}" y2="${bottom}"/><text class="revenue-axis" x="${left-7}" y="${top+4}" text-anchor="end">${fmt(max/1e8,0)}</text><text class="revenue-axis" x="${left-7}" y="${bottom+4}" text-anchor="end">0</text>${bars}${labels}<rect class="revenue-hit" x="${left}" y="${top}" width="${plotW}" height="${bottom-top}"/></svg><div class="revenue-tooltip" hidden></div><small>單位：億元 · 公司公告實際月營收</small></div>`;
+}
+function bindRevenueTooltip(series){
+  const rows=(series||[]).filter(x=>x?.period&&x.revenue!=null).slice(-24),chart=document.querySelector('.revenue-chart'),svg=chart?.querySelector('svg'),tip=chart?.querySelector('.revenue-tooltip');
+  if(!rows.length||!svg||!tip)return;
+  const show=e=>{const rect=svg.getBoundingClientRect(),ratio=Math.max(0,Math.min(1,(e.clientX-rect.left)/rect.width)),idx=Math.min(rows.length-1,Math.max(0,Math.floor(ratio*rows.length))),row=rows[idx],prior=rows.find(x=>Number(x.period.slice(0,4))===Number(row.period.slice(0,4))-1&&x.period.slice(5)===row.period.slice(5)),yoy=prior&&Number(prior.revenue)?(Number(row.revenue)/Number(prior.revenue)-1)*100:null;tip.innerHTML=`<b>${row.period}</b><span>實際營收 ${fmt(Number(row.revenue)/1e8,2)} 億元</span><span>年增 ${pct(yoy)}</span>`;tip.hidden=false;tip.style.left=`${Math.max(20,Math.min(80,ratio*100))}%`;};
+  svg.addEventListener('pointerdown',show);svg.addEventListener('pointermove',e=>{if(e.pointerType==='mouse'||e.buttons)show(e)});svg.addEventListener('pointerleave',()=>{tip.hidden=true});
+}
+
+function money(v){
+  if(v==null)return '—';
+  const n=Number(v),a=Math.abs(n),unit=a>=1e8?'億':a>=1e4?'萬':'元',scaled=a>=1e8?n/1e8:a>=1e4?n/1e4:n;
+  return `${n>0?'+':''}${Number(scaled).toLocaleString('zh-TW',{maximumFractionDigits:a>=1e8?2:0})} ${unit}`;
+}
+
 function flowMatrix(fl){
   const rows=[['外資','foreign'],['投信','trust'],['自營商','dealer']];
-  const signed=v=>v==null?'—':`${Number(v)>0?'+':''}${fmt0(v)}`;
   const periods=[[1,'今日'],[5,'近 5 日'],[20,'近 20 日']];
-  const cards=rows.map(([label,key])=>`<section class="flow-card" aria-label="${label}淨買賣"><div class="flow-card-head"><b>${label}</b><small>淨買賣股數</small></div><div class="flow-periods">${periods.map(([n,period])=>{const v=fl[`${key}_${n}`];return `<div class="flow-period"><span>${period}</span><strong class="${v<0?'neg':'pos'}">${signed(v)}</strong></div>`}).join('')}</div></section>`).join('');
+  const cards=rows.map(([label,key])=>`<section class="flow-card" aria-label="${label}估算淨買賣金額"><div class="flow-card-head"><b>${label}</b><small>估算淨買賣金額</small></div><div class="flow-periods">${periods.map(([n,period])=>{const v=fl[`${key}_${n}_amount`];return `<div class="flow-period"><span>${period}</span><strong class="${v<0?'neg':'pos'}">${money(v)}</strong></div>`}).join('')}</div></section>`).join('');
   const margin=`<section class="margin-card" aria-label="融資餘額變化"><div class="flow-card-head"><b>融資餘額變化</b><small>增減百分比</small></div><div class="flow-periods">${periods.map(([n,period])=>{const v=fl[`margin_${n}_pct`];return `<div class="flow-period"><span>${period}</span><strong class="${v>0?'neg':'pos'}">${v==null?'—':`${v>0?'+':''}${fmt(v,1)}%`}</strong></div>`}).join('')}</div></section>`;
-  return `<div class="flow-cards">${cards}</div>${margin}`;
+  return `<div class="flow-cards">${cards}</div><small class="flow-amount-note">換算方式：每日淨買賣股數 × 當日收盤價；屬估算金額，非官方逐筆成交金額。</small>${margin}`;
 }
 function signedLots(v){
   if(v==null)return '—';
@@ -112,7 +132,7 @@ function targetRow(x){return `<div class="target-row ${x.name==='悲觀'?'bear':
 
 function snapshotKey(ticker){return `ai-stock-v5.2.12-snapshot-${ticker}`}
 function currentSnapshot(d){
-  return {generated_at:d.generated_at,score:d.scores?.['綜合'],price:d.price,median_target:d.research?.median_target,median_eps:d.research?.median_forward_eps,per:d.per?.per,foreign20:d.flow?.foreign_20,regime:d.expectation_gap?.regime};
+  return {generated_at:d.generated_at,score:d.scores?.['綜合'],price:d.price,median_target:d.research?.median_target,median_eps:d.research?.median_forward_eps,per:d.per?.per,foreign20:d.flow?.foreign_20_amount,regime:d.expectation_gap?.regime};
 }
 function deltaText(now,old,digits=1,suffix=''){if(now==null||old==null)return '—';const delta=Number(now)-Number(old);return `${delta>=0?'+':''}${delta.toFixed(digits)}${suffix}`}
 function renderSnapshotCompare(d){
@@ -122,7 +142,7 @@ function renderSnapshotCompare(d){
   if(!box)return;
   if(!old){box.innerHTML='<div class="empty bordered">這是此裝置第一次保存這檔股票的分析；下次查詢時會自動顯示前後變化。</div>';}
   else{
-    const rows=[['Research Score',old.score,now.score,deltaText(now.score,old.score,0,' 分')],['法人目標價中位數',old.median_target,now.median_target,deltaText(now.median_target,old.median_target,0,'')],['Forward EPS 中位數',old.median_eps,now.median_eps,deltaText(now.median_eps,old.median_eps,2,'')],['PER',old.per,now.per,deltaText(now.per,old.per,1,'x')],['外資20日',old.foreign20,now.foreign20,deltaText(now.foreign20,old.foreign20,0,'')]];
+    const rows=[['Research Score',old.score,now.score,deltaText(now.score,old.score,0,' 分')],['法人目標價中位數',old.median_target,now.median_target,deltaText(now.median_target,old.median_target,0,'')],['Forward EPS 中位數',old.median_eps,now.median_eps,deltaText(now.median_eps,old.median_eps,2,'')],['PER',old.per,now.per,deltaText(now.per,old.per,1,'x')],['外資20日估算金額',old.foreign20,now.foreign20,deltaText(now.foreign20,old.foreign20,0,' 元')]];
     box.innerHTML=`<div class="snapshot-head"><span>前次 ${old.generated_at?new Date(old.generated_at).toLocaleString('zh-TW'):'—'}</span><b>${old.regime||'—'} → ${now.regime||'—'}</b></div><div class="snapshot-grid">${rows.map(r=>`<div><span>${r[0]}</span><small>${r[1]==null?'—':fmt(r[1],r[0]==='Research Score'?0:1)} → ${r[2]==null?'—':fmt(r[2],r[0]==='Research Score'?0:1)}</small><b>${r[3]}</b></div>`).join('')}</div>`;
   }
   localStorage.setItem(key,JSON.stringify(now));
@@ -188,7 +208,7 @@ function render(d){
   $('companyName').textContent=d.name; $('tickerLabel').textContent=d.ticker; $('sector').textContent=d.industry; $('marketType').textContent=d.market_type;
   $('stanceTag').textContent=d.stance; $('confidenceScore').textContent=d.confidence?.overall ?? '—'; $('price').textContent=fmt(d.price,1); $('dayChange').textContent=pct(d.change_pct);
   $('thesis').textContent=d.thesis; $('dataPolicy').textContent=d.data_policy; $('overallScore').textContent=d.scores['綜合'];
-  $('kpis').innerHTML=[['預期狀態',d.expectation_gap?.regime||'—','V5.2.15'],['Research Score',`${d.scores['綜合']}/100`,'量化綜合'],['可信度',`${d.confidence?.overall??'—'}/100`,'資料+估值'],['PER',`${fmt(d.per?.per,1)}x`,'最新可得'],['營收 YoY',pct(d.revenue?.revenue_yoy),'最新月'],['外資 1/5/20日',`${fmt0(d.flow?.foreign_1)} / ${fmt0(d.flow?.foreign_5)} / ${fmt0(d.flow?.foreign_20)}`,'淨買賣'],['RSI14',fmt(d.technical?.rsi14,1),'技術動能']].map(x=>`<div class="kpi"><span>${x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`).join('');
+  $('kpis').innerHTML=[['預期狀態',d.expectation_gap?.regime||'—','V5.2.15'],['Research Score',`${d.scores['綜合']}/100`,'量化綜合'],['可信度',`${d.confidence?.overall??'—'}/100`,'資料+估值'],['PER',`${fmt(d.per?.per,1)}x`,'最新可得'],['營收 YoY',pct(d.revenue?.revenue_yoy),'最新月'],['外資 20日',money(d.flow?.foreign_20_amount),'估算淨買賣金額'],['RSI14',fmt(d.technical?.rsi14,1),'技術動能']].map(x=>`<div class="kpi"><span>${x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`).join('');
   $('dockPdf').disabled=false; $('dockShare').disabled=false; $('lastFetch').textContent=`資料頁產生 ${new Date(d.generated_at).toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit'})}`;
   // Safari-safe URL update: avoid passing a URL object to history.replaceState.
   try {
@@ -219,7 +239,8 @@ function render(d){
   const eg=d.evidence_graph||{}, esum=eg.summary||{};
   const evidenceHtml=`<div class="evidence-matrix"><h4>Multi-Source Evidence Matrix</h4><div class="evidence-stats"><div><span>Evidence</span><b>${esum.usable??0}</b></div><div><span>官方/驗證</span><b>${esum.official_or_verified??0}</b></div><div><span>Fact</span><b>${esum.facts??0}</b></div><div><span>Derived</span><b>${esum.derived_facts??0}</b></div><div><span>Estimate</span><b>${esum.estimates??0}</b></div><div><span>真正衝突</span><b>${esum.conflicts??0}</b></div><div><span>預估修正</span><b>${esum.estimate_revisions??0}</b></div><div><span>Evidence Score</span><b>${esum.evidence_score??0}</b></div></div>${(eg.conflicts||[]).length?`<div class="evidence-conflicts"><b>同定義來源衝突</b>${eg.conflicts.slice(0,4).map(c=>`<small>${c.metric} ${c.period||''} · spread ${c.spread_pct}%</small>`).join('')}</div>`:'<small class="evidence-ok">目前核心 Fact 未偵測到同期間、同定義的重大來源衝突。</small>'}${(eg.estimate_revisions||[]).length?`<div class="evidence-revisions"><b>Estimate Revision</b>${eg.estimate_revisions.slice(-4).map(r=>`<small>${r.metric} ${r.period||''} · ${r.revision_pct==null?'—':`${r.revision_pct>0?'+':''}${r.revision_pct}%`}</small>`).join('')}</div>`:''}<a class="diagnostic-link" href="/api/evidence/${encodeURIComponent(d.ticker)}" target="_blank" rel="noopener noreferrer">查看完整 Evidence JSON</a></div>`;
   document.querySelector('.eps-ledger')?.insertAdjacentHTML('afterend',evidenceHtml);
-  $('fundChart').innerHTML=lineSvg((r.series||[]).map(x=>x.revenue));
+  $('fundChart').innerHTML=revenueBarSvg(r.series||[]);
+  bindRevenueTooltip(r.series||[]);
   $('fundAnalysis').textContent=r.revenue_yoy==null?`營收年增資料不足。${staleNote}`:`最新月營收年增 ${pct(r.revenue_yoy)}；${fi.core_financials_allowed?`${es.quarter_period||'最新財報'} 單季 EPS ${fmt(es.quarter_eps,2)}、YTD EPS ${fmt(es.ytd_eps,2)}、TTM EPS ${fmt(es.ttm_eps,2)}。`:'財報 EPS 尚未通過最新季度閘門，不進核心估值。'} ${staleNote}`;
 
   const fl=d.flow||{};
@@ -227,11 +248,11 @@ function render(d){
   $('marginHistoryCharts').innerHTML=marginHistoryDashboard(fl);
   bindCreditChartTooltips(fl.margin_history||[]);
   scheduleMarginHistoryRefresh(d.ticker,(fl.margin_history||[]).length);
-  const flows={外資:fl.foreign_20,投信:fl.trust_20,自營商:fl.dealer_20};
+  const flows={外資:fl.foreign_20_amount,投信:fl.trust_20_amount,自營商:fl.dealer_20_amount};
   const available=Object.values(flows).filter(v=>v!=null), mx=Math.max(1,...available.map(Math.abs));
-  $('flowBars').innerHTML=Object.entries(flows).map(([k,v])=>`<div class="flow-row"><span>${k} 20日</span><div class="flow-track"><div class="flow-fill ${v!=null&&v<0?'neg':''}" style="width:${v==null?0:Math.abs(v)/mx*100}%"></div></div><b>${v==null?'—':`${v>0?'+':''}${fmt0(v)}`}</b></div>`).join('');
+  $('flowBars').innerHTML=Object.entries(flows).map(([k,v])=>`<div class="flow-row"><span>${k} 20日</span><div class="flow-track"><div class="flow-fill ${v!=null&&v<0?'neg':''}" style="width:${v==null?0:Math.abs(v)/mx*100}%"></div></div><b>${money(v)}</b></div>`).join('');
   const direction=v=>v==null?'資料不足':(v>=0?'偏買超':'偏賣超');
-  $('flowAnalysis').textContent=`法人籌碼以實際交易日的 1日 / 5日 / 20日尺度判讀；短線看1日、波段轉折看5日、中期方向看20日。外資20日 ${direction(fl.foreign_20)}，投信20日 ${direction(fl.trust_20)}。`;
+  $('flowAnalysis').textContent=`法人籌碼金額以每日淨買賣股數乘當日收盤價估算；短線看1日、波段轉折看5日、中期方向看20日。外資20日 ${direction(fl.foreign_20_amount)}，投信20日 ${direction(fl.trust_20_amount)}。`;
 
   const t=d.technical||{}; $('techPill').textContent=t.trend||'資料不足';
   $('priceChart').innerHTML=technicalDashboard(t);

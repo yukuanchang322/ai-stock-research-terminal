@@ -28,7 +28,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.15.0"
+APP_VERSION = "5.15.1"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -293,7 +293,7 @@ async def fetch_twse_t86_latest(ticker: str, price: float | None, anchor: date |
     return {"institutional": {}, "flow": {}, "last_date": None, "source": "TWSE T86 official", "attempts": attempts}
 
 
-OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.0"}
+OFFICIAL_JSON_HEADERS = {"User-Agent": "Mozilla/5.0 AI-Stock-Research/5.15.1"}
 
 
 def _roc_date(raw: Any) -> str:
@@ -325,6 +325,54 @@ def parse_twse_revenue_rows(payload: Any, ticker: str) -> list[dict[str, Any]]:
                         "revenue": value * 1000, "date": f"{y:04d}-{month:02d}-01",
                         "_source": f"TWSE/MOPS t187ap05_L {source}"})
     return out
+
+
+def parse_mops_monthly_revenue_html(content: bytes | str, ticker: str, year: int, month: int) -> list[dict[str, Any]]:
+    """Parse one official MOPS historical monthly-revenue page (unit: NT$ thousand)."""
+    text = content.decode("big5", errors="ignore") if isinstance(content, bytes) else str(content)
+    try:
+        document = lxml_html.fromstring(text)
+    except Exception:
+        return []
+    for row in document.xpath("//tr"):
+        cells = [" ".join(cell.text_content().split()) for cell in row.xpath("./td")]
+        if len(cells) < 3 or cells[0].strip() != ticker:
+            continue
+        value = parse_num_text(cells[2])
+        if value is None:
+            return []
+        return [{"stock_id": ticker, "revenue_year": year, "revenue_month": month,
+                 "revenue": value * 1000, "date": f"{year:04d}-{month:02d}-01",
+                 "_source": "MOPS official historical monthly revenue"}]
+    return []
+
+
+async def fetch_mops_monthly_revenue_history(client: httpx.AsyncClient, ticker: str, anchor: date, months: int = 24) -> list[dict[str, Any]]:
+    """Fetch 24 announced monthly facts from MOPS historical pages."""
+    cursor = date(anchor.year, anchor.month, 1) - timedelta(days=1)
+    targets: list[tuple[int, int]] = []
+    for _ in range(months):
+        targets.append((cursor.year, cursor.month))
+        cursor = date(cursor.year, cursor.month, 1) - timedelta(days=1)
+    sem = asyncio.Semaphore(6)
+
+    async def one(year: int, month: int) -> list[dict[str, Any]]:
+        roc_year = year - 1911
+        async with sem:
+            for market in ("sii", "otc"):
+                try:
+                    response = await client.get(f"https://mopsov.twse.com.tw/nas/t21/{market}/t21sc03_{roc_year}_{month}_0.html")
+                    response.raise_for_status()
+                    parsed = parse_mops_monthly_revenue_html(response.content, ticker, year, month)
+                    if parsed:
+                        return parsed
+                except Exception:
+                    continue
+        return []
+
+    batches = await asyncio.gather(*(one(year, month) for year, month in targets))
+    rows = [row for batch in batches for row in batch]
+    return sorted(rows, key=lambda row: row["date"])[-months:]
 
 
 def parse_twse_institutional_payload(payload: Any, ticker: str, day: str) -> list[dict[str, Any]]:
@@ -379,7 +427,12 @@ async def fetch_official_market_supplements(ticker: str, anchor: date | None = N
             return response.json()
 
         async def revenue():
-            return parse_twse_revenue_rows(await get_json("https://openapi.twse.com.tw/v1/opendata/t187ap05_L"), ticker)
+            latest = parse_twse_revenue_rows(await get_json("https://openapi.twse.com.tw/v1/opendata/t187ap05_L"), ticker)
+            if not history_days:
+                return latest
+            history = await fetch_mops_monthly_revenue_history(client, ticker, end, 24)
+            merged = {row["date"]: row for row in latest + history}
+            return [merged[key] for key in sorted(merged)][-24:]
 
         async def valuation():
             payload = await get_json("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL")
@@ -446,7 +499,7 @@ async def fetch_official_market_supplements(ticker: str, anchor: date | None = N
 async def _warm_official_history(ticker: str) -> None:
     try:
         data = await asyncio.wait_for(fetch_official_market_supplements(ticker, history_days=45), timeout=48)
-        if data.get("institutional") or data.get("margin"):
+        if data.get("institutional") or data.get("margin") or data.get("revenue"):
             _OFFICIAL_HISTORY_CACHE[ticker] = (time.time(), data)
             _CACHE.pop(ticker, None)
     finally:
@@ -2321,7 +2374,8 @@ def calc_technical(prices: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]], lending: dict[str, Any] | None = None) -> dict[str, Any]:
+def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]], lending: dict[str, Any] | None = None,
+              price_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     df=pd.DataFrame(rows)
     result: dict[str,Any]={}
     if not df.empty:
@@ -2344,6 +2398,37 @@ def calc_flow(rows: list[dict[str, Any]], margin_rows: list[dict[str, Any]], len
         result.update(values)
         if any(value is not None for value in values.values()):
             result["last_date"] = str(df.iloc[-1]["date"])
+        # Per-stock T86/FinMind institutional feeds publish shares, not traded
+        # consideration. Estimate the amount with each session's close and
+        # expose the method so the UI never calls it an official amount.
+        price_by_date: dict[str, float] = {}
+        for row in price_rows or []:
+            day = str(row.get("date") or "")[:10]
+            close = safe_num(row.get("close") if row.get("close") is not None else row.get("Close"))
+            if day and close is not None:
+                price_by_date[day] = close
+
+        def estimated_amount(prefix: str, n: int) -> float | None:
+            buy=[c for c in df.columns if c.startswith(prefix) and c.endswith("_buy")]
+            sell=[c for c in df.columns if c.startswith(prefix) and c.endswith("_sell")]
+            if len(df) < n or not (buy or sell):
+                return None
+            total = 0.0
+            for _, row in df.tail(n).iterrows():
+                close = price_by_date.get(str(row.get("date") or "")[:10])
+                if close is None:
+                    return None
+                total += (sum(float(row[c]) for c in buy) - sum(float(row[c]) for c in sell)) * close
+            return total
+
+        amounts = {
+            "foreign_1_amount":estimated_amount("Foreign_",1),"foreign_5_amount":estimated_amount("Foreign_",5),"foreign_20_amount":estimated_amount("Foreign_",20),
+            "trust_1_amount":estimated_amount("Investment_Trust",1),"trust_5_amount":estimated_amount("Investment_Trust",5),"trust_20_amount":estimated_amount("Investment_Trust",20),
+            "dealer_1_amount":estimated_amount("Dealer",1),"dealer_5_amount":estimated_amount("Dealer",5),"dealer_20_amount":estimated_amount("Dealer",20),
+        }
+        result.update(amounts)
+        if any(value is not None for value in amounts.values()):
+            result.update({"institutional_amount_unit":"TWD","institutional_amount_method":"net_shares_x_daily_close","institutional_amount_label":"估算淨買賣金額"})
 
     mdf=pd.DataFrame(margin_rows)
     if not mdf.empty and "MarginPurchaseTodayBalance" in mdf.columns:
@@ -2908,7 +2993,7 @@ def narrative(s: dict[str, int], tech: dict[str, Any], revenue: dict[str, Any], 
     facts=[]
     if revenue.get("revenue_yoy") is not None: facts.append(f"最新月營收年增 {revenue['revenue_yoy']:+.1f}%")
     if revenue.get("revenue_3m_yoy") is not None: facts.append(f"近3月營收年增 {revenue['revenue_3m_yoy']:+.1f}%")
-    if flow.get("foreign_20") is not None: facts.append(f"外資近20日淨買賣 {flow['foreign_20']:,.0f} 股")
+    if flow.get("foreign_20_amount") is not None: facts.append(f"外資近20日估算淨買賣金額 {flow['foreign_20_amount']/100_000_000:+,.2f} 億元")
     if tech.get("trend"): facts.append(f"技術趨勢 {tech['trend']}")
     if research.get("eps_revision_pct") is not None: facts.append(f"法人研究 Forward EPS 修正 {research['eps_revision_pct']:+.1f}%")
     if base: facts.append(f"模型基準合理價約 {base['target']:,.0f} 元")
@@ -3036,6 +3121,8 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
             supplements["institutional"] = history_data["institutional"]
         if history_data.get("margin"):
             supplements["margin"] = history_data["margin"]
+        if history_data.get("revenue"):
+            supplements["revenue"] = history_data["revenue"]
 
     def merge_by_date(base: list[dict[str, Any]], official: list[dict[str, Any]]) -> list[dict[str, Any]]:
         merged = {str(row.get("date")): row for row in base if row.get("date")}
@@ -3057,7 +3144,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     if supplements.get("valuation"):
         pers = merge_by_date(pers, supplements["valuation"])
 
-    tech=calc_technical(prices); flow=calc_flow(inst,margin); revenue=calc_revenue(rev); perdata=calc_per(pers); financial=calc_financials(fin)
+    tech=calc_technical(prices); flow=calc_flow(inst,margin,None,prices); revenue=calc_revenue(rev); perdata=calc_per(pers); financial=calc_financials(fin)
     institutional_source = "TWSE T86 official history" if supplements.get("institutional") else "FinMind TaiwanStockInstitutionalInvestorsBuySellWide"
     margin_source = "TWSE MI_MARGN official history" if supplements.get("margin") else "FinMind TaiwanStockMarginPurchaseShortSale"
     flow["margin_history_source"] = margin_source
@@ -3158,7 +3245,7 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
     change=((lp/prev-1)*100) if lp and prev else None
     evidence_graph=build_evidence_graph(ticker,tech,revenue,flow,perdata,financial,eps_stack,research,company_events,financial_integrity,mcp_snapshot)
     margin_source = "TWSE MI_MARGN official history" if supplements.get("margin") else "FinMind TaiwanStockMarginPurchaseShortSale"
-    revenue_source = "TWSE/MOPS official latest + FinMind history" if supplements.get("revenue") else "FinMind TaiwanStockMonthRevenue"
+    revenue_source = "TWSE/MOPS official current + historical monthly revenue" if supplements.get("revenue") else "FinMind TaiwanStockMonthRevenue"
     valuation_source = "TWSE BWIBBU official latest + FinMind history" if supplements.get("valuation") else "FinMind TaiwanStockPER"
     source_status=[
         {"name":"股價","dataset":price_source,"as_of":tech.get("last_date"),"status":"ok" if tech else "missing","scheduled_update":"交易日約 17:30"},
@@ -3208,7 +3295,7 @@ def report_html(d: dict[str, Any]) -> str:
     <h2>2. Expectation Gap & Revision Radar</h2><div class='call'><b>{esc(exp.get('regime'))}</b><br>{esc(exp.get('summary'))}</div><div class='grid'><div class='card'>預期修正分數<b>{exp.get('revision_score','—')}/100</b></div><div class='card'>EPS 修正<b>{pct(research.get('eps_revision_pct'))}</b></div><div class='card'>目標價修正<b>{pct(research.get('target_revision_pct'))}</b></div><div class='card'>估值區域<b style='font-size:10pt'>{esc(exp.get('valuation_zone'))}</b></div></div><table><tr><th>法人</th><th>前次 → 最新</th><th>EPS 修正</th><th>目標價修正</th><th>最新目標</th></tr>{erows}</table><p class='small muted'>{esc(exp.get('methodology'))}</p>
     <h2>3. Research Pipeline & Data Boundary</h2><div class='grid'><div class='card'>Research View<b style='font-size:11pt'>{esc(rp.get('stance'))}</b></div><div class='card'>Boundary Grade<b>{esc(db.get('grade'))}</b></div><div class='card'>Facts<b>{rp.get('evidence_counts',{}).get('facts','—')}</b></div><div class='card'>Estimates<b>{rp.get('evidence_counts',{}).get('estimates','—')}</b></div></div><div class='call'>{esc(rp.get('investment_view'))}</div><p><b>Data Boundary:</b> {esc(db.get('message'))}</p><div class='cols'><div><b>成立條件</b><ul>{''.join(f"<li>{esc(x.get('condition'))}</li>" for x in rp.get('action_conditions',[]))}</ul></div><div><b>失效條件</b><ul>{''.join(f"<li>{esc(x)}</li>" for x in rp.get('invalidation_conditions',[]))}</ul></div></div>
     <h2>4. Fundamentals & EPS Integrity</h2><table><tr><th>最新月營收</th><th>YoY</th><th>單季 EPS</th><th>YTD EPS</th><th>TTM EPS</th><th>財報期間</th></tr><tr><td>{nfmt(rev.get('latest_revenue'),0)}</td><td>{pct(rev.get('revenue_yoy'))}</td><td>{nfmt(d.get('eps_stack',{}).get('quarter_eps'),2)}</td><td>{nfmt(d.get('eps_stack',{}).get('ytd_eps'),2)}</td><td>{nfmt(d.get('eps_stack',{}).get('ttm_eps'),2)}</td><td>{esc(fin.get('period') or fin.get('statement_date'))}</td></tr></table><p class='small muted'>{esc(d.get('eps_stack',{}).get('note'))}</p>
-    <h2>5. Positioning & Technicals</h2><table><tr><th>外資20日</th><th>投信20日</th><th>融資20日</th><th>趨勢</th><th>RSI14</th><th>量比</th><th>支撐 / 壓力</th></tr><tr><td>{nfmt(flow.get('foreign_20'),0)}</td><td>{nfmt(flow.get('trust_20'),0)}</td><td>{pct(flow.get('margin_20_pct'))}</td><td>{esc(tech.get('trend'))}</td><td>{nfmt(tech.get('rsi14'),1)}</td><td>{nfmt(tech.get('volume_ratio_20'),2)}x</td><td>{nfmt(tech.get('support1'),1)} / {nfmt(tech.get('resistance'),1)}</td></tr></table>
+    <h2>5. Positioning & Technicals</h2><table><tr><th>外資20日估算金額</th><th>投信20日估算金額</th><th>融資20日</th><th>趨勢</th><th>RSI14</th><th>量比</th><th>支撐 / 壓力</th></tr><tr><td>{nfmt(flow.get('foreign_20_amount'),0)} 元</td><td>{nfmt(flow.get('trust_20_amount'),0)} 元</td><td>{pct(flow.get('margin_20_pct'))}</td><td>{esc(tech.get('trend'))}</td><td>{nfmt(tech.get('rsi14'),1)}</td><td>{nfmt(tech.get('volume_ratio_20'),2)}x</td><td>{nfmt(tech.get('support1'),1)} / {nfmt(tech.get('resistance'),1)}</td></tr></table><p class='small muted'>法人金額以每日淨買賣股數 × 當日收盤價換算，為估算值，非官方逐筆成交金額。</p>
     <div class='page-break'></div><h2>6. Analyst Research & Revisions</h2><p>匯入報告數：<b>{research.get('count',0)}</b> ｜ Forward EPS 修正：<b>{pct(research.get('eps_revision_pct'))}</b></p><table><tr><th>法人/券商</th><th>日期</th><th>評等</th><th>目標價</th><th>Forward EPS</th></tr>{rrows}</table><p class='small muted'>本區彙整公開網路可取得之研究引用與使用者匯入資料；僅保存標題、摘要、數值、發布者與來源連結，不重製付費研究全文。</p>
     <h2>7. Company Events & Earnings-call Radar</h2><table><tr><th>日期</th><th>事件</th><th>發布者</th></tr>{''.join(f"<tr><td>{esc(x.get('date'))}</td><td>{esc(x.get('title'))}</td><td>{esc(x.get('publisher'))}</td></tr>" for x in d.get('company_events',{{}}).get('rows',[])[:8]) or "<tr><td colspan='3'>目前未搜尋到公司事件引用。</td></tr>"}</table>
     <h2>8. Valuation Framework</h2><p>EPS：{esc(val.get('eps_basis'))}<br>PE：{esc(val.get('pe_basis'))}</p><table><tr><th>情境</th><th>EPS</th><th>合理 PE</th><th>模型合理價</th><th>相對現價</th></tr>{scenarios}</table>
