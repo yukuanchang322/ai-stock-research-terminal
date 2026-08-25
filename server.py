@@ -29,7 +29,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.17.5"
+APP_VERSION = "5.17.6"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -4252,6 +4252,61 @@ def report_html(d: dict[str, Any]) -> str:
     </body></html>"""
 
 
+def write_reportlab_fallback_pdf(d: dict[str, Any], out: Path) -> None:
+    """Create a dependency-light Traditional Chinese PDF when HTML rendering fails."""
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    font_name="NotoSansTC"
+    font_path=ROOT/"assets"/"fonts"/"NotoSansTC-VF.ttf"
+    if not font_path.is_file():
+        raise FileNotFoundError("bundled Traditional Chinese PDF font is missing")
+    if font_name not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(TTFont(font_name,str(font_path)))
+    styles=getSampleStyleSheet()
+    title=ParagraphStyle("ChineseTitle",parent=styles["Title"],fontName=font_name,fontSize=20,leading=26,alignment=TA_CENTER,textColor=colors.HexColor("#13202a"))
+    heading=ParagraphStyle("ChineseHeading",parent=styles["Heading2"],fontName=font_name,fontSize=13,leading=18,spaceBefore=10,spaceAfter=6,textColor=colors.HexColor("#173847"))
+    body=ParagraphStyle("ChineseBody",parent=styles["BodyText"],fontName=font_name,fontSize=9.5,leading=15,textColor=colors.HexColor("#263840"))
+    small=ParagraphStyle("ChineseSmall",parent=body,fontSize=8,leading=12,textColor=colors.HexColor("#60727c"))
+    doc=SimpleDocTemplate(str(out),pagesize=A4,rightMargin=13*mm,leftMargin=13*mm,topMargin=12*mm,bottomMargin=12*mm,
+                          title=f"{d.get('ticker','')} AI Stock Research V{APP_VERSION}",author="AI Stock Research Terminal")
+    esc=lambda value: html.escape("—" if value is None else str(value))
+    story=[Paragraph(f"{esc(d.get('name'))} {esc(d.get('ticker'))}",title),
+           Paragraph(f"AI Stock Research Terminal V{APP_VERSION}｜產生時間 {esc(d.get('generated_at'))}",small),Spacer(1,5*mm)]
+    story.extend([Paragraph("投資摘要",heading),Paragraph(esc(d.get("thesis") or "目前資料不足以形成完整摘要。"),body)])
+    scores=d.get("scores") or {}; financial=d.get("financial") or {}; revenue=d.get("revenue") or {}; technical=d.get("technical") or {}; valuation=d.get("valuation") or {}
+    overview=[
+        ["最新收盤","綜合評分","財報期間","TTM EPS"],
+        [nfmt(safe_num(d.get("price")),1),esc(scores.get("綜合")),esc(financial.get("period") or financial.get("statement_date")),nfmt(safe_num(financial.get("ttm_eps")),2)],
+        ["最新月營收","營收年增","技術趨勢","可信度"],
+        [nfmt(safe_num(revenue.get("latest_revenue")),0),pct(safe_num(revenue.get("revenue_yoy"))),esc(technical.get("trend")),esc((d.get("confidence") or {}).get("overall"))],
+    ]
+    table=Table(overview,colWidths=[43*mm]*4)
+    table.setStyle(TableStyle([("FONTNAME",(0,0),(-1,-1),font_name),("FONTSIZE",(0,0),(-1,-1),8.5),("LEADING",(0,0),(-1,-1),12),
+                               ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#eaf2f1")),("BACKGROUND",(0,2),(-1,2),colors.HexColor("#eaf2f1")),
+                               ("GRID",(0,0),(-1,-1),.4,colors.HexColor("#b7c6cc")),("VALIGN",(0,0),(-1,-1),"MIDDLE"),("PADDING",(0,0),(-1,-1),6)]))
+    story.extend([Spacer(1,4*mm),table,Paragraph("估值情境",heading)])
+    scenarios=valuation.get("scenarios") or []
+    value_rows=[["情境","EPS","合理 PE","模型合理價","相對現價"]]+[[esc(x.get("name")),nfmt(safe_num(x.get("eps")),2),f"{nfmt(safe_num(x.get('pe')),1)}x",nfmt(safe_num(x.get("target")),0),pct(safe_num(x.get("upside_pct")))] for x in scenarios]
+    if len(value_rows)==1:value_rows.append(["資料不足","—","—","—","—"])
+    value_table=Table(value_rows,colWidths=[34*mm]*5,repeatRows=1)
+    value_table.setStyle(TableStyle([("FONTNAME",(0,0),(-1,-1),font_name),("FONTSIZE",(0,0),(-1,-1),8),("BACKGROUND",(0,0),(-1,0),colors.HexColor("#173847")),
+                                     ("TEXTCOLOR",(0,0),(-1,0),colors.white),("GRID",(0,0),(-1,-1),.35,colors.HexColor("#c6d1d5")),("PADDING",(0,0),(-1,-1),5)]))
+    story.append(value_table)
+    for label,items in (("主要催化劑",d.get("catalysts") or []),("主要風險",d.get("risks") or [])):
+        story.append(Paragraph(label,heading))
+        story.append(Paragraph("<br/>".join(f"• {esc(item)}" for item in items) or "—",body))
+    story.extend([Paragraph("資料與揭露",heading),Paragraph("本檔為 HTML PDF 引擎不可用時產生的繁體中文備援報告；核心價格、財報、評分、估值與風險資料取自同一次網頁研究結果。",small),
+                  Paragraph("重要聲明：本系統為研究與資訊整理工具，不構成個人化投資建議、招攬或收益保證。",small)])
+    doc.build(story)
+
+
 @app.middleware("http")
 async def runtime_headers(request, call_next):
     response = await call_next(request)
@@ -4369,18 +4424,30 @@ async def history_diagnostics(ticker: str):
     }, headers={"Cache-Control":"no-store"})
 
 @app.get("/api/stock/{ticker}/pdf")
-async def stock_pdf(ticker: str, refresh: bool = Query(True)):
+async def stock_pdf(ticker: str, refresh: bool = Query(False)):
+    ticker=ticker.strip()
+    if not ticker.isdigit() or len(ticker) not in (4,5,6):
+        raise HTTPException(400,"請輸入有效台股代號")
     try:
-        from weasyprint import HTML
-    except (ImportError, OSError):
-        raise HTTPException(503,"PDF 引擎目前不可用；網頁研究報告仍可正常使用。")
-    d=await build_stock(ticker.strip(), force_refresh=refresh)
-    if d["price"] is None: raise HTTPException(503,"目前無法取得股價資料，為避免輸出錯誤報告，PDF 未產生。")
+        d=await build_stock(ticker,force_refresh=refresh)
+    except Exception as exc:
+        raise HTTPException(503,"研究資料暫時無法準備完成，請稍後再產生 PDF。") from exc
+    if d.get("price") is None: raise HTTPException(503,"目前無法取得股價資料，為避免輸出錯誤報告，PDF 未產生。")
     stamp=datetime.now().strftime("%Y%m%d_%H%M")
     version_slug=APP_VERSION.replace(".","_")
     out=REPORT_DIR/f"{ticker}_{stamp}_research_v{version_slug}.pdf"
-    HTML(string=report_html(d),base_url=str(ROOT)).write_pdf(out)
-    return FileResponse(out,media_type="application/pdf",filename=f"{ticker}_AI_research_V{version_slug}_{stamp}.pdf")
+    renderer="weasyprint"
+    try:
+        from weasyprint import HTML
+        HTML(string=report_html(d),base_url=str(ROOT)).write_pdf(out)
+    except Exception:
+        renderer="reportlab-fallback"
+        try:
+            write_reportlab_fallback_pdf(d,out)
+        except Exception as exc:
+            raise HTTPException(503,"PDF 引擎目前無法完成報告，請稍後再試。") from exc
+    filename=f"{ticker}_AI_research_V{version_slug}_{stamp}.pdf"
+    return FileResponse(out,media_type="application/pdf",headers={"Content-Disposition":f'inline; filename="{filename}"',"X-PDF-Renderer":renderer,"Cache-Control":"no-store"})
 
 @app.post("/api/cache/clear")
 async def cache_clear(request: Request):
