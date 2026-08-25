@@ -464,7 +464,34 @@ async function loadTicker(ticker, force=false){
 }
 $('searchBtn').onclick=()=>loadTicker($('tickerInput').value.trim()); $('refreshBtn').onclick=()=>loadTicker($('tickerInput').value.trim(), true);
 $('tickerInput').addEventListener('keydown',e=>{if(e.key==='Enter')loadTicker(e.target.value.trim())});
-$('pdfBtn').onclick=()=>{if(currentTicker) window.location.href=`/api/stock/${currentTicker}/pdf`;};
+async function openPdfReport(){
+  if(!currentTicker)return;
+  const buttons=[$('pdfBtn'),$('dockPdf')].filter(Boolean);
+  const preview=window.open('','_blank');
+  buttons.forEach(button=>{button.dataset.pdfLabel=button.innerHTML;button.disabled=true;button.setAttribute('aria-busy','true');button.innerHTML=button.id==='dockPdf'?'<span>…</span>產生中':'PDF 產生中…';});
+  $('errorBox').classList.add('hidden');
+  try{
+    const response=await fetch(`/api/stock/${encodeURIComponent(currentTicker)}/pdf?refresh=false`,{headers:{Accept:'application/pdf'},cache:'no-store'});
+    if(!response.ok){
+      const raw=await response.text();
+      let message='';
+      try{const payload=JSON.parse(raw);message=payload.detail||payload.message||'';}catch(_){message=raw.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();}
+      throw new Error(message||`PDF 產生失敗（HTTP ${response.status}）`);
+    }
+    const blob=await response.blob();
+    if(blob.type!=='application/pdf')throw new Error('伺服器未回傳有效 PDF 檔案。');
+    const url=URL.createObjectURL(blob);
+    if(preview)preview.location.replace(url);else window.location.href=url;
+    setTimeout(()=>URL.revokeObjectURL(url),120000);
+  }catch(error){
+    if(preview)preview.close();
+    $('errorBox').textContent=error?.message||'PDF 產生失敗，請稍後再試。';
+    $('errorBox').classList.remove('hidden');
+  }finally{
+    buttons.forEach(button=>{button.innerHTML=button.dataset.pdfLabel||button.innerHTML;delete button.dataset.pdfLabel;button.removeAttribute('aria-busy');button.disabled=false;});
+  }
+}
+$('pdfBtn').onclick=openPdfReport;
 $('methodBtn').onclick=()=>$('methodModal').classList.add('open'); $('closeModal').onclick=()=>$('methodModal').classList.remove('open');
 window.addEventListener('load',()=>{const q=new URLSearchParams(location.search).get('ticker'); if(q) $('tickerInput').value=q; loadTicker($('tickerInput').value.trim());});
 
@@ -559,7 +586,7 @@ $('closeInstall').onclick=()=>$('installSheet').classList.remove('open');
 $('installOk').onclick=()=>$('installSheet').classList.remove('open');
 $('dockSearch').onclick=()=>{document.querySelector('.search-card').scrollIntoView({behavior:'smooth',block:'start'});setTimeout(()=>$('tickerInput').focus(),300)};
 $('dockRefresh').onclick=()=>currentTicker&&loadTicker(currentTicker,true);
-$('dockPdf').onclick=()=>currentTicker&&(window.location.href=`/api/stock/${currentTicker}/pdf?refresh=true`);
+$('dockPdf').onclick=openPdfReport;
 $('dockShare').onclick=async()=>{
   if(!currentTicker)return;
   let shareUrl=`${location.origin}${location.pathname}?ticker=${encodeURIComponent(currentTicker)}`;
