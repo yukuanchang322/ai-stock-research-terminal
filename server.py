@@ -29,7 +29,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.17.6"
+APP_VERSION = "5.17.7"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -39,6 +39,8 @@ FINMIND_BASE = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 CACHE_ADMIN_TOKEN = os.getenv("CACHE_ADMIN_TOKEN", "").strip()
+PDF_CACHE_TTL = min(CACHE_TTL, int(os.getenv("PDF_CACHE_TTL_SECONDS", "600")))
+PDF_RENDERER = os.getenv("PDF_RENDERER", "reportlab").strip().lower()
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _OFFICIAL_HISTORY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _OFFICIAL_HISTORY_TASKS: dict[str, asyncio.Task] = {}
@@ -50,6 +52,9 @@ _MCP_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _MCP_TASKS: dict[str, asyncio.Task] = {}
 _PRICE_HISTORY_CACHE: dict[str, tuple[float, list[dict[str, Any]], str]] = {}
 _LONG_PRICE_HISTORY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_PDF_REPORT_CACHE: dict[str, dict[str, Any]] = {}
+_PDF_REPORT_LOCKS: dict[str, asyncio.Lock] = {}
+_WEASYPRINT_DISABLED = False
 
 app = FastAPI(title="AI Stock Research Terminal", version=APP_VERSION)
 app.add_middleware(GZipMiddleware, minimum_size=800)
@@ -4425,29 +4430,56 @@ async def history_diagnostics(ticker: str):
 
 @app.get("/api/stock/{ticker}/pdf")
 async def stock_pdf(ticker: str, refresh: bool = Query(False)):
+    global _WEASYPRINT_DISABLED
     ticker=ticker.strip()
     if not ticker.isdigit() or len(ticker) not in (4,5,6):
         raise HTTPException(400,"請輸入有效台股代號")
-    try:
-        d=await build_stock(ticker,force_refresh=refresh)
-    except Exception as exc:
-        raise HTTPException(503,"研究資料暫時無法準備完成，請稍後再產生 PDF。") from exc
-    if d.get("price") is None: raise HTTPException(503,"目前無法取得股價資料，為避免輸出錯誤報告，PDF 未產生。")
-    stamp=datetime.now().strftime("%Y%m%d_%H%M")
-    version_slug=APP_VERSION.replace(".","_")
-    out=REPORT_DIR/f"{ticker}_{stamp}_research_v{version_slug}.pdf"
-    renderer="weasyprint"
-    try:
-        from weasyprint import HTML
-        HTML(string=report_html(d),base_url=str(ROOT)).write_pdf(out)
-    except Exception:
-        renderer="reportlab-fallback"
+    def data_revision() -> tuple[float,float,float]:
+        return (_history_revision(ticker),
+                float((_OFFICIAL_FINANCIAL_JOBS.get(ticker) or {}).get("updated_epoch") or 0),
+                float((_MCP_CACHE.get(ticker) or (0,{}))[0] or 0))
+    def cached_response() -> FileResponse | None:
+        entry=_PDF_REPORT_CACHE.get(ticker)
+        if not entry or refresh or time.time()-float(entry.get("created_epoch") or 0)>PDF_CACHE_TTL:
+            return None
+        path=Path(entry.get("path") or "")
+        if not path.is_file() or tuple(entry.get("data_revision") or ())!=data_revision():
+            return None
+        filename=str(entry.get("filename") or path.name)
+        return FileResponse(path,media_type="application/pdf",headers={"Content-Disposition":f'inline; filename="{filename}"',
+                            "X-PDF-Renderer":str(entry.get("renderer") or "reportlab"),"X-PDF-Cache":"HIT","Cache-Control":"no-store"})
+    hit=cached_response()
+    if hit:return hit
+    lock=_PDF_REPORT_LOCKS.setdefault(ticker,asyncio.Lock())
+    async with lock:
+        hit=cached_response()
+        if hit:return hit
         try:
-            write_reportlab_fallback_pdf(d,out)
+            d=await build_stock(ticker,force_refresh=refresh)
         except Exception as exc:
-            raise HTTPException(503,"PDF 引擎目前無法完成報告，請稍後再試。") from exc
-    filename=f"{ticker}_AI_research_V{version_slug}_{stamp}.pdf"
-    return FileResponse(out,media_type="application/pdf",headers={"Content-Disposition":f'inline; filename="{filename}"',"X-PDF-Renderer":renderer,"Cache-Control":"no-store"})
+            raise HTTPException(503,"研究資料暫時無法準備完成，請稍後再產生 PDF。") from exc
+        if d.get("price") is None: raise HTTPException(503,"目前無法取得股價資料，為避免輸出錯誤報告，PDF 未產生。")
+        stamp=datetime.now().strftime("%Y%m%d_%H%M")
+        version_slug=APP_VERSION.replace(".","_")
+        out=REPORT_DIR/f"{ticker}_{stamp}_research_v{version_slug}.pdf"
+        renderer="reportlab"
+        if PDF_RENDERER=="weasyprint" and not _WEASYPRINT_DISABLED:
+            try:
+                from weasyprint import HTML
+                HTML(string=report_html(d),base_url=str(ROOT)).write_pdf(out)
+                renderer="weasyprint"
+            except Exception:
+                _WEASYPRINT_DISABLED=True
+        if renderer!="weasyprint":
+            try:
+                write_reportlab_fallback_pdf(d,out)
+            except Exception as exc:
+                raise HTTPException(503,"PDF 引擎目前無法完成報告，請稍後再試。") from exc
+        filename=f"{ticker}_AI_research_V{version_slug}_{stamp}.pdf"
+        _PDF_REPORT_CACHE[ticker]={"created_epoch":time.time(),"path":str(out),"filename":filename,
+                                   "renderer":renderer,"data_revision":data_revision(),"generated_at":d.get("generated_at")}
+        return FileResponse(out,media_type="application/pdf",headers={"Content-Disposition":f'inline; filename="{filename}"',
+                            "X-PDF-Renderer":renderer,"X-PDF-Cache":"MISS","Cache-Control":"no-store"})
 
 @app.post("/api/cache/clear")
 async def cache_clear(request: Request):
@@ -4460,6 +4492,7 @@ async def cache_clear(request: Request):
     _CACHE.clear()
     _OFFICIAL_HISTORY_CACHE.clear()
     _OFFICIAL_FINANCIAL_CACHE.clear()
+    _PDF_REPORT_CACHE.clear()
     return {"status":"ok","message":"cache cleared"}
 
 @app.get("/api/diagnostics/eps/{ticker}")
