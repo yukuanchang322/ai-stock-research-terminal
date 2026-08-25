@@ -29,7 +29,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.17.3"
+APP_VERSION = "5.17.4"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -1731,7 +1731,7 @@ async def fetch_official_financial_amounts_for_period(ticker: str, year: int, qu
     return merged if merged.get("revenue_ytd") is not None else None
 
 
-async def build_financial_margin_views(ticker: str, current: dict[str, Any]) -> dict[str, Any]:
+async def build_financial_margin_views(ticker: str, current: dict[str, Any], resolve_prior: bool = True) -> dict[str, Any]:
     """Keep cumulative and derived standalone-quarter profitability definitions separate."""
     try: year=int(current.get("fiscal_year")); quarter=int(current.get("fiscal_quarter"))
     except (TypeError,ValueError): year=quarter=None
@@ -1747,20 +1747,21 @@ async def build_financial_margin_views(ticker: str, current: dict[str, Any]) -> 
     if quarter==1:
         quarter_block={**ytd,"period":f"{year} Q1 單季","basis":"standalone_quarter","method":"q1_equals_ytd","note":"Q1 單季等於 Q1 累計"}
     else:
-        prior=await fetch_official_financial_amounts_for_period(ticker,year,quarter-1)
-        if prior and safe_num(current.get("revenue_ytd")) is not None and safe_num(prior.get("revenue_ytd")) is not None:
-            delta={field:(safe_num(current.get(field))-safe_num(prior.get(field))
-                          if safe_num(current.get(field)) is not None and safe_num(prior.get(field)) is not None else None)
-                   for field in FINANCIAL_AMOUNT_FIELDS}
-            if delta["revenue_ytd"] and delta["revenue_ytd"]>0:
-                quarter_block=_margin_block({**current,**delta},f"{year} Q{quarter} 單季","standalone_quarter",
-                                            "official_ytd_difference","依本期累計減前期累計回推，非公司單季公告")
-        if quarter_block is None and (current.get("gross_margin_direct") is not None or current.get("operating_margin_direct") is not None):
+        if current.get("gross_margin_direct") is not None or current.get("operating_margin_direct") is not None:
             quarter_block={"period":f"{year} Q{quarter} 單季","basis":"standalone_quarter","method":"company_official_direct",
                            "note":"公司官方單季公告比率","source":current.get("source"),"endpoint":current.get("endpoint"),
                            "revenue":None,"gross_profit":None,"operating_income":None,"net_income":None,
                            "gross_margin":safe_num(current.get("gross_margin_direct")),
                            "operating_margin":safe_num(current.get("operating_margin_direct")),"net_margin":None}
+        elif resolve_prior:
+            prior=await fetch_official_financial_amounts_for_period(ticker,year,quarter-1)
+            if prior and safe_num(current.get("revenue_ytd")) is not None and safe_num(prior.get("revenue_ytd")) is not None:
+                delta={field:(safe_num(current.get(field))-safe_num(prior.get(field))
+                              if safe_num(current.get(field)) is not None and safe_num(prior.get(field)) is not None else None)
+                       for field in FINANCIAL_AMOUNT_FIELDS}
+                if delta["revenue_ytd"] and delta["revenue_ytd"]>0:
+                    quarter_block=_margin_block({**current,**delta},f"{year} Q{quarter} 單季","standalone_quarter",
+                                                "official_ytd_difference","依本期累計減前期累計回推，非公司單季公告")
     warning=None if quarter_block else f"缺少 {year} Q{quarter-1} 同口徑官方累計金額；只顯示 {ytd_period}，不推測單季獲利率。"
     return {"ytd":ytd,"quarter":quarter_block,"warning":warning}
 
@@ -1776,7 +1777,7 @@ async def _warm_official_financial(ticker: str) -> dict[str, Any]:
             _OFFICIAL_FINANCIAL_CACHE[ticker] = (time.time(), dict(selected))
             _CACHE.pop(ticker, None)
             try:
-                selected["margin_views"]=await asyncio.wait_for(build_financial_margin_views(ticker,selected),timeout=30)
+                selected["margin_views"]=await build_financial_margin_views(ticker,selected,resolve_prior=False)
                 _OFFICIAL_FINANCIAL_CACHE[ticker] = (time.time(), dict(selected))
                 _CACHE.pop(ticker, None)
             except Exception as exc:
@@ -2271,7 +2272,7 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
         "blocked_mops_html_removed":True,
         "identity_verified":not identity_mismatch,
         "rejected_company_code":official_code if identity_mismatch else None,
-        "note":"V5.17.3：全股票共用官方 EPS/TTM 規則；備援回推會明確標示並在官方資料取得後覆蓋。"
+        "note":"V5.17.4：全股票共用官方 EPS/TTM 規則；官方累計利潤率先顯示，單季回推不得阻塞背景財報更新。"
     }
 
 
