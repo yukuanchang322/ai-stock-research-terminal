@@ -4,6 +4,7 @@ const fmt0=v=>v==null?'—':Number(v).toLocaleString('zh-TW',{maximumFractionDig
 const pct=(v,d=1)=>v==null?'—':`${v>=0?'+':''}${Number(v).toFixed(d)}%`;
 let currentTicker='';
 let stockRequestSequence=0;
+let stockRequestController=null;
 let marginHistoryRefreshTimer=null;
 const marginHistoryRefreshAttempts={};
 let candleViewState={ticker:'',size:0,end:0};
@@ -78,8 +79,24 @@ function bindCreditChartTooltips(series){
 function scheduleMarginHistoryRefresh(ticker,seriesLength,revenueLength,institutionalLength,financialVerified){
   clearTimeout(marginHistoryRefreshTimer);
   if(seriesLength>=21&&revenueLength>=24&&institutionalLength>=20&&financialVerified){delete marginHistoryRefreshAttempts[ticker];return;}
-  if((marginHistoryRefreshAttempts[ticker]||0)>=20)return;
-  marginHistoryRefreshTimer=setTimeout(async()=>{if(currentTicker!==ticker)return;marginHistoryRefreshAttempts[ticker]=(marginHistoryRefreshAttempts[ticker]||0)+1;try{const response=await fetch(`/api/stock/${encodeURIComponent(ticker)}`,{cache:'no-store'}),data=await readApiResponse(response);if(response.ok&&currentTicker===ticker)render(data)}catch(e){console.warn('official history refresh pending',e)}},10000);
+  const attempt=marginHistoryRefreshAttempts[ticker]||0;
+  if(attempt>=6)return;
+  const delay=Math.min(60000,15000*(2**attempt));
+  marginHistoryRefreshTimer=setTimeout(async()=>{
+    if(currentTicker!==ticker)return;
+    marginHistoryRefreshAttempts[ticker]=attempt+1;
+    try{
+      const statusResponse=await fetch(`/api/diagnostics/history/${encodeURIComponent(ticker)}`,{cache:'no-store'});
+      const status=await readApiResponse(statusResponse),counts=status.counts||{};
+      const improved=(counts.margin||0)>seriesLength||(counts.revenue||0)>revenueLength||
+        (counts.institutional||0)>institutionalLength||Boolean(status.financial_cached&&!financialVerified);
+      if(improved){
+        const response=await fetch(`/api/stock/${encodeURIComponent(ticker)}`,{cache:'no-store'}),data=await readApiResponse(response);
+        if(response.ok&&currentTicker===ticker){render(data);return;}
+      }
+      scheduleMarginHistoryRefresh(ticker,seriesLength,revenueLength,institutionalLength,financialVerified);
+    }catch(e){console.warn('official history refresh pending',e);scheduleMarginHistoryRefresh(ticker,seriesLength,revenueLength,institutionalLength,financialVerified)}
+  },delay);
 }
 function _techLinePoints(series,key,w,h,p,min,max){
   const vals=series.map(x=>x[key]);
@@ -281,7 +298,7 @@ function render(d){
   $('companyName').textContent=d.name; $('tickerLabel').textContent=d.ticker; $('sector').textContent=d.industry; $('marketType').textContent=d.market_type;
   $('stanceTag').textContent=d.stance; $('confidenceScore').textContent=d.confidence?.overall ?? '—'; $('price').textContent=fmt(d.price,1); $('dayChange').textContent=pct(d.change_pct);
   $('thesis').textContent=d.thesis; $('dataPolicy').textContent=d.data_policy; $('overallScore').textContent=d.scores['綜合'];
-  $('kpis').innerHTML=[['預期狀態',d.expectation_gap?.regime||'—','V5.2.15'],['Research Score',`${d.scores['綜合']}/100`,'量化綜合'],['可信度',`${d.confidence?.overall??'—'}/100`,'資料+估值'],['PER',`${fmt(d.per?.per,1)}x`,'最新可得'],['營收 YoY',pct(d.revenue?.revenue_yoy),'最新月'],['外資 20日',money(d.flow?.foreign_20_amount),'估算淨買賣金額'],['RSI14',fmt(d.technical?.rsi14,1),'技術動能']].map(x=>`<div class="kpi"><span>${x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`).join('');
+  $('kpis').innerHTML=[['預期狀態',d.expectation_gap?.regime||'—','預期差模型'],['Research Score',`${d.scores['綜合']}/100`,'量化綜合'],['可信度',`${d.confidence?.overall??'—'}/100`,'資料+估值'],['PER',`${fmt(d.per?.per,1)}x`,'最新可得'],['營收 YoY',pct(d.revenue?.revenue_yoy),'最新月'],['外資 20日',money(d.flow?.foreign_20_amount),'估算淨買賣金額'],['RSI14',fmt(d.technical?.rsi14,1),'技術動能']].map(x=>`<div class="kpi"><span>${x[0]}</span><b>${x[1]}</b><small>${x[2]}</small></div>`).join('');
   $('dockPdf').disabled=false; $('dockShare').disabled=false; $('lastFetch').textContent=`資料頁產生 ${new Date(d.generated_at).toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit'})}`;
   // Safari-safe URL update: avoid passing a URL object to history.replaceState.
   try {
@@ -413,6 +430,9 @@ async function readApiResponse(response){
 async function loadTicker(ticker, force=false){
   ticker=String(ticker||'').trim().toUpperCase();
   const requestId=++stockRequestSequence;
+  stockRequestController?.abort();
+  stockRequestController=new AbortController();
+  const signal=stockRequestController.signal;
   currentTicker=ticker;
   clearTimeout(marginHistoryRefreshTimer);
   $('errorBox').classList.add('hidden');
@@ -425,7 +445,7 @@ async function loadTicker(ticker, force=false){
   $('loading').classList.remove('hidden'); $('searchBtn').disabled=true; $('pdfBtn').disabled=true; $('dockPdf').disabled=true; $('dockShare').disabled=true;
   try{
     const path=`/api/stock/${encodeURIComponent(ticker)}${force?'?refresh=true':''}`;
-    const r=await fetch(path,{method:'GET',headers:{'Accept':'application/json'},cache:force?'no-store':'default'});
+    const r=await fetch(path,{method:'GET',headers:{'Accept':'application/json'},cache:force?'no-store':'default',signal});
     const j=await readApiResponse(r);
     if(requestId!==stockRequestSequence)return;
     if(!r.ok) throw new Error(j.detail||j.message||`資料取得失敗（HTTP ${r.status}）`);
@@ -435,6 +455,7 @@ async function loadTicker(ticker, force=false){
     }
   }catch(e){
     if(requestId!==stockRequestSequence)return;
+    if(e?.name==='AbortError')return;
     console.error('loadTicker failed',e);
     $('report').classList.add('hidden');
     $('errorBox').textContent=e?.message||'資料取得失敗，請稍後再試。';
