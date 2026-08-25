@@ -29,7 +29,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.17.8"
+APP_VERSION = "5.17.9"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -44,6 +44,7 @@ PDF_RENDERER = os.getenv("PDF_RENDERER", "reportlab").strip().lower()
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _OFFICIAL_HISTORY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _OFFICIAL_HISTORY_TASKS: dict[str, asyncio.Task] = {}
+_OFFICIAL_HISTORY_CYCLES: dict[str, float] = {}
 _OFFICIAL_HISTORY_JOBS: dict[str, dict[str, dict[str, Any]]] = {}
 _OFFICIAL_FINANCIAL_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _OFFICIAL_FINANCIAL_TASKS: dict[str, asyncio.Task] = {}
@@ -577,19 +578,19 @@ def _history_revision(ticker: str) -> float:
 
 
 def _pdf_history_revision(ticker: str) -> float:
-    """Keep one stable revision while incremental official-history jobs are running."""
-    running=[]
-    for job in (_OFFICIAL_HISTORY_JOBS.get(ticker) or {}).values():
-        if job.get("status")!="running" or not job.get("started_at"):
-            continue
-        try:running.append(datetime.fromisoformat(str(job["started_at"])).timestamp())
-        except (TypeError,ValueError):continue
-    return max(running) if running else _history_revision(ticker)
+    """Keep one stable revision across the queued, running, and finishing cycle."""
+    return float(_OFFICIAL_HISTORY_CYCLES.get(ticker) or _history_revision(ticker))
 
 
 def _cached_stock_is_current(ticker: str, payload: dict[str, Any]) -> bool:
     """Never serve a report built from an older incremental history snapshot."""
     return _history_revision(ticker) <= float(payload.get("history_cache_at_used") or 0)
+
+
+def _finish_official_history_task(ticker: str, provider: str) -> None:
+    _OFFICIAL_HISTORY_TASKS.pop(f"{ticker}:{provider}",None)
+    if not any(key.startswith(f"{ticker}:") for key in _OFFICIAL_HISTORY_TASKS):
+        _OFFICIAL_HISTORY_CYCLES.pop(ticker,None)
 
 
 async def _warm_market_provider(ticker: str, provider: str) -> None:
@@ -646,7 +647,7 @@ async def _warm_market_provider(ticker: str, provider: str) -> None:
         job.update(status="error", last_error=f"{type(exc).__name__}: {str(exc)[:160]}")
     finally:
         job["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
-        _OFFICIAL_HISTORY_TASKS.pop(f"{ticker}:{provider}", None)
+        _finish_official_history_task(ticker,provider)
 
 
 async def _warm_revenue_provider(ticker: str) -> None:
@@ -692,7 +693,7 @@ async def _warm_revenue_provider(ticker: str) -> None:
         job.update(status="error", last_error=f"{type(exc).__name__}: {str(exc)[:160]}")
     finally:
         job["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
-        _OFFICIAL_HISTORY_TASKS.pop(f"{ticker}:{provider}", None)
+        _finish_official_history_task(ticker,provider)
 
 
 def schedule_official_history(ticker: str) -> None:
@@ -707,6 +708,7 @@ def schedule_official_history(ticker: str) -> None:
         if task and not task.done():
             continue
         worker = _warm_revenue_provider(ticker) if provider == "revenue" else _warm_market_provider(ticker, provider)
+        _OFFICIAL_HISTORY_CYCLES.setdefault(ticker,time.time())
         _OFFICIAL_HISTORY_TASKS[key] = asyncio.create_task(worker)
 
 
@@ -4502,6 +4504,7 @@ async def cache_clear(request: Request):
         raise HTTPException(403,"forbidden")
     _CACHE.clear()
     _OFFICIAL_HISTORY_CACHE.clear()
+    _OFFICIAL_HISTORY_CYCLES.clear()
     _OFFICIAL_FINANCIAL_CACHE.clear()
     _PDF_REPORT_CACHE.clear()
     return {"status":"ok","message":"cache cleared"}

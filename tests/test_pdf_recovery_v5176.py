@@ -67,14 +67,22 @@ class PdfRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(build.await_count,2)
 
     def test_pdf_history_revision_stays_stable_until_background_job_completes(self):
-        jobs={"margin":{"status":"running","started_at":"2026-08-25T04:23:21+00:00","updated_at":"first"}}
-        with patch.object(server,"_OFFICIAL_HISTORY_JOBS",{"2454":jobs}), patch("server._history_revision",return_value=99):
+        with patch.object(server,"_OFFICIAL_HISTORY_CYCLES",{"2454":42}), patch("server._history_revision",return_value=99):
             first=server._pdf_history_revision("2454")
-            jobs["margin"]["updated_at"]="many incremental writes later"
             second=server._pdf_history_revision("2454")
             self.assertEqual(first,second)
-            jobs["margin"]["status"]="complete"
+            server._OFFICIAL_HISTORY_CYCLES.pop("2454")
             self.assertEqual(server._pdf_history_revision("2454"),99)
+
+    def test_history_cycle_clears_only_after_last_provider_finishes(self):
+        class Task:
+            pass
+        tasks={"2454:institutional":Task(),"2454:margin":Task()}
+        with patch.object(server,"_OFFICIAL_HISTORY_TASKS",tasks), patch.object(server,"_OFFICIAL_HISTORY_CYCLES",{"2454":42}):
+            server._finish_official_history_task("2454","institutional")
+            self.assertEqual(server._OFFICIAL_HISTORY_CYCLES["2454"],42)
+            server._finish_official_history_task("2454","margin")
+            self.assertNotIn("2454",server._OFFICIAL_HISTORY_CYCLES)
 
     def test_mobile_button_uses_cached_pdf_and_shows_busy_state(self):
         app=(server.ROOT/"app.js").read_text()
