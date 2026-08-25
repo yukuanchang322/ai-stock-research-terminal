@@ -470,6 +470,37 @@ window.addEventListener('load',()=>{const q=new URLSearchParams(location.search)
 
 // V4 Cloud / PWA mobile enhancements
 let deferredInstallPrompt = null;
+function pinMobileDockToVisualViewport(){
+  const dock=document.querySelector('.mobile-dock');
+  if(!dock)return;
+  if(!window.matchMedia('(max-width: 780px)').matches){
+    dock.classList.remove('visual-viewport-ready');
+    dock.style.removeProperty('--mobile-dock-top');
+    return;
+  }
+  const viewport=window.visualViewport;
+  if(!viewport){
+    dock.classList.remove('visual-viewport-ready');
+    return;
+  }
+  const top=Math.max(viewport.offsetTop+4,viewport.offsetTop+viewport.height-dock.offsetHeight-6);
+  dock.style.setProperty('--mobile-dock-top',`${Math.round(top)}px`);
+  dock.classList.add('visual-viewport-ready');
+}
+let mobileDockFrame=0;
+function scheduleMobileDockPin(){
+  cancelAnimationFrame(mobileDockFrame);
+  mobileDockFrame=requestAnimationFrame(pinMobileDockToVisualViewport);
+}
+window.visualViewport?.addEventListener('resize',scheduleMobileDockPin);
+window.visualViewport?.addEventListener('scroll',scheduleMobileDockPin);
+window.addEventListener('resize',scheduleMobileDockPin);
+window.addEventListener('orientationchange',scheduleMobileDockPin);
+window.addEventListener('load',scheduleMobileDockPin);
+if('ResizeObserver' in window){
+  const mobileDock=document.querySelector('.mobile-dock');
+  if(mobileDock)new ResizeObserver(scheduleMobileDockPin).observe(mobileDock);
+}
 function wrapWideTables(){
   document.querySelectorAll('.clean-table').forEach(table=>{
     const labels=Array.from(table.querySelectorAll('thead th')).map(x=>x.textContent.trim());
