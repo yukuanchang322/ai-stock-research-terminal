@@ -44,7 +44,7 @@ class PdfRecoveryTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as folder, patch.object(server,"REPORT_DIR",Path(folder)), \
              patch("server.build_stock",new=AsyncMock(return_value=report)) as build, \
              patch.object(server,"PDF_RENDERER","reportlab"), patch.object(server,"_PDF_REPORT_CACHE",{}), \
-             patch("server._history_revision",return_value=0):
+             patch("server._pdf_history_revision",return_value=0):
             for ticker in ("2330","2454","3661"):
                 report["ticker"]=ticker
                 first=await server.stock_pdf(ticker,refresh=False)
@@ -59,12 +59,22 @@ class PdfRecoveryTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as folder, patch.object(server,"REPORT_DIR",Path(folder)), \
              patch("server.build_stock",new=AsyncMock(return_value=report)) as build, \
              patch.object(server,"PDF_RENDERER","reportlab"), patch.object(server,"_PDF_REPORT_CACHE",{}), \
-             patch("server._history_revision",side_effect=lambda _ticker:next(revisions)):
+             patch("server._pdf_history_revision",side_effect=lambda _ticker:next(revisions)):
             first=await server.stock_pdf("2454",refresh=False)
             second=await server.stock_pdf("2454",refresh=False)
             self.assertEqual(first.headers["x-pdf-cache"],"MISS")
             self.assertEqual(second.headers["x-pdf-cache"],"MISS")
             self.assertEqual(build.await_count,2)
+
+    def test_pdf_history_revision_stays_stable_until_background_job_completes(self):
+        jobs={"margin":{"status":"running","started_at":"2026-08-25T04:23:21+00:00","updated_at":"first"}}
+        with patch.object(server,"_OFFICIAL_HISTORY_JOBS",{"2454":jobs}), patch("server._history_revision",return_value=99):
+            first=server._pdf_history_revision("2454")
+            jobs["margin"]["updated_at"]="many incremental writes later"
+            second=server._pdf_history_revision("2454")
+            self.assertEqual(first,second)
+            jobs["margin"]["status"]="complete"
+            self.assertEqual(server._pdf_history_revision("2454"),99)
 
     def test_mobile_button_uses_cached_pdf_and_shows_busy_state(self):
         app=(server.ROOT/"app.js").read_text()
