@@ -29,7 +29,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.17.7"
+APP_VERSION = "5.17.8"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -574,6 +574,17 @@ def _save_official_history(ticker: str, provider: str, rows: list[dict[str, Any]
 def _history_revision(ticker: str) -> float:
     cached = _OFFICIAL_HISTORY_CACHE.get(ticker)
     return cached[0] if cached and time.time() - cached[0] < 3600 else 0
+
+
+def _pdf_history_revision(ticker: str) -> float:
+    """Keep one stable revision while incremental official-history jobs are running."""
+    running=[]
+    for job in (_OFFICIAL_HISTORY_JOBS.get(ticker) or {}).values():
+        if job.get("status")!="running" or not job.get("started_at"):
+            continue
+        try:running.append(datetime.fromisoformat(str(job["started_at"])).timestamp())
+        except (TypeError,ValueError):continue
+    return max(running) if running else _history_revision(ticker)
 
 
 def _cached_stock_is_current(ticker: str, payload: dict[str, Any]) -> bool:
@@ -4435,7 +4446,7 @@ async def stock_pdf(ticker: str, refresh: bool = Query(False)):
     if not ticker.isdigit() or len(ticker) not in (4,5,6):
         raise HTTPException(400,"請輸入有效台股代號")
     def data_revision() -> tuple[float,float,float]:
-        return (_history_revision(ticker),
+        return (_pdf_history_revision(ticker),
                 float((_OFFICIAL_FINANCIAL_JOBS.get(ticker) or {}).get("updated_epoch") or 0),
                 float((_MCP_CACHE.get(ticker) or (0,{}))[0] or 0))
     def cached_response() -> FileResponse | None:
