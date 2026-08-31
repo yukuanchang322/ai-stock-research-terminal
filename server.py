@@ -30,7 +30,7 @@ from pypdf import PdfReader
 from professional_pdf import write_professional_pdf
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.18.0"
+APP_VERSION = "5.18.1"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -41,6 +41,7 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 CACHE_ADMIN_TOKEN = os.getenv("CACHE_ADMIN_TOKEN", "").strip()
 PDF_CACHE_TTL = min(CACHE_TTL, int(os.getenv("PDF_CACHE_TTL_SECONDS", "600")))
+PDF_CACHE_REVISION_GRACE_SECONDS = min(PDF_CACHE_TTL, int(os.getenv("PDF_CACHE_REVISION_GRACE_SECONDS", "30")))
 PDF_RENDERER = os.getenv("PDF_RENDERER", "reportlab").strip().lower()
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _OFFICIAL_HISTORY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
@@ -4459,10 +4460,17 @@ async def stock_pdf(ticker: str, refresh: bool = Query(False)):
                 float((_MCP_CACHE.get(ticker) or (0,{}))[0] or 0))
     def cached_response() -> FileResponse | None:
         entry=_PDF_REPORT_CACHE.get(ticker)
-        if not entry or refresh or time.time()-float(entry.get("created_epoch") or 0)>PDF_CACHE_TTL:
+        age=time.time()-float((entry or {}).get("created_epoch") or 0)
+        if not entry or refresh or age>PDF_CACHE_TTL:
             return None
         path=Path(entry.get("path") or "")
-        if not path.is_file() or tuple(entry.get("data_revision") or ())!=data_revision():
+        if not path.is_file():
+            return None
+        # An official background job may finish immediately after the first PDF
+        # response and change the revision. Keep the just-generated file stable
+        # long enough for an iPhone retry; after the grace window, normal
+        # revision invalidation refreshes it with newly completed official data.
+        if age>PDF_CACHE_REVISION_GRACE_SECONDS and tuple(entry.get("data_revision") or ())!=data_revision():
             return None
         filename=str(entry.get("filename") or path.name)
         return FileResponse(path,media_type="application/pdf",headers={"Content-Disposition":f'inline; filename="{filename}"',
