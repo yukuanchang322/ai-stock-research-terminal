@@ -71,15 +71,21 @@ class PdfRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(build.await_count,3)
 
     async def test_official_history_revision_invalidates_cached_pdf(self):
-        report=self.sample_report(); revisions=iter((1,2,2,2))
+        report=self.sample_report(); clock=[100.0]; revision=[1.0]
         with tempfile.TemporaryDirectory() as folder, patch.object(server,"REPORT_DIR",Path(folder)), \
              patch("server.build_stock",new=AsyncMock(return_value=report)) as build, \
              patch.object(server,"PDF_RENDERER","reportlab"), patch.object(server,"_PDF_REPORT_CACHE",{}), \
-             patch("server._pdf_history_revision",side_effect=lambda _ticker:next(revisions)):
+             patch("server.time.time",side_effect=lambda:clock[0]), \
+             patch("server._pdf_history_revision",side_effect=lambda _ticker:revision[0]):
             first=await server.stock_pdf("2454",refresh=False)
+            revision[0]=2.0
+            clock[0]=105.0
             second=await server.stock_pdf("2454",refresh=False)
             self.assertEqual(first.headers["x-pdf-cache"],"MISS")
-            self.assertEqual(second.headers["x-pdf-cache"],"MISS")
+            self.assertEqual(second.headers["x-pdf-cache"],"HIT")
+            clock[0]=131.0
+            third=await server.stock_pdf("2454",refresh=False)
+            self.assertEqual(third.headers["x-pdf-cache"],"MISS")
             self.assertEqual(build.await_count,2)
 
     def test_pdf_history_revision_stays_stable_until_background_job_completes(self):

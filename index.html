@@ -9,13 +9,13 @@
   <meta name="apple-mobile-web-app-title" content="AI Stock" />
   <link rel="apple-touch-icon" href="/static/icon-192.png" />
   <link rel="manifest" href="/static/manifest.webmanifest" />
-  <title>AI Stock Research Terminal V5.18.0</title>
-  <link rel="stylesheet" href="/static/styles.css?v=5.18.0" />
+  <title>AI Stock Research Terminal V5.18.1</title>
+  <link rel="stylesheet" href="/static/styles.css?v=5.18.1" />
 </head>
 <body>
   <header class="topbar"><div class="brand"><span class="brand-mark">A</span><div><b>AI Stock Research Terminal</b><small>Taiwan Equity Research • Live Public Data</small></div></div><div class="actions"><button class="ghost install-action" id="installBtn">加入主畫面</button><button class="ghost" id="methodBtn">研究方法</button><button class="primary" id="pdfBtn" disabled>下載投資人 PDF</button></div></header>
   <main>
-    <section class="hero no-print"><div><div class="eyebrow">TAIWAN EQUITY RESEARCH</div><h1>輸入股票代號，產生可交付投資人的研究報告。</h1><p>整合最新可取得的股價、基本面、三大法人、融資融券、技術面、公開網路法人研究、法說資訊與透明估值。資料缺口可用明確標示的備援暫估，官方資料取得後自動覆蓋。</p></div><div class="search-card"><label>股票代號</label><div class="search-row"><input id="tickerInput" value="2330" inputmode="numeric" placeholder="例如 2330 / 3661 / 2454" /><button id="searchBtn">產生研究報告</button><button id="refreshBtn" class="ghost">強制刷新</button></div><small>資料層：TWSE/TPEx/MOPS 官方資料 + FinMind/Yahoo Finance 備援 + TWStock MCP 交叉驗證；官方同期間資料永遠優先，備援值不冒充官方值。</small><div class="cloud-status"><span class="status-dot"></span><span id="cloudStatus">雲端服務連線檢查中</span><span class="status-sep">•</span><span data-app-version>V5.18.0</span><span class="status-sep">•</span><span id="lastFetch">尚未更新</span></div></div></section>
+    <section class="hero no-print"><div><div class="eyebrow">TAIWAN EQUITY RESEARCH</div><h1>輸入股票代號，產生可交付投資人的研究報告。</h1><p>整合最新可取得的股價、基本面、三大法人、融資融券、技術面、公開網路法人研究、法說資訊與透明估值。資料缺口可用明確標示的備援暫估，官方資料取得後自動覆蓋。</p></div><div class="search-card"><label>股票代號</label><div class="search-row"><input id="tickerInput" value="2330" inputmode="numeric" placeholder="例如 2330 / 3661 / 2454" /><button id="searchBtn">產生研究報告</button><button id="refreshBtn" class="ghost">強制刷新</button></div><small>資料層：TWSE/TPEx/MOPS 官方資料 + FinMind/Yahoo Finance 備援 + TWStock MCP 交叉驗證；官方同期間資料永遠優先，備援值不冒充官方值。</small><div class="cloud-status"><span class="status-dot"></span><span id="cloudStatus">雲端服務連線檢查中</span><span class="status-sep">•</span><span data-app-version>V5.18.1</span><span class="status-sep">•</span><span id="lastFetch">尚未更新</span></div></div></section>
     <div id="loading" class="loading hidden">正在取得最新市場資料並計算分析…</div><div id="errorBox" class="error-box hidden"></div>
     <section class="report hidden" id="report">
       <div class="report-head"><div><div class="eyebrow">EQUITY RESEARCH • <span id="generatedAt"></span></div><h2><span id="companyName"></span> <span class="muted" id="tickerLabel"></span></h2><div class="tags"><span id="sector"></span><span id="marketType"></span><span id="stanceTag" class="tag-positive"></span></div></div><div class="price-box"><small>最新收盤</small><strong id="price"></strong><span>NTD</span><em id="dayChange"></em></div></div>
@@ -34,6 +34,6 @@
   <nav class="mobile-dock no-print" aria-label="手機快捷操作"><button id="dockSearch"><span>⌕</span>查股</button><button id="dockRefresh"><span>↻</span>更新</button><button id="dockPdf" disabled><span>PDF</span>報告</button><button id="dockShare" disabled><span>↗</span>分享</button></nav>
   <div class="install-sheet" id="installSheet"><div class="install-card"><button class="close" id="closeInstall">×</button><h3>加入 iPhone 主畫面</h3><p>在 Safari 點下方「分享」按鈕，選擇「加入主畫面」。</p><button class="primary" id="installOk">知道了</button></div></div>
   <div class="modal" id="methodModal"><div class="modal-card"><button class="close" id="closeModal">×</button><h3>研究方法</h3><p>研究流程固定為：定義問題 → 多來源蒐集 → Evidence 正規化 → 官方性/期間/新鮮度/衝突驗證 → 基本面/技術面/籌碼面 → 預期差 → 估值 → 結論。</p></div></div>
-  <script src="/static/app.js?v=5.18.0"></script>
+  <script src="/static/app.js?v=5.18.1"></script>
 </body>
 </html>
