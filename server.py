@@ -30,7 +30,7 @@ from pypdf import PdfReader
 from professional_pdf import write_professional_pdf
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.19.0"
+APP_VERSION = "5.19.1"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -39,6 +39,12 @@ REPORT_DIR.mkdir(exist_ok=True)
 FINMIND_BASE = "https://api.finmindtrade.com/api/v4/data"
 FINMIND_TOKEN = os.getenv("FINMIND_TOKEN", "").strip()
 CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
+# Render's edge proxy can end a request before the provider fan-out completes.
+# Keep the request budget below that proxy window while the shielded build task
+# continues in the background for the next retry.
+STOCK_API_REQUEST_TIMEOUT = min(
+    26.0, max(8.0, float(os.getenv("STOCK_API_REQUEST_TIMEOUT_SECONDS", "22")))
+)
 CACHE_ADMIN_TOKEN = os.getenv("CACHE_ADMIN_TOKEN", "").strip()
 PDF_CACHE_TTL = min(CACHE_TTL, int(os.getenv("PDF_CACHE_TTL_SECONDS", "600")))
 PDF_CACHE_REVISION_GRACE_SECONDS = min(PDF_CACHE_TTL, int(os.getenv("PDF_CACHE_REVISION_GRACE_SECONDS", "30")))
@@ -589,6 +595,32 @@ def _pdf_history_revision(ticker: str) -> float:
 def _cached_stock_is_current(ticker: str, payload: dict[str, Any]) -> bool:
     """Never serve a report built from an older incremental history snapshot."""
     return _history_revision(ticker) <= float(payload.get("history_cache_at_used") or 0)
+
+
+def _stale_stock_snapshot(ticker: str, *, reason: str) -> dict[str, Any] | None:
+    """Return the last complete report when a refresh misses the edge budget.
+
+    This is intentionally opt-in at the API timeout path. Normal requests keep
+    the existing freshness gate, while a slow provider cycle never leaves a
+    previously usable report unavailable to the investor.
+    """
+    cached = _CACHE.get(ticker)
+    if not cached or not isinstance(cached[1], dict):
+        return None
+    payload = dict(cached[1])
+    cache = dict(payload.get("cache") or {})
+    cache.update({
+        "hit": True,
+        "stale": True,
+        "stale_reason": reason,
+        "cached_at": datetime.fromtimestamp(cached[0], tz=timezone.utc).isoformat(),
+        "ttl_seconds": CACHE_TTL,
+    })
+    payload["cache"] = cache
+    diagnostics = dict(payload.get("request_diagnostics") or {})
+    diagnostics["timeout_fallback"] = "stale-cache"
+    payload["request_diagnostics"] = diagnostics
+    return payload
 
 
 def _finish_official_history_task(ticker: str, provider: str) -> None:
@@ -4454,7 +4486,46 @@ async def stock_api(ticker: str, refresh: bool = Query(False)):
     if not ticker.isdigit() or len(ticker) not in (4,5,6):
         return JSONResponse({"status":"error","message":"請輸入有效台股代號","ticker":ticker},status_code=400,headers={"Cache-Control":"no-store"})
     try:
-        d=await build_stock(ticker,force_refresh=refresh)
+        # build_stock shields its shared task, so timing out this request does
+        # not cancel the provider fan-out. A later retry can coalesce onto the
+        # same task instead of starting another expensive cold build.
+        d=await asyncio.wait_for(
+            build_stock(ticker,force_refresh=refresh),
+            timeout=STOCK_API_REQUEST_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        stale = _stale_stock_snapshot(
+            ticker,
+            reason=f"完整資料建置超過 {STOCK_API_REQUEST_TIMEOUT:.0f} 秒；背景建置仍在進行。",
+        )
+        if stale:
+            return JSONResponse(
+                stale,
+                headers={
+                    "Cache-Control":"no-store",
+                    "X-Stock-Build":"stale-cache",
+                    "Warning":"110 - stale response; background refresh in progress",
+                },
+            )
+        return JSONResponse(
+            {
+                "status":"warming",
+                "ticker":ticker,
+                "message":"研究資料仍在背景建置，請於數秒後重新整理。",
+                "retry_after_seconds":5,
+                "request_diagnostics":{
+                    "timeout_seconds":STOCK_API_REQUEST_TIMEOUT,
+                    "background_build":True,
+                    "inflight_builds":len(_STOCK_BUILD_TASKS),
+                },
+            },
+            status_code=503,
+            headers={
+                "Cache-Control":"no-store",
+                "Retry-After":"5",
+                "X-Stock-Build":"background",
+            },
+        )
     except Exception as e:
         return JSONResponse(
             {"status":"degraded","ticker":ticker,"message":"研究報告暫時無法完整產生","errors":_compact_error_payload([_clean_provider_error("build_stock",e)])},
