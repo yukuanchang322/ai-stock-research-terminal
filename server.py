@@ -30,7 +30,7 @@ from pypdf import PdfReader
 from professional_pdf import write_professional_pdf
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.19.1"
+APP_VERSION = "5.19.2"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -568,18 +568,28 @@ def _history_job(ticker: str, provider: str) -> dict[str, Any]:
                                       "errors": 0, "last_error": None, "updated_at": None})
 
 
-def _save_official_history(ticker: str, provider: str, rows: list[dict[str, Any]]) -> None:
+def _save_official_history(ticker: str, provider: str, rows: list[dict[str, Any]]) -> bool:
+    """Persist a provider snapshot only when its material rows changed.
+
+    Background backfill workers revisit dates that can return no additional
+    records. Treating those identical batches as a new revision repeatedly
+    invalidated the completed stock report and trapped callers in `warming`.
+    """
     if not rows:
-        return
+        return False
     prior = _OFFICIAL_HISTORY_CACHE.get(ticker)
     merged = dict(prior[1]) if prior else {}
     existing = merged.get(provider) or []
     by_date = {str(row.get("date")): row for row in existing if row.get("date")}
     by_date.update({str(row.get("date")): row for row in rows if row.get("date")})
     limit = 60 if provider == "margin" else 24 if provider == "revenue" else 21
-    merged[provider] = [by_date[key] for key in sorted(by_date)][-limit:]
+    next_rows = [by_date[key] for key in sorted(by_date)][-limit:]
+    if existing == next_rows:
+        return False
+    merged[provider] = next_rows
     _OFFICIAL_HISTORY_CACHE[ticker] = (time.time(), merged)
     _CACHE.pop(ticker, None)
+    return True
 
 
 def _history_revision(ticker: str) -> float:
@@ -666,7 +676,8 @@ async def _warm_market_provider(ticker: str, provider: str) -> None:
                 if last_error:
                     job["last_error"] = last_error
                 unique_count = len({row["date"] for row in collected})
-                if collected and (unique_count % 4 == 0 or unique_count >= target):
+                if (collected and unique_count > int(job.get("rows") or 0)
+                        and (unique_count % 4 == 0 or unique_count >= target)):
                     _save_official_history(ticker, provider, collected)
                     job["rows"] = unique_count
                     job["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
