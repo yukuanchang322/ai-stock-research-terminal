@@ -27,9 +27,10 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.gzip import GZipMiddleware
 from pypdf import PdfReader
+from professional_pdf import write_professional_pdf
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.17.9"
+APP_VERSION = "5.18.0"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -4270,7 +4271,7 @@ def report_html(d: dict[str, Any]) -> str:
     </body></html>"""
 
 
-def write_reportlab_fallback_pdf(d: dict[str, Any], out: Path) -> None:
+def _write_legacy_reportlab_fallback_pdf(d: dict[str, Any], out: Path) -> None:
     """Create a dependency-light Traditional Chinese PDF when HTML rendering fails."""
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_CENTER
@@ -4323,6 +4324,11 @@ def write_reportlab_fallback_pdf(d: dict[str, Any], out: Path) -> None:
     story.extend([Paragraph("資料與揭露",heading),Paragraph("本檔為 HTML PDF 引擎不可用時產生的繁體中文備援報告；核心價格、財報、評分、估值與風險資料取自同一次網頁研究結果。",small),
                   Paragraph("重要聲明：本系統為研究與資訊整理工具，不構成個人化投資建議、招攬或收益保證。",small)])
     doc.build(story)
+
+
+def write_reportlab_fallback_pdf(d: dict[str, Any], out: Path) -> None:
+    """Render the full professional research report with the bundled TC font."""
+    write_professional_pdf(d, out, ROOT, APP_VERSION)
 
 
 @app.middleware("http")

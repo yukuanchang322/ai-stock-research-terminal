@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 from pypdf import PdfReader
 
 import server
+from professional_pdf import _risk_levels
 
 
 class PdfRecoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -24,7 +25,22 @@ class PdfRecoveryTests(unittest.IsolatedAsyncioTestCase):
             out=Path(folder)/"fallback.pdf"
             server.write_reportlab_fallback_pdf(self.sample_report(),out)
             self.assertTrue(out.read_bytes().startswith(b"%PDF-"))
-            self.assertGreaterEqual(len(PdfReader(str(out)).pages),1)
+            reader=PdfReader(str(out))
+            self.assertGreaterEqual(len(reader.pages),7)
+            text="".join(page.extract_text() or "" for page in reader.pages)
+            self.assertIn("基本面與盈餘品質",text)
+            self.assertIn("法人籌碼與融資融券",text)
+            self.assertIn("估值、法人預期與市場隱含假設",text)
+            self.assertIn("資料來源、品質邊界與重要揭露",text)
+
+    def test_pdf_risk_levels_never_label_above_market_as_support(self):
+        technical={"support1":3815.75,"support2":4014.4,"resistance":4560,
+                   "ma":{"20":3815.75,"60":4014.4},
+                   "series":[{"low":3400+i} for i in range(60)]}
+        support1,support2,resistance=_risk_levels(technical,3765)
+        self.assertLessEqual(support2,support1)
+        self.assertLessEqual(support1,3765)
+        self.assertGreaterEqual(resistance,3765)
 
     async def test_pdf_route_uses_cache_by_default_and_inline_fallback(self):
         report=self.sample_report()
