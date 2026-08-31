@@ -30,7 +30,7 @@ from pypdf import PdfReader
 from professional_pdf import write_professional_pdf
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.18.1"
+APP_VERSION = "5.19.0"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -57,6 +57,8 @@ _PRICE_HISTORY_CACHE: dict[str, tuple[float, list[dict[str, Any]], str]] = {}
 _LONG_PRICE_HISTORY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _PDF_REPORT_CACHE: dict[str, dict[str, Any]] = {}
 _PDF_REPORT_LOCKS: dict[str, asyncio.Lock] = {}
+_STOCK_BUILD_TASKS: dict[tuple[str, bool], asyncio.Task] = {}
+_STOCK_BUILD_METRICS = {"started": 0, "coalesced": 0, "completed": 0, "failed": 0}
 _WEASYPRINT_DISABLED = False
 
 app = FastAPI(title="AI Stock Research Terminal", version=APP_VERSION)
@@ -3156,13 +3158,22 @@ def scores(technical: dict[str, Any], revenue: dict[str, Any], flow: dict[str, A
     return d
 
 
-def calc_confidence(source_status: list[dict[str, Any]], valuation: dict[str, Any], research: dict[str, Any]) -> dict[str, Any]:
+def calc_confidence(source_status: list[dict[str, Any]], valuation: dict[str, Any], research: dict[str, Any],
+                    integrity: dict[str, Any] | None=None, evidence_graph: dict[str, Any] | None=None) -> dict[str, Any]:
     available = sum(1 for x in source_status if x["status"] == "ok")
     completeness = round(available / len(source_status) * 100) if source_status else 0
     trusted_coverage=int(research.get("target_coverage") or 0) + int(research.get("eps_coverage") or 0)
     research_bonus = 8 if trusted_coverage >= 4 else 4 if trusted_coverage >= 2 else 1 if trusted_coverage else 0
-    overall = round(completeness * .65 + valuation.get("confidence", 0) * .25 + research_bonus)
-    return {"data_completeness": completeness, "valuation_confidence": valuation.get("confidence", 0), "research_coverage": trusted_coverage, "raw_research_mentions": research.get("count", 0), "overall": min(100, overall)}
+    overall = min(100, round(completeness * .65 + valuation.get("confidence", 0) * .25 + research_bonus))
+    caps=[]
+    if integrity is not None and not integrity.get("official_verified"):
+        overall=min(overall,69); caps.append("official_financial_unverified")
+    conflicts=len((evidence_graph or {}).get("conflicts") or [])
+    if conflicts:
+        overall=min(overall,74); caps.append("material_source_conflict")
+    return {"data_completeness": completeness, "valuation_confidence": valuation.get("confidence", 0),
+            "research_coverage": trusted_coverage, "raw_research_mentions": research.get("count", 0),
+            "overall": overall,"quality_caps":caps,"conflict_count":conflicts}
 
 
 def _iso_now() -> str:
@@ -3573,6 +3584,46 @@ def build_data_boundary(source_status, integrity, evidence_graph):
             "optional_unavailable_count":len(optional_unavailable),
             "conflict_count":len(conflicts),"message":"；".join(material) if material else "目前未發現會改變核心結論的重大資料邊界。"}
 
+def build_decision_brief(price, valuation, research, confidence, financial_integrity, evidence_graph, company_events):
+    """Create an auditable decision memo without presenting scenario weights as forecasts."""
+    probability_by_name={"悲觀":25,"基準":50,"樂觀":25}
+    weighted=[]
+    for row in valuation.get("scenarios") or []:
+        probability=probability_by_name.get(str(row.get("name")),0)
+        target=safe_num(row.get("target"))
+        weighted.append({**row,"probability_pct":probability,
+                         "weighted_target":target*probability/100 if target is not None else None})
+    expected_target=sum(x["weighted_target"] for x in weighted if x.get("weighted_target") is not None) if weighted else None
+    expected_upside=round(((expected_target/price)-1)*100,4) if expected_target is not None and price else None
+    target_coverage=int(research.get("target_coverage") or 0)
+    eps_coverage=int(research.get("eps_coverage") or 0)
+    conflicts=len(evidence_graph.get("conflicts") or [])
+    gates=[]
+    if not financial_integrity.get("official_verified"): gates.append("最新財報尚未通過官方季度驗證")
+    if target_coverage<2: gates.append("法人目標價有效樣本少於2筆")
+    if eps_coverage<2: gates.append("Forward EPS有效樣本少於2筆")
+    if conflicts: gates.append(f"核心資料存在{conflicts}組來源衝突")
+    overall=int(confidence.get("overall") or 0)
+    strength="高" if overall>=80 and not gates else "中" if overall>=60 and len(gates)<=2 else "低"
+    if expected_upside is None:
+        variant="估值資料不足，無法判斷市場預期差"
+    elif expected_upside>=15:
+        variant=f"機率加權模型較市價高 {expected_upside:.1f}%，市場可能低估獲利或估值延續性"
+    elif expected_upside<=-15:
+        variant=f"機率加權模型較市價低 {abs(expected_upside):.1f}%，市價可能已反映更高成長或結構性溢價"
+    else:
+        variant=f"機率加權模型與市價差 {expected_upside:+.1f}%，目前沒有明顯估值預期差"
+    events=[]
+    for row in (company_events.get("rows") or [])[:6]:
+        events.append({"date":row.get("date") or row.get("published_date"),"event":row.get("title"),
+                       "source":row.get("publisher"),"official":bool(row.get("official_source"))})
+    return {"conclusion_strength":strength,"quality_gates":gates,
+            "scenario_probabilities":"研究框架假設 25% / 50% / 25%，非統計預測",
+            "scenarios":weighted,"expected_target":expected_target,"expected_upside_pct":expected_upside,
+            "variant_perception":variant,"catalyst_calendar":events,
+            "analyst_sample":{"target_coverage":target_coverage,"eps_coverage":eps_coverage},
+            "methodology":"期望值僅用於比較情境，不代表價格預測或報酬保證。"}
+
 def build_research_pipeline(ticker,scores_map,narrative_map,evidence_graph,financial_integrity,expectation,valuation,source_status,technical,flow,revenue,research):
     records=evidence_graph.get("records") or []
     counts={k:len([x for x in records if x.get("kind")==k and x.get("status")=="usable"]) for k in ["fact","derived_fact","estimate","model_output"]}
@@ -3966,7 +4017,7 @@ async def fetch_twse_stock_day_history(ticker: str, months: int = 13) -> list[di
         dedup[x["date"]]=x
     return [dedup[k] for k in sorted(dedup)]
 
-async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any]:
+async def _build_stock_uncached(ticker: str, force_refresh: bool = False) -> dict[str, Any]:
     if (not force_refresh and ticker in _CACHE and time.time() - _CACHE[ticker][0] < CACHE_TTL
             and _cached_stock_is_current(ticker, _CACHE[ticker][1])):
         cached = dict(_CACHE[ticker][1]); cached["cache"] = {"hit": True, "ttl_seconds": CACHE_TTL}; return cached
@@ -4221,13 +4272,14 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
                           "status":"ok" if mcp_snapshot.get("status")=="ok" else "optional","required":False,
                           "scheduled_update":f"工具 {mcp_snapshot.get('tool_count',0)} / 成功呼叫 {mcp_snapshot.get('successful_calls',0)} / Evidence {len(mcp_snapshot.get('records') or [])}"})
     source_status.append({"name":"Evidence Engine","dataset":"Multi-Source Evidence Schema v1","as_of":evidence_graph.get("generated_at"),"status":"ok" if evidence_graph.get("summary",{}).get("usable") else "missing","scheduled_update":f"Fact {evidence_graph.get('summary',{}).get('facts',0)} / Derived {evidence_graph.get('summary',{}).get('derived_facts',0)} / Conflicts {evidence_graph.get('summary',{}).get('conflicts',0)}"})
-    conf=calc_confidence(source_status,valuation,research)
+    conf=calc_confidence(source_status,valuation,research,financial_integrity,evidence_graph)
     research_pipeline=build_research_pipeline(ticker,sc,nar,evidence_graph,financial_integrity,expectation,valuation,source_status,tech,flow,revenue,research)
+    decision_brief=build_decision_brief(lp,valuation,research,conf,financial_integrity,evidence_graph,company_events)
     errors=_compact_error_payload(errors)
     data={"ticker":ticker,"name":info.get("stock_name") or ticker,"industry":info.get("industry_category") or "—","market_type":info.get("type") or "—",
           "generated_at":datetime.now().astimezone().isoformat(timespec="seconds"),"price":lp,"change_pct":change,"technical":tech,"revenue":revenue,"flow":flow,"per":perdata,"financial":financial,
           "research":research,"expectation_gap":expectation,"valuation":valuation,"eps_stack":eps_stack,"official_financial":official_financial,"financial_integrity":financial_integrity,"scores":sc,"stance":nar["stance"],"thesis":nar["thesis"],"catalysts":nar["catalysts"],"risks":nar["risks"],"confidence":conf,
-          "source_status":source_status,"evidence_graph":evidence_graph,"research_pipeline":research_pipeline,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,"twstock_mcp":mcp_snapshot,
+          "source_status":source_status,"evidence_graph":evidence_graph,"research_pipeline":research_pipeline,"decision_brief":decision_brief,"errors":errors,"cache":{"hit":False,"ttl_seconds":CACHE_TTL},"web_research_meta":web_research,"company_events":company_events,"twstock_mcp":mcp_snapshot,
           "cashflow":{"institutional":institutional_payload.get("institutional") or {},"institutional_source":institutional_source,"last_date":flow.get("last_date")},"version":APP_VERSION,
           "data_policy":"Cross-Validation：所有資料先正規化為 Evidence Record，依官方性、新鮮度、期間與衝突檢查後才進研究模型；Fact、Derived Fact、Estimate 分層；TWStock MCP 僅作第二來源交叉驗證，不靜默覆蓋官方值。",
           "history_cache_at_used":history_cache_at_used,
@@ -4241,6 +4293,28 @@ async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any
         data["cache"]["skipped_stale_history_write"] = True
     schedule_official_history(ticker)
     return data
+
+async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any]:
+    """Coalesce identical in-flight builds so one cold ticker performs one provider fan-out."""
+    key=(ticker,bool(force_refresh))
+    task=_STOCK_BUILD_TASKS.get(key)
+    coalesced=bool(task and not task.done())
+    if not coalesced:
+        task=asyncio.create_task(_build_stock_uncached(ticker,force_refresh=force_refresh))
+        _STOCK_BUILD_TASKS[key]=task
+        _STOCK_BUILD_METRICS["started"]+=1
+        def finish(done, task_key=key):
+            if _STOCK_BUILD_TASKS.get(task_key) is done:
+                _STOCK_BUILD_TASKS.pop(task_key,None)
+            _STOCK_BUILD_METRICS["failed" if done.cancelled() or done.exception() else "completed"]+=1
+        task.add_done_callback(finish)
+    else:
+        _STOCK_BUILD_METRICS["coalesced"]+=1
+    result=await asyncio.shield(task)
+    payload=dict(result)
+    payload["request_diagnostics"]={"coalesced":coalesced,"inflight_builds":len(_STOCK_BUILD_TASKS),
+                                    "build_metrics":dict(_STOCK_BUILD_METRICS)}
+    return payload
 
 
 def report_html(d: dict[str, Any]) -> str:
@@ -4633,4 +4707,4 @@ async def provider_health(ticker: str):
     return JSONResponse(result,headers={"Cache-Control":"no-store"})
 
 @app.get("/health")
-async def health(): return {"status":"ok","version":APP_VERSION,"mode":"multi-source-official-first","finmind_token":bool(FINMIND_TOKEN),"finmind_mode":"token" if FINMIND_TOKEN else "anonymous-fallback","yahoo_price_fallback":True,"twstock_mcp_crosscheck":TWSTOCK_MCP_ENABLED,"cache_ttl_seconds":CACHE_TTL,"pwa":False}
+async def health(): return {"status":"ok","version":APP_VERSION,"mode":"multi-source-official-first","finmind_token":bool(FINMIND_TOKEN),"finmind_mode":"token" if FINMIND_TOKEN else "anonymous-fallback","yahoo_price_fallback":True,"twstock_mcp_crosscheck":TWSTOCK_MCP_ENABLED,"cache_ttl_seconds":CACHE_TTL,"inflight_stock_builds":len(_STOCK_BUILD_TASKS),"stock_build_metrics":dict(_STOCK_BUILD_METRICS),"pwa":False}
