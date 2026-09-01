@@ -29,7 +29,7 @@ class HistoryCacheIdempotencyTests(unittest.TestCase):
         self.assertEqual(server._OFFICIAL_HISTORY_CACHE["2454"][0], 1000)
         self.assertIn("2454", server._CACHE)
 
-    def test_material_history_change_advances_revision_and_evicts_report(self):
+    def test_material_history_change_advances_revision_and_preserves_last_report(self):
         original = [{"date": "2026-08-31", "margin_balance": 100}]
         changed = [{"date": "2026-08-31", "margin_balance": 120}]
         with patch.object(server.time, "time", return_value=1000):
@@ -40,7 +40,10 @@ class HistoryCacheIdempotencyTests(unittest.TestCase):
             self.assertTrue(server._save_official_history("2454", "margin", changed))
 
         self.assertEqual(server._OFFICIAL_HISTORY_CACHE["2454"][0], 2000)
-        self.assertNotIn("2454", server._CACHE)
+        self.assertIn("2454", server._CACHE)
+        with patch.object(server.time, "time", return_value=2001):
+            self.assertFalse(server._cached_stock_is_current("2454", server._CACHE["2454"][1]))
+            self.assertIsNotNone(server._stale_stock_snapshot("2454", reason="background refresh"))
         saved = server._OFFICIAL_HISTORY_CACHE["2454"][1]["margin"]
         self.assertEqual(saved[0]["margin_balance"], 120)
 

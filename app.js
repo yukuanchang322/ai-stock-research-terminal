@@ -3,6 +3,7 @@ const fmt=(v,d=1)=>v==null?'—':Number(v).toLocaleString('zh-TW',{maximumFracti
 const fmt0=v=>v==null?'—':Number(v).toLocaleString('zh-TW',{maximumFractionDigits:0});
 const pct=(v,d=1)=>v==null?'—':`${v>=0?'+':''}${Number(v).toFixed(d)}%`;
 let currentTicker='';
+let renderedTicker='';
 let stockRequestSequence=0;
 let stockRequestController=null;
 let marginHistoryRefreshTimer=null;
@@ -10,6 +11,43 @@ const marginHistoryRefreshAttempts={};
 let candleViewState={ticker:'',size:0,end:0};
 let candlePeriodState={ticker:'',interval:'day',daily:[],dailyTechnical:null,series:[],technical:null,source:'研究報告日線資料',asOf:'',requestId:0};
 const candlePeriodCache=new Map();
+const REPORT_SNAPSHOT_PREFIX='ai-stock-last-good-report-v1-';
+const REPORT_SNAPSHOT_INDEX='ai-stock-last-good-report-v1-index';
+const REPORT_SNAPSHOT_LIMIT=6;
+
+function reportSnapshotKey(ticker){return `${REPORT_SNAPSHOT_PREFIX}${ticker}`}
+function loadReportSnapshot(ticker){
+  try{
+    const raw=localStorage.getItem(reportSnapshotKey(ticker));
+    const entry=raw?JSON.parse(raw):null;
+    return entry?.data?.ticker===ticker&&entry.data.price!=null?entry.data:null;
+  }catch(_){return null}
+}
+function saveReportSnapshot(data){
+  if(!data?.ticker||data.price==null)return;
+  try{
+    localStorage.setItem(reportSnapshotKey(data.ticker),JSON.stringify({saved_at:Date.now(),data}));
+    const prior=JSON.parse(localStorage.getItem(REPORT_SNAPSHOT_INDEX)||'[]').filter(x=>x?.ticker!==data.ticker);
+    const next=[{ticker:data.ticker,saved_at:Date.now()},...prior].slice(0,REPORT_SNAPSHOT_LIMIT);
+    const keep=new Set(next.map(x=>x.ticker));
+    prior.filter(x=>!keep.has(x?.ticker)).forEach(x=>localStorage.removeItem(reportSnapshotKey(x.ticker)));
+    localStorage.setItem(REPORT_SNAPSHOT_INDEX,JSON.stringify(next));
+  }catch(_){/* Private browsing/storage limits must never block the report. */}
+}
+function showLoadStatus(message,warming=false){
+  const box=$('errorBox');
+  box.textContent=message;
+  box.classList.toggle('warming',warming);
+  box.classList.remove('hidden');
+}
+function waitForStockRetry(ms,signal){
+  return new Promise((resolve,reject)=>{
+    if(signal.aborted){reject(new DOMException('Aborted','AbortError'));return;}
+    const timer=setTimeout(()=>{signal.removeEventListener('abort',abort);resolve();},ms);
+    const abort=()=>{clearTimeout(timer);reject(new DOMException('Aborted','AbortError'));};
+    signal.addEventListener('abort',abort,{once:true});
+  });
+}
 
 function lineSvg(values){
   if(!values.length)return '<div class="empty">資料不足</div>';
@@ -293,6 +331,7 @@ function cleanUiError(err){
 
 function render(d){
   currentTicker=d.ticker;
+  renderedTicker=d.ticker;
   $('report').classList.remove('hidden'); $('pdfBtn').disabled=false;
   $('generatedAt').textContent=new Date(d.generated_at).toLocaleString('zh-TW');
   $('companyName').textContent=d.name; $('tickerLabel').textContent=d.ticker; $('sector').textContent=d.industry; $('marketType').textContent=d.market_type;
@@ -412,6 +451,7 @@ const ex=d.expectation_gap||{};
   $('catalystList').innerHTML=(d.catalysts||[]).map(x=>`<li>${x}</li>`).join(''); $('riskList').innerHTML=(d.risks||[]).map(x=>`<li>${x}</li>`).join('');
   $('freshnessStrip').innerHTML=d.source_status.map(x=>`<div class="fresh ${x.status}"><span>${x.name}</span><b>${x.as_of||'缺資料'}</b></div>`).join('');
   $('sourceTable').innerHTML=`<table class="clean-table"><thead><tr><th>資料</th><th>Dataset</th><th>最新資料日</th><th>預定更新</th><th>狀態</th></tr></thead><tbody>${d.source_status.map(x=>`<tr><td>${x.name}</td><td>${x.dataset}</td><td>${x.as_of||'—'}</td><td>${x.scheduled_update}</td><td>${x.status==='ok'?'可用':x.status==='warming'?'歷史補齊中':x.status==='stale'?'STALE / 已降權':x.status==='optional'?'選用 / 不影響評級':'缺資料'}</td></tr>`).join('')}</tbody></table>`;
+  if(!d.cache?.client_snapshot)saveReportSnapshot(d);
   wrapWideTables();
 }
 
@@ -436,30 +476,59 @@ async function loadTicker(ticker, force=false){
   currentTicker=ticker;
   clearTimeout(marginHistoryRefreshTimer);
   $('errorBox').classList.add('hidden');
+  $('errorBox').classList.remove('warming');
   if(!/^[0-9A-Z.-]{2,12}$/.test(ticker)){
     $('report').classList.add('hidden');
     $('errorBox').textContent='股票代號格式不正確，請輸入例如 2330、3661。';
     $('errorBox').classList.remove('hidden');
     return;
   }
+  const stored=loadReportSnapshot(ticker);
+  if(stored){
+    try{
+      render({...stored,cache:{...(stored.cache||{}),hit:true,stale:true,client_snapshot:true}});
+      showLoadStatus('雲端資料正在更新；目前先顯示此裝置上次成功取得的研究報告。',true);
+    }catch(error){console.warn('stored report unavailable',error)}
+  }else if(renderedTicker!==ticker){
+    $('report').classList.add('hidden');
+  }
   $('loading').classList.remove('hidden'); $('searchBtn').disabled=true; $('pdfBtn').disabled=true; $('dockPdf').disabled=true; $('dockShare').disabled=true;
   try{
-    const path=`/api/stock/${encodeURIComponent(ticker)}${force?'?refresh=true':''}`;
-    const r=await fetch(path,{method:'GET',headers:{'Accept':'application/json'},cache:force?'no-store':'default',signal});
-    const j=await readApiResponse(r);
-    if(requestId!==stockRequestSequence)return;
-    if(!r.ok) throw new Error(j.detail||j.message||`資料取得失敗（HTTP ${r.status}）`);
-    try{render(j);}catch(renderError){
-      console.error('render failed',renderError);
-      throw new Error(`畫面產生失敗：${renderError?.message||'未知錯誤'}`);
+    for(let attempt=0;attempt<6;attempt++){
+      const refresh=force&&attempt===0;
+      const path=`/api/stock/${encodeURIComponent(ticker)}${refresh?'?refresh=true':''}`;
+      const r=await fetch(path,{method:'GET',headers:{'Accept':'application/json'},cache:refresh?'no-store':'default',signal});
+      const j=await readApiResponse(r);
+      if(requestId!==stockRequestSequence)return;
+      if(r.status===503&&j.status==='warming'){
+        const retrySeconds=Math.max(3,Math.min(15,Number(r.headers.get('retry-after')||j.retry_after_seconds||5)));
+        showLoadStatus(stored?'雲端資料仍在背景更新；上次成功報告會保留，完成後自動替換。':`首次建立 ${ticker} 研究資料，系統將於 ${retrySeconds} 秒後自動重試。`,true);
+        await waitForStockRetry(retrySeconds*1000,signal);
+        continue;
+      }
+      if(!r.ok) throw new Error(j.detail||j.message||`資料取得失敗（HTTP ${r.status}）`);
+      try{render(j);}catch(renderError){
+        console.error('render failed',renderError);
+        throw new Error(`畫面產生失敗：${renderError?.message||'未知錯誤'}`);
+      }
+      if(j.cache?.stale&&attempt<5){
+        showLoadStatus('雲端正在更新官方資料；目前保留上次成功報告，完成後會自動替換。',true);
+        $('pdfBtn').disabled=true; $('dockPdf').disabled=true; $('dockShare').disabled=true;
+        await waitForStockRetry(5000,signal);
+        continue;
+      }
+      $('errorBox').classList.add('hidden');
+      $('errorBox').classList.remove('warming');
+      return;
     }
+    throw new Error('背景建置時間較長，系統未取得完成結果；請保持頁面開啟後再次查詢。');
   }catch(e){
     if(requestId!==stockRequestSequence)return;
     if(e?.name==='AbortError')return;
     console.error('loadTicker failed',e);
-    $('report').classList.add('hidden');
-    $('errorBox').textContent=e?.message||'資料取得失敗，請稍後再試。';
-    $('errorBox').classList.remove('hidden');
+    if(!stored&&renderedTicker!==ticker)$('report').classList.add('hidden');
+    if(stored){$('pdfBtn').disabled=false;$('dockPdf').disabled=false;$('dockShare').disabled=false;}
+    showLoadStatus(stored?`最新資料更新暫時失敗；仍顯示上次成功報告。${e?.message?` ${e.message}`:''}`:(e?.message||'資料取得失敗，請稍後再試。'));
   } finally {if(requestId===stockRequestSequence){$('loading').classList.add('hidden'); $('searchBtn').disabled=false;}}
 }
 $('searchBtn').onclick=()=>loadTicker($('tickerInput').value.trim()); $('refreshBtn').onclick=()=>loadTicker($('tickerInput').value.trim(), true);
