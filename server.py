@@ -30,7 +30,7 @@ from pypdf import PdfReader
 from professional_pdf import write_professional_pdf
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.19.2"
+APP_VERSION = "5.19.3"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -63,7 +63,7 @@ _PRICE_HISTORY_CACHE: dict[str, tuple[float, list[dict[str, Any]], str]] = {}
 _LONG_PRICE_HISTORY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _PDF_REPORT_CACHE: dict[str, dict[str, Any]] = {}
 _PDF_REPORT_LOCKS: dict[str, asyncio.Lock] = {}
-_STOCK_BUILD_TASKS: dict[tuple[str, bool], asyncio.Task] = {}
+_STOCK_BUILD_TASKS: dict[str, asyncio.Task] = {}
 _STOCK_BUILD_METRICS = {"started": 0, "coalesced": 0, "completed": 0, "failed": 0}
 _WEASYPRINT_DISABLED = False
 
@@ -588,7 +588,6 @@ def _save_official_history(ticker: str, provider: str, rows: list[dict[str, Any]
         return False
     merged[provider] = next_rows
     _OFFICIAL_HISTORY_CACHE[ticker] = (time.time(), merged)
-    _CACHE.pop(ticker, None)
     return True
 
 
@@ -597,14 +596,22 @@ def _history_revision(ticker: str) -> float:
     return cached[0] if cached and time.time() - cached[0] < 3600 else 0
 
 
+def _financial_revision(ticker: str) -> float:
+    cached = _OFFICIAL_FINANCIAL_CACHE.get(ticker)
+    return cached[0] if cached and time.time() - cached[0] < 21600 else 0
+
+
 def _pdf_history_revision(ticker: str) -> float:
     """Keep one stable revision across the queued, running, and finishing cycle."""
     return float(_OFFICIAL_HISTORY_CYCLES.get(ticker) or _history_revision(ticker))
 
 
 def _cached_stock_is_current(ticker: str, payload: dict[str, Any]) -> bool:
-    """Never serve a report built from an older incremental history snapshot."""
-    return _history_revision(ticker) <= float(payload.get("history_cache_at_used") or 0)
+    """Only treat a report as fresh when its official source revisions match."""
+    return (
+        _history_revision(ticker) <= float(payload.get("history_cache_at_used") or 0)
+        and _financial_revision(ticker) <= float(payload.get("financial_cache_at_used") or 0)
+    )
 
 
 def _stale_stock_snapshot(ticker: str, *, reason: str) -> dict[str, Any] | None:
@@ -1840,11 +1847,9 @@ async def _warm_official_financial(ticker: str) -> dict[str, Any]:
         selected = await asyncio.wait_for(reconcile_official_financial_snapshot(ticker, selected), timeout=45)
         if selected.get("official"):
             _OFFICIAL_FINANCIAL_CACHE[ticker] = (time.time(), dict(selected))
-            _CACHE.pop(ticker, None)
             try:
                 selected["margin_views"]=await build_financial_margin_views(ticker,selected,resolve_prior=False)
                 _OFFICIAL_FINANCIAL_CACHE[ticker] = (time.time(), dict(selected))
-                _CACHE.pop(ticker, None)
             except Exception as exc:
                 job["margin_views_error"]=type(exc).__name__
             job.update(status="complete", period=selected.get("period"), source=selected.get("source"))
@@ -3581,7 +3586,6 @@ async def _warm_twstock_mcp(ticker:str) -> None:
         snap=await asyncio.wait_for(fetch_twstock_mcp_snapshot(ticker),timeout=45)
         snap["optional"]=True
         _MCP_CACHE[ticker]=(time.time(),snap)
-        _CACHE.pop(ticker,None)
     except Exception:
         pass
     finally:
@@ -4216,6 +4220,7 @@ async def _build_stock_uncached(ticker: str, force_refresh: bool = False) -> dic
     official_financial, institutional_payload = await asyncio.gather(
         official_financial_bounded(), institutional_bounded()
     )
+    financial_cache_at_used = _financial_revision(ticker)
     if institutional_payload.get("institutional"):
         flow.update(institutional_payload.get("flow") or {})
         institutional_source = institutional_payload["source"]
@@ -4326,20 +4331,20 @@ async def _build_stock_uncached(ticker: str, force_refresh: bool = False) -> dic
           "cashflow":{"institutional":institutional_payload.get("institutional") or {},"institutional_source":institutional_source,"last_date":flow.get("last_date")},"version":APP_VERSION,
           "data_policy":"Cross-Validation：所有資料先正規化為 Evidence Record，依官方性、新鮮度、期間與衝突檢查後才進研究模型；Fact、Derived Fact、Estimate 分層；TWStock MCP 僅作第二來源交叉驗證，不靜默覆蓋官方值。",
           "history_cache_at_used":history_cache_at_used,
+          "financial_cache_at_used":financial_cache_at_used,
           "financial_backfill_status":(_OFFICIAL_FINANCIAL_JOBS.get(ticker) or {}).get("status")}
-    # A background history job may finish while this slower report is still
-    # building. Never let that older snapshot overwrite the newly completed
-    # official history for the full cache TTL.
-    if _history_revision(ticker) <= history_cache_at_used:
-        _CACHE[ticker]=(time.time(),data)
-    else:
-        data["cache"]["skipped_stale_history_write"] = True
+    # Always retain the last complete report. Revision gates above prevent an
+    # older report from being treated as fresh, while the timeout path can still
+    # serve it explicitly as stale during cold-start/background refresh.
+    if not _cached_stock_is_current(ticker, data):
+        data["cache"]["background_revision_pending"] = True
+    _CACHE[ticker]=(time.time(),data)
     schedule_official_history(ticker)
     return data
 
 async def build_stock(ticker: str, force_refresh: bool = False) -> dict[str, Any]:
-    """Coalesce identical in-flight builds so one cold ticker performs one provider fan-out."""
-    key=(ticker,bool(force_refresh))
+    """Coalesce every in-flight build per ticker, including refresh retries."""
+    key=ticker
     task=_STOCK_BUILD_TASKS.get(key)
     coalesced=bool(task and not task.done())
     if not coalesced:

@@ -12,6 +12,7 @@ class StockSwitchCacheRaceTests(unittest.TestCase):
     def tearDown(self):
         server._CACHE.clear()
         server._OFFICIAL_HISTORY_CACHE.clear()
+        server._OFFICIAL_FINANCIAL_CACHE.clear()
 
     def test_report_from_older_history_revision_is_rejected(self):
         server._OFFICIAL_HISTORY_CACHE["3665"] = (time.time(), {"revenue": [{"date": "2026-07"}]})
@@ -38,7 +39,7 @@ class StockSwitchCacheRaceTests(unittest.TestCase):
 
     def test_versioned_assets_match_runtime(self):
         html = (ROOT / "index.html").read_text()
-        self.assertEqual(server.APP_VERSION, "5.19.2")
+        self.assertEqual(server.APP_VERSION, "5.19.3")
         self.assertNotIn("5.15.8", html)
         self.assertGreaterEqual(html.count(server.APP_VERSION), 4)
 
