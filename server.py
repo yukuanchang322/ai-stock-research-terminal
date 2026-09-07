@@ -30,7 +30,7 @@ from pypdf import PdfReader
 from professional_pdf import write_professional_pdf
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.19.3"
+APP_VERSION = "5.19.4"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)

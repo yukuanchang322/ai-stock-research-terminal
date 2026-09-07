@@ -65,7 +65,20 @@ class StaleWhileRevalidateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("r.status===503&&j.status==='warming'", source)
         self.assertIn("await waitForStockRetry", source)
         self.assertIn("j.cache?.stale", source)
-        self.assertIn("上次成功報告會保留", source)
+        self.assertIn("目前保留上次成功報告", source)
+
+    def test_frontend_rejects_lower_quality_snapshots_and_legacy_schema(self):
+        source = (ROOT / "app.js").read_text(encoding="utf-8")
+        styles = (ROOT / "styles.css").read_text(encoding="utf-8")
+        self.assertIn("ai-stock-last-good-report-v2-", source)
+        self.assertIn("purgeLegacyReportSnapshots()", source)
+        self.assertIn("reportSnapshotQuality(data)", source)
+        self.assertIn("existingQuality.complete&&!quality.complete", source)
+        self.assertIn("quality.complete&&!existingQuality.complete", source)
+        self.assertIn("quality.score<REPORT_SNAPSHOT_MIN_SCORE", source)
+        self.assertIn("j.cache?.background_revision_pending", source)
+        self.assertIn("snapshot-status", styles)
+        self.assertIn("position:fixed", styles)
 
     def test_optional_mcp_does_not_invalidate_core_report(self):
         source = Path(server.__file__).read_text(encoding="utf-8")
