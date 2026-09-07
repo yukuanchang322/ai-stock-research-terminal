@@ -11,33 +11,87 @@ const marginHistoryRefreshAttempts={};
 let candleViewState={ticker:'',size:0,end:0};
 let candlePeriodState={ticker:'',interval:'day',daily:[],dailyTechnical:null,series:[],technical:null,source:'研究報告日線資料',asOf:'',requestId:0};
 const candlePeriodCache=new Map();
-const REPORT_SNAPSHOT_PREFIX='ai-stock-last-good-report-v1-';
-const REPORT_SNAPSHOT_INDEX='ai-stock-last-good-report-v1-index';
+const REPORT_SNAPSHOT_PREFIX='ai-stock-last-good-report-v2-';
+const REPORT_SNAPSHOT_INDEX='ai-stock-last-good-report-v2-index';
+const LEGACY_REPORT_SNAPSHOT_PREFIX='ai-stock-last-good-report-v1-';
 const REPORT_SNAPSHOT_LIMIT=6;
+const REPORT_SNAPSHOT_MIN_SCORE=60;
 
 function reportSnapshotKey(ticker){return `${REPORT_SNAPSHOT_PREFIX}${ticker}`}
+function reportSnapshotQuality(data){
+  const revenueRows=(data?.revenue?.series||[]).filter(x=>x?.period&&x.revenue!=null).length;
+  const financialKeys=['ytd_eps','quarter_eps','ttm_eps','gross_margin','operating_margin'];
+  const financialValues=financialKeys.filter(key=>data?.financial?.[key]!=null||data?.eps_stack?.[key]!=null).length;
+  const officialFinancial=Boolean(data?.financial_integrity?.official_verified||data?.financial?.official);
+  const technicalRows=(data?.technical?.series||[]).filter(x=>x?.date&&x.close!=null).length;
+  const flowValues=['foreign_1_amount','foreign_5_amount','foreign_20_amount','trust_20_amount','dealer_20_amount']
+    .filter(key=>data?.flow?.[key]!=null).length;
+  const priceReady=data?.price!=null;
+  let score=0;
+  if(priceReady)score+=10;
+  if(data?.ticker&&data?.name)score+=5;
+  score+=Math.min(20,revenueRows>=20?20:revenueRows>=12?15:Math.floor(revenueRows/3)*3);
+  score+=officialFinancial?30:Math.min(20,financialValues*4);
+  score+=technicalRows>=60?15:technicalRows>=20?10:technicalRows?5:0;
+  score+=Math.min(15,flowValues*3);
+  const complete=Boolean(priceReady&&revenueRows>=12&&(officialFinancial||financialValues>=3)&&technicalRows>=20);
+  return {score:Math.min(100,score),complete,officialFinancial,revenueRows,financialValues,technicalRows,flowValues};
+}
+function shouldReplaceReportSnapshot(existingEntry,data,quality=reportSnapshotQuality(data)){
+  if(!existingEntry?.data)return true;
+  const existingQuality=existingEntry.quality||reportSnapshotQuality(existingEntry.data);
+  if(existingQuality.complete&&!quality.complete)return false;
+  if(quality.complete&&!existingQuality.complete)return true;
+  if(quality.score!==existingQuality.score)return quality.score>existingQuality.score;
+  const incomingAt=Date.parse(data?.generated_at||'')||0,existingAt=Date.parse(existingEntry.data?.generated_at||'')||0;
+  return incomingAt>=existingAt;
+}
+function purgeLegacyReportSnapshots(){
+  try{
+    for(let i=localStorage.length-1;i>=0;i--){
+      const key=localStorage.key(i);
+      if(key?.startsWith(LEGACY_REPORT_SNAPSHOT_PREFIX))localStorage.removeItem(key);
+    }
+  }catch(_){/* Private browsing/storage limits must never block the report. */}
+}
 function loadReportSnapshot(ticker){
   try{
     const raw=localStorage.getItem(reportSnapshotKey(ticker));
     const entry=raw?JSON.parse(raw):null;
-    return entry?.data?.ticker===ticker&&entry.data.price!=null?entry.data:null;
+    if(entry?.schema!==2||entry?.data?.ticker!==ticker||entry.data.price==null)return null;
+    return {data:entry.data,savedAt:Number(entry.saved_at)||0,quality:entry.quality||reportSnapshotQuality(entry.data)};
   }catch(_){return null}
 }
 function saveReportSnapshot(data){
-  if(!data?.ticker||data.price==null)return;
+  if(!data?.ticker||data.price==null)return false;
   try{
-    localStorage.setItem(reportSnapshotKey(data.ticker),JSON.stringify({saved_at:Date.now(),data}));
+    const quality=reportSnapshotQuality(data);
+    if(quality.score<REPORT_SNAPSHOT_MIN_SCORE)return false;
+    const key=reportSnapshotKey(data.ticker),raw=localStorage.getItem(key);
+    let existing=null;
+    if(raw){try{existing=JSON.parse(raw)}catch(_){localStorage.removeItem(key)}}
+    if(!shouldReplaceReportSnapshot(existing,data,quality))return false;
+    const savedAt=Date.now();
+    localStorage.setItem(key,JSON.stringify({schema:2,saved_at:savedAt,quality,data}));
     const prior=JSON.parse(localStorage.getItem(REPORT_SNAPSHOT_INDEX)||'[]').filter(x=>x?.ticker!==data.ticker);
-    const next=[{ticker:data.ticker,saved_at:Date.now()},...prior].slice(0,REPORT_SNAPSHOT_LIMIT);
+    const next=[{ticker:data.ticker,saved_at:savedAt,score:quality.score},...prior].slice(0,REPORT_SNAPSHOT_LIMIT);
     const keep=new Set(next.map(x=>x.ticker));
     prior.filter(x=>!keep.has(x?.ticker)).forEach(x=>localStorage.removeItem(reportSnapshotKey(x.ticker)));
     localStorage.setItem(REPORT_SNAPSHOT_INDEX,JSON.stringify(next));
+    return true;
   }catch(_){/* Private browsing/storage limits must never block the report. */}
+  return false;
 }
-function showLoadStatus(message,warming=false){
+function snapshotStatusText(entry){
+  const saved=entry?.savedAt?new Date(entry.savedAt).toLocaleString('zh-TW',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}):'時間不明';
+  const quality=entry?.quality||reportSnapshotQuality(entry?.data||{});
+  return `目前顯示此裝置 ${saved} 儲存的報告（完整度 ${quality.score}/100）；雲端資料完成後會自動替換。`;
+}
+function showLoadStatus(message,warming=false,sticky=false){
   const box=$('errorBox');
   box.textContent=message;
   box.classList.toggle('warming',warming);
+  box.classList.toggle('snapshot-status',sticky);
   box.classList.remove('hidden');
 }
 function waitForStockRetry(ms,signal){
@@ -477,17 +531,18 @@ async function loadTicker(ticker, force=false){
   clearTimeout(marginHistoryRefreshTimer);
   $('errorBox').classList.add('hidden');
   $('errorBox').classList.remove('warming');
+  $('errorBox').classList.remove('snapshot-status');
   if(!/^[0-9A-Z.-]{2,12}$/.test(ticker)){
     $('report').classList.add('hidden');
     $('errorBox').textContent='股票代號格式不正確，請輸入例如 2330、3661。';
     $('errorBox').classList.remove('hidden');
     return;
   }
-  const stored=loadReportSnapshot(ticker);
+  const storedEntry=loadReportSnapshot(ticker),stored=storedEntry?.data||null;
   if(stored){
     try{
       render({...stored,cache:{...(stored.cache||{}),hit:true,stale:true,client_snapshot:true}});
-      showLoadStatus('雲端資料正在更新；目前先顯示此裝置上次成功取得的研究報告。',true);
+      showLoadStatus(snapshotStatusText(storedEntry),true,true);
     }catch(error){console.warn('stored report unavailable',error)}
   }else if(renderedTicker!==ticker){
     $('report').classList.add('hidden');
@@ -502,7 +557,7 @@ async function loadTicker(ticker, force=false){
       if(requestId!==stockRequestSequence)return;
       if(r.status===503&&j.status==='warming'){
         const retrySeconds=Math.max(3,Math.min(15,Number(r.headers.get('retry-after')||j.retry_after_seconds||5)));
-        showLoadStatus(stored?'雲端資料仍在背景更新；上次成功報告會保留，完成後自動替換。':`首次建立 ${ticker} 研究資料，系統將於 ${retrySeconds} 秒後自動重試。`,true);
+        showLoadStatus(stored?snapshotStatusText(storedEntry):`首次建立 ${ticker} 研究資料，系統將於 ${retrySeconds} 秒後自動重試。`,true,true);
         await waitForStockRetry(retrySeconds*1000,signal);
         continue;
       }
@@ -511,14 +566,15 @@ async function loadTicker(ticker, force=false){
         console.error('render failed',renderError);
         throw new Error(`畫面產生失敗：${renderError?.message||'未知錯誤'}`);
       }
-      if(j.cache?.stale&&attempt<5){
-        showLoadStatus('雲端正在更新官方資料；目前保留上次成功報告，完成後會自動替換。',true);
+      if((j.cache?.stale||j.cache?.background_revision_pending)&&attempt<5){
+        showLoadStatus('雲端正在更新官方資料；目前保留上次成功報告，完成後會自動替換。',true,true);
         $('pdfBtn').disabled=true; $('dockPdf').disabled=true; $('dockShare').disabled=true;
         await waitForStockRetry(5000,signal);
         continue;
       }
       $('errorBox').classList.add('hidden');
       $('errorBox').classList.remove('warming');
+      $('errorBox').classList.remove('snapshot-status');
       return;
     }
     throw new Error('背景建置時間較長，系統未取得完成結果；請保持頁面開啟後再次查詢。');
@@ -528,7 +584,7 @@ async function loadTicker(ticker, force=false){
     console.error('loadTicker failed',e);
     if(!stored&&renderedTicker!==ticker)$('report').classList.add('hidden');
     if(stored){$('pdfBtn').disabled=false;$('dockPdf').disabled=false;$('dockShare').disabled=false;}
-    showLoadStatus(stored?`最新資料更新暫時失敗；仍顯示上次成功報告。${e?.message?` ${e.message}`:''}`:(e?.message||'資料取得失敗，請稍後再試。'));
+    showLoadStatus(stored?`最新資料更新暫時失敗；仍顯示上次成功報告。${e?.message?` ${e.message}`:''}`:(e?.message||'資料取得失敗，請稍後再試。'),false,Boolean(stored));
   } finally {if(requestId===stockRequestSequence){$('loading').classList.add('hidden'); $('searchBtn').disabled=false;}}
 }
 $('searchBtn').onclick=()=>loadTicker($('tickerInput').value.trim()); $('refreshBtn').onclick=()=>loadTicker($('tickerInput').value.trim(), true);
@@ -562,7 +618,7 @@ async function openPdfReport(){
 }
 $('pdfBtn').onclick=openPdfReport;
 $('methodBtn').onclick=()=>$('methodModal').classList.add('open'); $('closeModal').onclick=()=>$('methodModal').classList.remove('open');
-window.addEventListener('load',()=>{const q=new URLSearchParams(location.search).get('ticker'); if(q) $('tickerInput').value=q; loadTicker($('tickerInput').value.trim());});
+window.addEventListener('load',()=>{purgeLegacyReportSnapshots();const q=new URLSearchParams(location.search).get('ticker'); if(q) $('tickerInput').value=q; loadTicker($('tickerInput').value.trim());});
 
 // V4 Cloud / PWA mobile enhancements
 let deferredInstallPrompt = null;
