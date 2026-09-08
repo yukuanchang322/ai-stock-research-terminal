@@ -12,7 +12,7 @@ class TpexMarketRoutingV5159Tests(unittest.IsolatedAsyncioTestCase):
             rows, provider, errors = await server.fetch_official_stock_day("6488")
         self.assertEqual(rows, otc_rows)
         self.assertEqual(provider, "TPEx afterTrading/tradingStock")
-        self.assertIn("no rows", errors)
+        self.assertEqual(errors, [])
         twse.assert_awaited_once_with("6488", 13)
         tpex.assert_awaited_once_with("6488", 13)
 

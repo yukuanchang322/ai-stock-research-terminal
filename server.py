@@ -30,7 +30,7 @@ from pypdf import PdfReader
 from professional_pdf import write_professional_pdf
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.19.4"
+APP_VERSION = "5.19.5"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -57,6 +57,7 @@ _OFFICIAL_HISTORY_JOBS: dict[str, dict[str, dict[str, Any]]] = {}
 _OFFICIAL_FINANCIAL_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _OFFICIAL_FINANCIAL_TASKS: dict[str, asyncio.Task] = {}
 _OFFICIAL_FINANCIAL_JOBS: dict[str, dict[str, Any]] = {}
+_OFFICIAL_EPS_SNAPSHOT_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
 _MCP_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _MCP_TASKS: dict[str, asyncio.Task] = {}
 _PRICE_HISTORY_CACHE: dict[str, tuple[float, list[dict[str, Any]], str]] = {}
@@ -801,7 +802,7 @@ def _official_row_to_snapshot(row: dict[str, Any], source: str, endpoint: str, m
     op=parse_num_text(val("營業利益（損失）","營業利益(損失)","營業利益") or _row_value(row,["營業利益"],["百分比"]))
     net=parse_num_text(val("本期淨利（淨損）","本期淨利(淨損)","本期淨利","稅後淨利") or _row_value(row,["本期淨利"],["百分比"]) or _row_value(row,["稅後淨利"]))
     year=val("年度","Year") or _row_value(row,["年度"]) or _row_value(row,["年"])
-    quarter=val("季別") or _row_value(row,["季別"]) or _row_value(row,["季"])
+    quarter=val("季別","Season","Quarter") or _row_value(row,["季別"]) or _row_value(row,["季"])
     out_date=val("出表日期","資料日期","Date") or _row_value(row,["出表日期"]) or _row_value(row,["資料日期"])
     try:
         y=int(str(year).strip()); y=y+1911 if y<1911 else y
@@ -1456,34 +1457,8 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
     and different endpoints may refresh at slightly different times. The newest fiscal period wins.
     """
     industry_suffixes=["ci","mim","basi","bd","fh","ins"]
-    candidates=[]
-    # Daily EPS summary is the fastest official period anchor and is not tied to an industry schema.
-    # It is especially useful for KY/foreign issuers whose detailed statement may live outside the usual L_* feed.
-    candidates.append((TWSE_OPENAPI, "/opendata/t187ap14_L", "TWSE/MOPS EPS Daily Summary", "上市", "summary"))
-    candidates.append((TPEX_OPENAPI, "/mopsfin_t187ap14_O", "TPEx/MOPS EPS Daily Summary", "上櫃", "summary"))
-    for suffix in industry_suffixes:
-        candidates.append((TWSE_OPENAPI, f"/opendata/t187ap06_L_{suffix}", "TWSE/MOPS Income Statement", "上市", "detail"))
-        # X_* is the public-company/foreign-issuer feed and covers cases that do not appear in L_* as expected.
-        candidates.append((TWSE_OPENAPI, f"/opendata/t187ap06_X_{suffix}", "TWSE/MOPS Income Statement (X/foreign)", "公發/外國", "detail"))
-        candidates.append((TPEX_OPENAPI, f"/mopsfin_t187ap06_O_{suffix}", "TPEx/MOPS Income Statement", "上櫃", "detail"))
     errors=[]; found=[]
-
-    # Layer 0: company-specific MOPS IFRS report for the expected quarter.
-    # Aggregate OpenAPI feeds can be incomplete/staggered; direct company report is authoritative.
-    try:
-        ey,eq,_=expected_latest_financial_period(date.today())
-        found.extend(await fetch_mops_company_ifrs(ticker,ey,eq))
-    except Exception as e:
-        errors.append(f"mops_company:{type(e).__name__}")
-
-    # TSMC publishes quarterly results earlier than some MOPS aggregate refreshes.
-    if ticker=="2330":
-        try:
-            ey,eq,_=expected_latest_financial_period(date.today())
-            ir=await fetch_tsmc_quarterly_release(ey,eq)
-            if ir: found.append(ir)
-        except Exception as e:
-            errors.append(f"tsmc_ir:{type(e).__name__}")
+    ey,eq,_=expected_latest_financial_period(date.today())
 
     def company_code(row: dict[str, Any]) -> str:
         direct=row.get("公司代號") or row.get("SecuritiesCompanyCode") or row.get("公司代碼") or row.get("代號")
@@ -1493,7 +1468,8 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
 
     async def probe(base: str, path: str, source: str, market: str, kind: str):
         try:
-            rows=await openapi_json(base,path)
+            # One slow schema must not consume the complete 28-second caller budget.
+            rows=await asyncio.wait_for(openapi_json(base,path), timeout=12)
             row=next((x for x in rows if company_code(x)==ticker),None)
             if not row: return None
             # One canonical parser for TWSE, TPEx and CSV rows. Keeping a second parser here
@@ -1503,28 +1479,75 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
             errors.append(f"{path}:{type(e).__name__}")
             return None
 
-    results=await asyncio.gather(*(probe(*c) for c in candidates))
-    found.extend(x for x in results if x)
-    # Layer 2: direct official MOPS CSV. This bypasses JSON endpoint/schema lag and is critical for KY/foreign issuers.
-    try:
-        found.extend(await fetch_mops_csv_official(ticker))
-    except Exception as e:
-        errors.append(f"mops_csv:{type(e).__name__}")
-    # Layer 3: official board-approved financial-report disclosure. This is especially important for
-    # KY/foreign issuers whose structured XBRL/EPS feed can lag even after the board has approved Q2/Q3.
-    try:
-        ey,eq,_=expected_latest_financial_period(date.today())
-        found.extend(await fetch_mops_material_financial(ticker,ey,eq))
-    except Exception as e:
-        errors.append(f"mops_material:{type(e).__name__}")
+    # Fast path: the current EPS summary plus the general-industry detail feeds resolve the
+    # overwhelming majority of listed and OTC issuers.  They also identify the correct market,
+    # so a free Render worker does not fan out to every TWSE and TPEx schema for every ticker.
+    quick_candidates=[
+        (TWSE_OPENAPI, "/opendata/t187ap14_L", "TWSE/MOPS EPS Daily Summary", "上市", "summary"),
+        (TPEX_OPENAPI, "/mopsfin_t187ap14_O", "TPEx/MOPS EPS Daily Summary", "上櫃", "summary"),
+        (TWSE_OPENAPI, "/opendata/t187ap06_L_ci", "TWSE/MOPS Income Statement", "上市", "detail"),
+        (TWSE_OPENAPI, "/opendata/t187ap06_X_ci", "TWSE/MOPS Income Statement (X/foreign)", "公發/外國", "detail"),
+        (TPEX_OPENAPI, "/mopsfin_t187ap06_O_ci", "TPEx/MOPS Income Statement", "上櫃", "detail"),
+    ]
+    quick_results=await asyncio.gather(*(probe(*c) for c in quick_candidates))
+    found.extend(x for x in quick_results if x)
 
-    # Layer 4: company IR reviewed/audited PDF for mapped issuers. Used only when the PDF explicitly states the expected period.
-    try:
-        ey,eq,_=expected_latest_financial_period(date.today())
-        ir=await fetch_company_ir_financial(ticker,ey,eq)
-        if ir: found.append(ir)
-    except Exception as e:
-        errors.append(f"company_ir:{type(e).__name__}")
+    def expected_detail(rows: list[dict[str, Any]]) -> bool:
+        return any(row.get("official") and row.get("fiscal_year")==ey and row.get("fiscal_quarter")==eq
+                   and row.get("feed_kind")=="detail" and (row.get("completeness") or 0)>=4 for row in rows)
+
+    if not expected_detail(found):
+        if any(row.get("market")=="上櫃" for row in found):
+            remaining=[(TPEX_OPENAPI, f"/mopsfin_t187ap06_O_{suffix}", "TPEx/MOPS Income Statement", "上櫃", "detail")
+                       for suffix in industry_suffixes if suffix!="ci"]
+        elif found:
+            remaining=[]
+            for suffix in industry_suffixes:
+                if suffix=="ci": continue
+                remaining.append((TWSE_OPENAPI, f"/opendata/t187ap06_L_{suffix}", "TWSE/MOPS Income Statement", "上市", "detail"))
+                remaining.append((TWSE_OPENAPI, f"/opendata/t187ap06_X_{suffix}", "TWSE/MOPS Income Statement (X/foreign)", "公發/外國", "detail"))
+        else:
+            remaining=[]
+            quick_keys={(base,path) for base,path,*_ in quick_candidates}
+            for suffix in industry_suffixes:
+                for candidate in (
+                    (TWSE_OPENAPI, f"/opendata/t187ap06_L_{suffix}", "TWSE/MOPS Income Statement", "上市", "detail"),
+                    (TWSE_OPENAPI, f"/opendata/t187ap06_X_{suffix}", "TWSE/MOPS Income Statement (X/foreign)", "公發/外國", "detail"),
+                    (TPEX_OPENAPI, f"/mopsfin_t187ap06_O_{suffix}", "TPEx/MOPS Income Statement", "上櫃", "detail"),
+                ):
+                    if (candidate[0],candidate[1]) not in quick_keys: remaining.append(candidate)
+        results=await asyncio.gather(*(probe(*c) for c in remaining))
+        found.extend(x for x in results if x)
+
+    # The aggregate exchange feeds are the fastest authoritative source. Only enter the slower
+    # company-specific/MOPS/IR fallback chain when they did not produce the expected detailed row.
+    if not expected_detail(found):
+        try:
+            found.extend(await fetch_mops_company_ifrs(ticker,ey,eq))
+        except Exception as e:
+            errors.append(f"mops_company:{type(e).__name__}")
+        try:
+            found.extend(await fetch_mops_csv_official(ticker))
+        except Exception as e:
+            errors.append(f"mops_csv:{type(e).__name__}")
+        try:
+            found.extend(await fetch_mops_material_financial(ticker,ey,eq))
+        except Exception as e:
+            errors.append(f"mops_material:{type(e).__name__}")
+        try:
+            ir=await fetch_company_ir_financial(ticker,ey,eq)
+            if ir: found.append(ir)
+        except Exception as e:
+            errors.append(f"company_ir:{type(e).__name__}")
+
+    # TSMC's official release supplies a direct single-quarter EPS and margin bridge that the
+    # cumulative exchange statement does not contain.
+    if ticker=="2330":
+        try:
+            ir=await fetch_tsmc_quarterly_release(ey,eq)
+            if ir: found.append(ir)
+        except Exception as e:
+            errors.append(f"tsmc_ir:{type(e).__name__}")
     if found:
         # Latest fiscal period always wins. Within the same period prefer the detailed row with more parsed fields.
         found.sort(key=lambda x: (x.get("fiscal_year") or 0, x.get("fiscal_quarter") or 0,
@@ -1543,6 +1566,12 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
                     merged[k]=row[k]
         merged["source_candidates"]=[{"source":x.get("source"),"endpoint":x.get("endpoint"),"kind":x.get("feed_kind"),"completeness":x.get("completeness")} for x in same]
         merged["errors"]=errors; merged["candidate_hits"]=len(found)
+        for row in same:
+            if row.get("official") and row.get("fiscal_year") and row.get("fiscal_quarter"):
+                key=(ticker,int(row["fiscal_year"]),int(row["fiscal_quarter"]))
+                prior=_OFFICIAL_EPS_SNAPSHOT_CACHE.get(key)
+                if prior is None or (row.get("completeness") or 0) >= (prior.get("completeness") or 0):
+                    _OFFICIAL_EPS_SNAPSHOT_CACHE[key]=dict(row)
         return merged
     return {"official":False,"errors":errors,"candidate_hits":0}
 
@@ -2069,12 +2098,19 @@ async def fetch_official_eps_for_period(ticker: str, year: int, quarter: int) ->
       4) return None.  The blocked MOPS historical HTML endpoint is intentionally *not* in the
          production EPS path. Third-party/FinMind values never fill an official predecessor quarter.
     """
-    # Layer 0: verified company-official registry. This avoids re-scraping historical pages on every request
+    # Layer 0: an official exchange snapshot already observed by this worker. This ledger lets a
+    # later quarter reuse the prior official cumulative EPS without another slow historical scrape.
+    cached=_OFFICIAL_EPS_SNAPSHOT_CACHE.get((str(ticker),int(year),int(quarter)))
+    if cached:
+        row=dict(cached); row["eps_provenance"]="official_snapshot_cache"; row["eps_confidence"]=100
+        return row
+
+    # Layer 1: verified company-official registry. This avoids re-scraping historical pages on every request
     # and makes evidence auditable/stable. Registry rows always carry their original official URL.
     reg=registry_eps_for_period(ticker,year,quarter)
     if reg: return reg
 
-    # Layer 1: official structured CSV/OpenData. These feeds often expose only the latest quarter,
+    # Layer 2: official structured CSV/OpenData. These feeds often expose only the latest quarter,
     # but if it exactly matches the requested period it is the preferred cumulative source.
     try:
         rows=await fetch_mops_csv_official(ticker)
@@ -2085,7 +2121,7 @@ async def fetch_official_eps_for_period(ticker: str, year: int, quarter: int) ->
     except Exception:
         pass
 
-    # Layer 2: company official IR. TSMC publishes a direct quarter EPS; mapped issuers such as
+    # Layer 3: company official IR. TSMC publishes a direct quarter EPS; mapped issuers such as
     # Alchip are parsed from their reviewed/audited IR PDF when an explicit period match exists.
     if ticker=="2330":
         try:
@@ -2101,7 +2137,7 @@ async def fetch_official_eps_for_period(ticker: str, year: int, quarter: int) ->
     except Exception:
         pass
 
-    # Layer 3: official board-approved disclosure, if it contains an exact period and EPS.
+    # Layer 4: official board-approved disclosure, if it contains an exact period and EPS.
     try:
         mats=await fetch_mops_material_financial(ticker,year,quarter)
         mb=_best_period_snapshot(mats,year,quarter)
@@ -3926,7 +3962,8 @@ async def fetch_official_stock_day(ticker: str, market_hint: str | None = None) 
         return twse_rows, "TWSE STOCK_DAY", twse_errors
     tpex_rows, tpex_errors = await fetch_tpex_stock_day(ticker, 13)
     if tpex_rows:
-        return tpex_rows, "TPEx afterTrading/tradingStock", twse_errors + tpex_errors
+        # A TWSE miss is the expected routing signal for an OTC ticker, not a report error.
+        return tpex_rows, "TPEx afterTrading/tradingStock", tpex_errors
     return [], "official price unavailable", twse_errors + tpex_errors
 
 
@@ -4236,6 +4273,10 @@ async def _build_stock_uncached(ticker: str, force_refresh: bool = False) -> dic
             errors.append(f"OfficialReconcile: {type(e).__name__}")
     eps_stack=await build_eps_stack(ticker, fin, official_financial, financial)
     financial_integrity=assess_financial_integrity(official_financial, eps_stack, today)
+    if financial_integrity.get("official_verified"):
+        # A bounded request may record a transient timeout just before the shielded official task
+        # publishes a verified snapshot. Do not show that resolved transport warning as a live error.
+        errors=[e for e in errors if not str(e).startswith("OfficialFinancial:")]
     # Official snapshot has highest priority for latest period margins/amounts.
     if official_financial.get("official"):
         financial.update({
