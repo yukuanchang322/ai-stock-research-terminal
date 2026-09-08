@@ -27,6 +27,19 @@ class GenericEpsEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["period"], "2026 Q2")
         self.assertEqual(snapshot["statement_date"], "2026-08-24")
 
+    def test_tpex_detail_english_season_field_maps_to_fiscal_quarter(self):
+        row = {
+            "Date": "1150908", "Year": "115", "Season": "2",
+            "SecuritiesCompanyCode": "6223", "基本每股盈餘（元）": "28.08",
+            "營業收入": "9166454.00", "營業毛利（毛損）": "5392930.00",
+        }
+        snapshot = server._official_row_to_snapshot(
+            row, "TPEx/MOPS Income Statement", "/mopsfin_t187ap06_O_ci", "上櫃", "detail"
+        )
+        self.assertEqual(snapshot["fiscal_year"], 2026)
+        self.assertEqual(snapshot["fiscal_quarter"], 2)
+        self.assertEqual(snapshot["period"], "2026 Q2")
+
     async def test_q2_official_cumulative_difference_and_ttm_for_any_ticker(self):
         ticker = "7777"
         rows = {
