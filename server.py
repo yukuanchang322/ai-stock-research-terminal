@@ -30,7 +30,7 @@ from pypdf import PdfReader
 from professional_pdf import write_professional_pdf
 
 ROOT = Path(__file__).resolve().parent
-APP_VERSION = "5.19.5"
+APP_VERSION = "5.19.6"
 DATA_DIR = ROOT / "data"
 REPORT_DIR = ROOT / "generated_reports"
 DATA_DIR.mkdir(exist_ok=True)
@@ -44,6 +44,12 @@ CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "600"))
 # continues in the background for the next retry.
 STOCK_API_REQUEST_TIMEOUT = min(
     26.0, max(8.0, float(os.getenv("STOCK_API_REQUEST_TIMEOUT_SECONDS", "22")))
+)
+# The API response has a much tighter budget than archival enrichment.  Keep a
+# slow third-party or disclosure endpoint from consuming the complete Render
+# edge window before the verified core record can be returned.
+CORE_PROVIDER_TIMEOUT = min(
+    12.0, max(4.0, float(os.getenv("CORE_PROVIDER_TIMEOUT_SECONDS", "8")))
 )
 CACHE_ADMIN_TOKEN = os.getenv("CACHE_ADMIN_TOKEN", "").strip()
 PDF_CACHE_TTL = min(CACHE_TTL, int(os.getenv("PDF_CACHE_TTL_SECONDS", "600")))
@@ -1479,18 +1485,37 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
             errors.append(f"{path}:{type(e).__name__}")
             return None
 
-    # Fast path: the current EPS summary plus the general-industry detail feeds resolve the
-    # overwhelming majority of listed and OTC issuers.  They also identify the correct market,
-    # so a free Render worker does not fan out to every TWSE and TPEx schema for every ticker.
-    quick_candidates=[
+    async def collect_with_budget(candidates: list[tuple], budget: float) -> list[dict[str, Any]]:
+        """Keep completed official answers when another schema stalls.
+
+        ``gather`` wrapped in a timeout discards every successful sibling when
+        one exchange endpoint is slow.  A valid EPS summary is already an
+        official period anchor, so preserve it and cancel only the late work.
+        """
+        tasks=[asyncio.create_task(probe(*candidate)) for candidate in candidates]
+        done,pending=await asyncio.wait(tasks, timeout=budget)
+        rows=[]
+        for task in done:
+            try:
+                row=task.result()
+                if row: rows.append(row)
+            except Exception as exc:
+                errors.append(f"official_probe:{type(exc).__name__}")
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+            errors.append("official_detail:deferred_after_core_budget")
+        return rows
+
+    # Establish market and the newest official EPS period first.  This pair is
+    # sufficient to present an audited/latest-period YTD EPS; detail feeds only
+    # enrich margins and must never suppress that verified answer.
+    summary_candidates=[
         (TWSE_OPENAPI, "/opendata/t187ap14_L", "TWSE/MOPS EPS Daily Summary", "上市", "summary"),
         (TPEX_OPENAPI, "/mopsfin_t187ap14_O", "TPEx/MOPS EPS Daily Summary", "上櫃", "summary"),
-        (TWSE_OPENAPI, "/opendata/t187ap06_L_ci", "TWSE/MOPS Income Statement", "上市", "detail"),
-        (TWSE_OPENAPI, "/opendata/t187ap06_X_ci", "TWSE/MOPS Income Statement (X/foreign)", "公發/外國", "detail"),
-        (TPEX_OPENAPI, "/mopsfin_t187ap06_O_ci", "TPEx/MOPS Income Statement", "上櫃", "detail"),
     ]
-    quick_results=await asyncio.gather(*(probe(*c) for c in quick_candidates))
-    found.extend(x for x in quick_results if x)
+    found.extend(await collect_with_budget(summary_candidates, CORE_PROVIDER_TIMEOUT))
 
     def expected_detail(rows: list[dict[str, Any]]) -> bool:
         return any(row.get("official") and row.get("fiscal_year")==ey and row.get("fiscal_quarter")==eq
@@ -1498,47 +1523,30 @@ async def fetch_official_income_statement(ticker: str) -> dict[str, Any]:
 
     if not expected_detail(found):
         if any(row.get("market")=="上櫃" for row in found):
-            remaining=[(TPEX_OPENAPI, f"/mopsfin_t187ap06_O_{suffix}", "TPEx/MOPS Income Statement", "上櫃", "detail")
-                       for suffix in industry_suffixes if suffix!="ci"]
-        elif found:
-            remaining=[]
+            detail_candidates=[(TPEX_OPENAPI, f"/mopsfin_t187ap06_O_{suffix}", "TPEx/MOPS Income Statement", "上櫃", "detail")
+                               for suffix in industry_suffixes]
+        elif any(row.get("market")=="上市" for row in found):
+            detail_candidates=[]
             for suffix in industry_suffixes:
-                if suffix=="ci": continue
-                remaining.append((TWSE_OPENAPI, f"/opendata/t187ap06_L_{suffix}", "TWSE/MOPS Income Statement", "上市", "detail"))
-                remaining.append((TWSE_OPENAPI, f"/opendata/t187ap06_X_{suffix}", "TWSE/MOPS Income Statement (X/foreign)", "公發/外國", "detail"))
-        else:
-            remaining=[]
-            quick_keys={(base,path) for base,path,*_ in quick_candidates}
-            for suffix in industry_suffixes:
-                for candidate in (
+                detail_candidates.extend([
                     (TWSE_OPENAPI, f"/opendata/t187ap06_L_{suffix}", "TWSE/MOPS Income Statement", "上市", "detail"),
                     (TWSE_OPENAPI, f"/opendata/t187ap06_X_{suffix}", "TWSE/MOPS Income Statement (X/foreign)", "公發/外國", "detail"),
-                    (TPEX_OPENAPI, f"/mopsfin_t187ap06_O_{suffix}", "TPEx/MOPS Income Statement", "上櫃", "detail"),
-                ):
-                    if (candidate[0],candidate[1]) not in quick_keys: remaining.append(candidate)
-        results=await asyncio.gather(*(probe(*c) for c in remaining))
-        found.extend(x for x in results if x)
+                ])
+        else:
+            # No summary can be a temporary exchange outage. Probe only the
+            # general schema within the same core budget; expensive MOPS/PDF
+            # discovery belongs to diagnostics/background enrichment.
+            detail_candidates=[
+                (TWSE_OPENAPI, "/opendata/t187ap06_L_ci", "TWSE/MOPS Income Statement", "上市", "detail"),
+                (TWSE_OPENAPI, "/opendata/t187ap06_X_ci", "TWSE/MOPS Income Statement (X/foreign)", "公發/外國", "detail"),
+                (TPEX_OPENAPI, "/mopsfin_t187ap06_O_ci", "TPEx/MOPS Income Statement", "上櫃", "detail"),
+            ]
+        found.extend(await collect_with_budget(detail_candidates, CORE_PROVIDER_TIMEOUT))
 
-    # The aggregate exchange feeds are the fastest authoritative source. Only enter the slower
-    # company-specific/MOPS/IR fallback chain when they did not produce the expected detailed row.
-    if not expected_detail(found):
-        try:
-            found.extend(await fetch_mops_company_ifrs(ticker,ey,eq))
-        except Exception as e:
-            errors.append(f"mops_company:{type(e).__name__}")
-        try:
-            found.extend(await fetch_mops_csv_official(ticker))
-        except Exception as e:
-            errors.append(f"mops_csv:{type(e).__name__}")
-        try:
-            found.extend(await fetch_mops_material_financial(ticker,ey,eq))
-        except Exception as e:
-            errors.append(f"mops_material:{type(e).__name__}")
-        try:
-            ir=await fetch_company_ir_financial(ticker,ey,eq)
-            if ir: found.append(ir)
-        except Exception as e:
-            errors.append(f"company_ir:{type(e).__name__}")
+    # A slow company-specific MOPS/PDF crawl used to keep an already verified
+    # summary hostage for 60+ seconds.  Keep that work on diagnostics and the
+    # asynchronous reconciliation path; the selected summary remains auditable
+    # and is immediately replaced when a richer official same-period row lands.
 
     # TSMC's official release supplies a direct single-quarter EPS and margin bridge that the
     # cumulative exchange statement does not contain.
@@ -1872,15 +1880,13 @@ async def _warm_official_financial(ticker: str) -> dict[str, Any]:
     job.update(status="running", last_error=None,
                started_at=datetime.now().astimezone().isoformat(timespec="seconds"))
     try:
-        selected = await asyncio.wait_for(fetch_official_income_statement(ticker), timeout=90)
-        selected = await asyncio.wait_for(reconcile_official_financial_snapshot(ticker, selected), timeout=45)
+        # Publish the fast, verified exchange record first.  Reconciliation can
+        # visit CSV/MOPS/IR sources and must not make the investor wait for a
+        # value that is already official, dated, and usable for the core EPS
+        # integrity gate.
+        selected = await asyncio.wait_for(fetch_official_income_statement(ticker), timeout=18)
         if selected.get("official"):
             _OFFICIAL_FINANCIAL_CACHE[ticker] = (time.time(), dict(selected))
-            try:
-                selected["margin_views"]=await build_financial_margin_views(ticker,selected,resolve_prior=False)
-                _OFFICIAL_FINANCIAL_CACHE[ticker] = (time.time(), dict(selected))
-            except Exception as exc:
-                job["margin_views_error"]=type(exc).__name__
             job.update(status="complete", period=selected.get("period"), source=selected.get("source"))
         else:
             job.update(status="partial", last_error="no_official_candidate")
@@ -2152,7 +2158,8 @@ async def fetch_official_eps_for_period(ticker: str, year: int, quarter: int) ->
 async def fetch_official_eps_ytd_for_period(ticker: str, year: int, quarter: int) -> dict[str, Any] | None:
     return await fetch_official_eps_for_period(ticker,year,quarter)
 
-async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official: dict[str, Any], fallback_financial: dict[str, Any]) -> dict[str, Any]:
+async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official: dict[str, Any], fallback_financial: dict[str, Any],
+                          resolve_history: bool = True) -> dict[str, Any]:
     """V5.2.13 multi-source EPS engine with explicit provenance.
 
     Official current-period data is never combined with a third-party predecessor. Quarter EPS is
@@ -2199,7 +2206,8 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
                     official_ytd[cur_key]=float(reg_cur.get("quarter_eps_direct"))
 
         # Re-check company IR for the current quarter when the selected accounting feed has only YTD.
-        if cur_key not in direct_quarter:
+        # This is archival enrichment, not a prerequisite for publishing a verified current YTD EPS.
+        if resolve_history and cur_key not in direct_quarter:
             try:
                 cur_ir=await fetch_official_eps_for_period(ticker,fy,fq)
                 if cur_ir:
@@ -2213,30 +2221,31 @@ async def build_eps_stack(ticker: str, fin_rows: list[dict[str, Any]], official:
             except Exception:
                 pass
 
-        periods=[]; y,q=fy,fq
-        for _ in range(5):
-            periods.append((y,q)); q-=1
-            if q==0: y-=1; q=4
-        tasks=[fetch_official_eps_for_period(ticker,y,q) for (y,q) in periods[1:]]
-        rows=await asyncio.gather(*tasks, return_exceptions=True)
-        for (yq,row) in zip(periods[1:],rows):
-            if isinstance(row,Exception):
-                lookup_diagnostics.append({"period":f"{yq[0]} Q{yq[1]}","status":"error","error":type(row).__name__}); continue
-            if not row:
-                lookup_diagnostics.append({"period":f"{yq[0]} Q{yq[1]}","status":"missing_official"}); continue
-            if row.get("ytd_eps") is not None:
-                official_ytd[yq]=float(row.get("ytd_eps"))
-            # For Q1, an official direct-quarter EPS is also the official cumulative YTD EPS.
-            if yq[1]==1 and row.get("ytd_eps") is None and row.get("quarter_eps_direct") is not None:
-                official_ytd[yq]=float(row.get("quarter_eps_direct"))
-            if row.get("quarter_eps_direct") is not None: direct_quarter[yq]=float(row.get("quarter_eps_direct"))
-            row_method="official_registry_verified" if row.get("eps_provenance")=="official_registry_verified" else ("official_direct" if row.get("quarter_eps_direct") is not None else "official_ytd")
-            provenance[yq]={"method":row_method,
-                            "source":row.get("source"),"endpoint":row.get("endpoint"),"confidence":row.get("eps_confidence",98)}
-            lookup_diagnostics.append({"period":f"{yq[0]} Q{yq[1]}","status":"ok",
-                "source":row.get("source"),"endpoint":row.get("endpoint"),"ytd_eps":row.get("ytd_eps"),
-                "quarter_eps_direct":row.get("quarter_eps_direct"),"eps_provenance":row.get("eps_provenance"),
-                "confidence":row.get("eps_confidence")})
+        if resolve_history:
+            periods=[]; y,q=fy,fq
+            for _ in range(5):
+                periods.append((y,q)); q-=1
+                if q==0: y-=1; q=4
+            tasks=[fetch_official_eps_for_period(ticker,y,q) for (y,q) in periods[1:]]
+            rows=await asyncio.gather(*tasks, return_exceptions=True)
+            for (yq,row) in zip(periods[1:],rows):
+                if isinstance(row,Exception):
+                    lookup_diagnostics.append({"period":f"{yq[0]} Q{yq[1]}","status":"error","error":type(row).__name__}); continue
+                if not row:
+                    lookup_diagnostics.append({"period":f"{yq[0]} Q{yq[1]}","status":"missing_official"}); continue
+                if row.get("ytd_eps") is not None:
+                    official_ytd[yq]=float(row.get("ytd_eps"))
+                # For Q1, an official direct-quarter EPS is also the official cumulative YTD EPS.
+                if yq[1]==1 and row.get("ytd_eps") is None and row.get("quarter_eps_direct") is not None:
+                    official_ytd[yq]=float(row.get("quarter_eps_direct"))
+                if row.get("quarter_eps_direct") is not None: direct_quarter[yq]=float(row.get("quarter_eps_direct"))
+                row_method="official_registry_verified" if row.get("eps_provenance")=="official_registry_verified" else ("official_direct" if row.get("quarter_eps_direct") is not None else "official_ytd")
+                provenance[yq]={"method":row_method,
+                                "source":row.get("source"),"endpoint":row.get("endpoint"),"confidence":row.get("eps_confidence",98)}
+                lookup_diagnostics.append({"period":f"{yq[0]} Q{yq[1]}","status":"ok",
+                    "source":row.get("source"),"endpoint":row.get("endpoint"),"ytd_eps":row.get("ytd_eps"),
+                    "quarter_eps_direct":row.get("quarter_eps_direct"),"eps_provenance":row.get("eps_provenance"),
+                    "confidence":row.get("eps_confidence")})
 
     # Structured history remains lower-priority. It may fill a display gap only with a provisional label.
     fin_map={(x["year"],x["quarter"]):float(x["ytd_eps"]) for x in fin_hist}
@@ -4112,11 +4121,18 @@ async def _build_stock_uncached(ticker: str, force_refresh: bool = False) -> dic
         # independent fallback when TPEx rejected the Render egress address.
         # Keep the same request path in token and anonymous modes; failures are
         # still isolated per dataset and never overwrite official rows.
-        try: return await finmind(dataset, ticker, today - timedelta(days=days), today)
+        try:
+            return await asyncio.wait_for(
+                finmind(dataset, ticker, today - timedelta(days=days), today),
+                timeout=CORE_PROVIDER_TIMEOUT,
+            )
         except Exception as e: errors.append(f"{dataset}: {type(e).__name__}"); return []
     async def info_grab():
         try:
-            infos = await finmind("TaiwanStockInfo", ticker)
+            infos = await asyncio.wait_for(
+                finmind("TaiwanStockInfo", ticker),
+                timeout=CORE_PROVIDER_TIMEOUT,
+            )
             info = next((x for x in infos if str(x.get("stock_id")) == ticker), {})
             if info.get("type"):
                 info = {**info, "type": normalize_market_type(info.get("type"))}
@@ -4126,7 +4142,7 @@ async def _build_stock_uncached(ticker: str, force_refresh: bool = False) -> dic
     # Start every independent official chain together. On a free single-worker
     # Render instance, serial fallback stages otherwise add up beyond the
     # browser/proxy timeout even when each provider is healthy.
-    supplements_task = asyncio.create_task(asyncio.wait_for(fetch_official_market_supplements(ticker, today, history_days=0), timeout=16))
+    supplements_task = asyncio.create_task(asyncio.wait_for(fetch_official_market_supplements(ticker, today, history_days=0), timeout=CORE_PROVIDER_TIMEOUT))
     official_financial_task = schedule_official_financial(ticker)
     async def official_market_context():
         # Company lookup and OHLC discovery do not depend on each other.  The
@@ -4137,7 +4153,7 @@ async def _build_stock_uncached(ticker: str, force_refresh: bool = False) -> dic
         )
         otc_supplements = await fetch_tpex_latest_supplements(ticker) if official_info.get("type") == "上櫃" else {}
         return official_info, official_prices, provider, info_errors + price_errors, otc_supplements
-    official_market_task = asyncio.create_task(asyncio.wait_for(official_market_context(), timeout=24))
+    official_market_task = asyncio.create_task(asyncio.wait_for(official_market_context(), timeout=CORE_PROVIDER_TIMEOUT))
     info, prices, inst, margin, rev, pers, fin = await asyncio.gather(
         info_grab(),
         grab("TaiwanStockPrice",460),
@@ -4247,7 +4263,9 @@ async def _build_stock_uncached(ticker: str, force_refresh: bool = False) -> dic
         if flow.get("last_date"):
             return {}
         try:
-            return await asyncio.wait_for(fetch_twse_t86_latest(ticker, tech.get("last")), timeout=18)
+            # Latest T86 is useful enrichment, but cannot delay the initial
+            # report after the official core financial record is ready.
+            return await asyncio.wait_for(fetch_twse_t86_latest(ticker, tech.get("last")), timeout=4)
         except Exception as e:
             errors.append(f"TWSET86: {type(e).__name__}")
             return {}
@@ -4268,15 +4286,19 @@ async def _build_stock_uncached(ticker: str, force_refresh: bool = False) -> dic
     # V5.2.8 official mapping + EPS resolver guard: force the newest official MOPS quarter into the main payload.
     if not official_financial.get("mapping_reconciled"):
         try:
-            official_financial=await reconcile_official_financial_snapshot(ticker, official_financial)
+            reconciled=await asyncio.wait_for(reconcile_official_financial_snapshot(ticker, official_financial), timeout=3)
+            if reconciled.get("official"):
+                official_financial=reconciled
         except Exception as e:
-            errors.append(f"OfficialReconcile: {type(e).__name__}")
-    eps_stack=await build_eps_stack(ticker, fin, official_financial, financial)
+            # Retain the verified fast snapshot; a slow reconciliation must
+            # never turn a usable official record into an empty one.
+            errors.append(f"OfficialReconcile: deferred_{type(e).__name__}")
+    eps_stack=await build_eps_stack(ticker, fin, official_financial, financial, resolve_history=False)
     financial_integrity=assess_financial_integrity(official_financial, eps_stack, today)
     if financial_integrity.get("official_verified"):
         # A bounded request may record a transient timeout just before the shielded official task
         # publishes a verified snapshot. Do not show that resolved transport warning as a live error.
-        errors=[e for e in errors if not str(e).startswith("OfficialFinancial:")]
+        errors=[e for e in errors if not str(e).startswith(("OfficialFinancial:", "OfficialReconcile: deferred_"))]
     # Official snapshot has highest priority for latest period margins/amounts.
     if official_financial.get("official"):
         financial.update({
@@ -4318,8 +4340,8 @@ async def _build_stock_uncached(ticker: str, force_refresh: bool = False) -> dic
             return fb
 
     web_research, company_events = await asyncio.gather(
-        _safe_provider("PublicWebResearch", asyncio.wait_for(fetch_public_research(ticker, company_name), timeout=10), {"rows":[],"errors":[]}),
-        _safe_provider("CompanyEvents", asyncio.wait_for(fetch_company_events(ticker, company_name), timeout=10), {"rows":[],"earnings_calls":[],"material_info":[],"errors":[]})
+        _safe_provider("PublicWebResearch", asyncio.wait_for(fetch_public_research(ticker, company_name), timeout=4), {"rows":[],"errors":[]}),
+        _safe_provider("CompanyEvents", asyncio.wait_for(fetch_company_events(ticker, company_name), timeout=4), {"rows":[],"earnings_calls":[],"material_info":[],"errors":[]})
     )
     mcp_snapshot=get_twstock_mcp_snapshot_cached(ticker)
     # Final price rescue from MCP cross-check when both FinMind and TWSE history are unavailable.
